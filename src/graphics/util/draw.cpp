@@ -55,6 +55,14 @@ bool IsRasterizationPotentiallyDone(const RegisterFile& regs, bool primitive_pol
       !regs.Get<reg::RB_SURFACE_INFO>().surface_pitch) {
     return false;
   }
+  // Geometry killed after hi-Z only feeds VIZ queries / screen extents - the
+  // pixels never reach the pixel shader or the render targets on the real
+  // hardware. Draws with an active VIZ query ID are already dropped by the
+  // PM4 draw handler; the ones without an ID must not write color or depth
+  // either (as in Xenia).
+  if (regs.Get<reg::PA_SC_VIZ_QUERY>().kill_pix_post_hi_z) {
+    return false;
+  }
   if (primitive_polygonal) {
     auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
     if (pa_su_sc_mode_cntl.cull_front && pa_su_sc_mode_cntl.cull_back) {
