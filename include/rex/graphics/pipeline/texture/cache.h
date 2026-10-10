@@ -226,7 +226,9 @@ class TextureCache {
     bool mips_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return mips_outdated_;
     }
-    void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
+    // Returns false (keeping the texture outdated) if the guest memory backing
+    // the outdated parts has been invalidated again since it was requested.
+    bool MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
