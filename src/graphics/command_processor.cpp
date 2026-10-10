@@ -59,7 +59,8 @@ REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
                     "scaled block during resolve readback downscale")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
+// Default false as in Xenia.
+REXCVAR_DEFINE_BOOL(readback_memexport, false, "GPU",
                     "Enable CPU readback of shader memexport writes for guest memory "
                     "coherency (can reduce correctness issues, but may add GPU/CPU sync cost)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

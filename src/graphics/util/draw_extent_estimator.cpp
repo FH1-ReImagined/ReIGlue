@@ -24,7 +24,10 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
+// Default true as in Xenia: otherwise draws with clipping disabled can claim up
+// to the entire EDRAM, and the resulting ownership transfers wipe other render
+// targets (Halo: Reach gameplay rendered black).
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
                     "Execute unclipped draw vertex shader on CPU");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
