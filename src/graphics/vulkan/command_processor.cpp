@@ -2216,6 +2216,8 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // Only the shader constant blocks are handled here (WriteRegistersFromMem
+  // relies on that for the other registers).
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2335,7 +2337,46 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     return;
   }
 
-  CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
+  // A range with other registers, or across blocks: split it. The parts in the
+  // constant blocks take the paths above; WriteRegister handles only those
+  // blocks itself, so the other registers go straight to the common handling,
+  // without a virtual call for each.
+  uint32_t index = start_index;
+  const uint32_t range_end = start_index + num_registers;
+  while (index < range_end) {
+    uint32_t part_end;
+    bool constant_block = true;
+    if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+      part_end = XE_GPU_REG_SHADER_CONSTANT_511_W + 1;
+    } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+               index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+      part_end = XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1;
+    } else if (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+               index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+      part_end = XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1;
+    } else {
+      constant_block = false;
+      if (index < XE_GPU_REG_SHADER_CONSTANT_000_X) {
+        part_end = XE_GPU_REG_SHADER_CONSTANT_000_X;
+      } else if (index < XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) {
+        part_end = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+      } else if (index < XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031) {
+        part_end = XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031;
+      } else {
+        part_end = range_end;
+      }
+    }
+    part_end = std::min(part_end, range_end);
+    uint32_t* part_base = base + (index - start_index);
+    if (constant_block) {
+      VulkanCommandProcessor::WriteRegistersFromMem(index, part_base, part_end - index);
+    } else {
+      for (uint32_t i = index; i < part_end; ++i) {
+        CommandProcessor::WriteRegister(i, memory::load_and_swap<uint32_t>(part_base + (i - index)));
+      }
+    }
+    index = part_end;
+  }
 }
 
 void VulkanCommandProcessor::SparseBindBuffer(VkBuffer buffer, uint32_t bind_count,

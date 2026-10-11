@@ -341,6 +341,27 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   return it != extended_register_values_.end() ? it->second : 0;
 }
 
+namespace {
+// RegisterFile::GetRegisterInfo is a switch over every known register. Calling it
+// on each register write, only to log writes to unknown registers, cost more than
+// the rest of the write; look the registers up once instead.
+class KnownRegisters {
+ public:
+  KnownRegisters() {
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      if (RegisterFile::GetRegisterInfo(i)) {
+        bits_[i >> 6] |= uint64_t(1) << (i & 63);
+      }
+    }
+  }
+  bool IsKnown(uint32_t index) const { return (bits_[index >> 6] >> (index & 63)) & 1; }
+
+ private:
+  uint64_t bits_[(RegisterFile::kRegisterCount + 63) / 64] = {};
+};
+const KnownRegisters known_registers;
+}  // namespace
+
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
   if (index >= RegisterFile::kRegisterCount) {
@@ -356,7 +377,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!known_registers.IsKnown(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -703,10 +724,16 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg) {
+    // Consecutive registers: as a range, so the backend can take the constant
+    // blocks (most of these packets) in one go rather than one virtual
+    // WriteRegister call per register.
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+    WriteRegister(base_index, reg_data);
   }
 
   return true;
