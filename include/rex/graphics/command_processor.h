@@ -86,6 +86,8 @@ class CommandProcessor {
 
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
+  // Called after the guest's vblank interrupt handler has run.
+  void OnVblankDispatched() { vblank_event_->Set(); }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -253,6 +255,9 @@ class CommandProcessor {
   uint32_t read_ptr_writeback_ptr_ = 0;
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+  // Set after each guest vblank interrupt: WAIT_REG_MEM sleeps on it, so a value
+  // the interrupt handler changes (the swap and flip waits) ends the wait at once.
+  std::unique_ptr<rex::thread::Event> vblank_event_;
   std::atomic<uint32_t> write_ptr_index_;
 
   // Some titles submit writes beyond the emulated register file range in PM4

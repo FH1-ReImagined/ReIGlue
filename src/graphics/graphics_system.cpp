@@ -329,6 +329,9 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+  if (command_processor_) {
+    command_processor_->OnVblankDispatched();
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

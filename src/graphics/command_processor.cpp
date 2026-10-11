@@ -110,8 +110,10 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       register_file_(graphics_system_->register_file()),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
+      vblank_event_(rex::thread::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
   assert_not_null(write_ptr_index_event_);
+  assert_not_null(vblank_event_);
 }
 
 CommandProcessor::~CommandProcessor() = default;
@@ -1065,7 +1067,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // Sleep, but wake up after a guest vblank interrupt: games wait here
+          // for values their interrupt handler changes (the frame flip), and a
+          // full sleep added up to a millisecond to every such wait.
+          rex::thread::Wait(vblank_event_.get(), false, std::chrono::milliseconds(wait / 0x100));
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
