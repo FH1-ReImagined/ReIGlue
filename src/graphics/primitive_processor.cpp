@@ -284,6 +284,7 @@ void PrimitiveProcessor::ClearPerFrameCache() {
 
 bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
   SCOPE_profile_cpu_f("gpu");
+  last_guest_index_range_ = {};
 
   const RegisterFile& regs = register_file_;
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
@@ -998,6 +999,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
+    last_guest_index_range_ = {guest_index_base, guest_index_buffer_needed_bytes};
     if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes)) {
       REXGPU_ERROR(
           "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "

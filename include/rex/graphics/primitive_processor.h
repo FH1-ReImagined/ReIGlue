@@ -168,6 +168,9 @@ class PrimitiveProcessor {
   // Submission must be open to call (may request the index buffer in the shared
   // memory).
   bool Process(ProcessingResult& result_out);
+  // The shared memory range (start, length in bytes) the last Process call requested for the
+  // guest's indices because the GPU reads them from there, or a zero length.
+  std::pair<uint32_t, uint32_t> last_guest_index_range() const { return last_guest_index_range_; }
 
   // Invalidates the cache within the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
@@ -655,6 +658,8 @@ class PrimitiveProcessor {
   const RegisterFile& register_file_;
   memory::Memory& memory_;
   SharedMemory& shared_memory_;
+
+  std::pair<uint32_t, uint32_t> last_guest_index_range_{};
 
   bool full_32bit_vertex_indices_used_ = false;
   bool convert_triangle_fans_to_lists_ = false;

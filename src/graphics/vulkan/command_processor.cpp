@@ -66,6 +66,12 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
+                    "Record shared memory uploads (vertex and index data the CPU rewrote) "
+                    "before the current render pass when no draw in it has read the uploaded "
+                    "pages, instead of ending the render pass for every upload")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -987,6 +993,12 @@ bool VulkanCommandProcessor::SetupContext() {
   if (!shared_memory_->Initialize()) {
     REXGPU_ERROR("Failed to initialize shared memory");
     return false;
+  }
+  {
+    size_t hoist_page_words =
+        ((size_t(SharedMemory::kBufferSize) >> shared_memory_->page_size_log2()) + 63) / 64;
+    hoist_read_pages_.assign(hoist_page_words, 0);
+    hoist_read_pages_serial_.assign(hoist_page_words, 0);
   }
 
   primitive_processor_ =
@@ -3265,10 +3277,19 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       deferred_command_buffer_.CmdVkEndRenderPass();
     }
     in_render_pass_ = false;
+    hoist_render_pass_ = false;
   }
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+
+  // Shared memory uploads for the draws in this render pass may be recorded here, after the
+  // barriers before it (CanHoistSharedMemoryUpload).
+  if (REXCVAR_GET(vulkan_hoist_shared_memory_uploads) && !hoist_read_pages_.empty()) {
+    hoist_point_ = deferred_command_buffer_.CmdHoistPoint();
+    ++hoist_render_pass_serial_;
+    hoist_render_pass_ = true;
+  }
 
   if (use_dynamic_rendering) {
     VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
@@ -3339,6 +3360,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       deferred_command_buffer_.CmdVkEndRenderPass();
     }
     in_render_pass_ = false;
+    hoist_render_pass_ = false;
   }
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
@@ -3405,6 +3427,63 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   in_render_pass_ = true;
 }
 
+bool VulkanCommandProcessor::CanHoistSharedMemoryUpload(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) const {
+  if (!hoist_render_pass_ || !in_render_pass_) {
+    return false;
+  }
+  for (const std::pair<uint32_t, uint32_t>& range : upload_page_ranges) {
+    if (!range.second) {
+      continue;
+    }
+    uint32_t page_first = range.first;
+    uint32_t page_last = range.first + range.second - 1;
+    if ((page_last >> 6) >= hoist_read_pages_.size()) {
+      return false;
+    }
+    for (uint32_t word = page_first >> 6; word <= (page_last >> 6); ++word) {
+      if (hoist_read_pages_serial_[word] != hoist_render_pass_serial_) {
+        continue;
+      }
+      uint64_t mask = ~uint64_t(0);
+      if (word == (page_first >> 6)) {
+        mask &= ~uint64_t(0) << (page_first & 63);
+      }
+      if (word == (page_last >> 6)) {
+        mask &= ~uint64_t(0) >> (63 - (page_last & 63));
+      }
+      if (hoist_read_pages_[word] & mask) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::MarkSharedMemoryReadInRenderPass(uint32_t start, uint32_t length) {
+  if (!hoist_render_pass_ || !length || start >= SharedMemory::kBufferSize) {
+    return;
+  }
+  length = std::min(length, SharedMemory::kBufferSize - start);
+  uint32_t page_size_log2 = shared_memory_->page_size_log2();
+  uint32_t page_first = start >> page_size_log2;
+  uint32_t page_last = (start + length - 1) >> page_size_log2;
+  for (uint32_t word = page_first >> 6; word <= (page_last >> 6); ++word) {
+    uint64_t mask = ~uint64_t(0);
+    if (word == (page_first >> 6)) {
+      mask &= ~uint64_t(0) << (page_first & 63);
+    }
+    if (word == (page_last >> 6)) {
+      mask &= ~uint64_t(0) >> (63 - (page_last & 63));
+    }
+    if (hoist_read_pages_serial_[word] != hoist_render_pass_serial_) {
+      hoist_read_pages_serial_[word] = hoist_render_pass_serial_;
+      hoist_read_pages_[word] = 0;
+    }
+    hoist_read_pages_[word] |= mask;
+  }
+}
+
 void VulkanCommandProcessor::EndRenderPass() {
   assert_true(submission_open_);
   if (!in_render_pass_) {
@@ -3418,6 +3497,7 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
+  hoist_render_pass_ = false;
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -4266,6 +4346,34 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+
+  // What this draw reads from the shared memory: no upload into it can go before this render
+  // pass any more (CanHoistSharedMemoryUpload).
+  if (hoist_render_pass_) {
+    for (const VulkanShader* shader : {static_cast<const VulkanShader*>(vertex_shader),
+                                       static_cast<const VulkanShader*>(pixel_shader)}) {
+      if (!shader) {
+        continue;
+      }
+      const Shader::ConstantRegisterMap& constant_map = shader->constant_register_map();
+      for (uint32_t i = 0; i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
+        uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
+        uint32_t j;
+        while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+          vfetch_bits_remaining &= ~(uint32_t(1) << j);
+          xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(i * 32 + j);
+          MarkSharedMemoryReadInRenderPass(vfetch_constant.address << 2,
+                                           vfetch_constant.size << 2);
+        }
+      }
+    }
+    std::pair<uint32_t, uint32_t> guest_index_range = primitive_processor_->last_guest_index_range();
+    MarkSharedMemoryReadInRenderPass(guest_index_range.first, guest_index_range.second);
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      MarkSharedMemoryReadInRenderPass(memexport_range.base_address_dwords << 2,
+                                       memexport_range.size_bytes);
+    }
+  }
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -5304,6 +5412,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     current_render_pass_ = VK_NULL_HANDLE;
     current_framebuffer_ = nullptr;
     in_render_pass_ = false;
+    hoist_render_pass_ = false;
     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_compute_pipeline_ = VK_NULL_HANDLE;

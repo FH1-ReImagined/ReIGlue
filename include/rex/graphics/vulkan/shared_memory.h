@@ -49,6 +49,8 @@ class VulkanSharedMemory : public SharedMemory {
 
   VkBuffer buffer() const { return buffer_; }
 
+  using SharedMemory::page_size_log2;
+
  protected:
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                         uint32_t length_allocations) override;
@@ -58,6 +60,8 @@ class VulkanSharedMemory : public SharedMemory {
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
                      VkAccessFlags& access_mask) const;
+  // A barrier on the whole buffer, written into the deferred command buffer directly.
+  void WriteUsageBarrier(Usage from, Usage to);
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
@@ -69,6 +73,13 @@ class VulkanSharedMemory : public SharedMemory {
 
   Usage last_usage_;
   std::pair<uint32_t, uint32_t> last_written_range_;
+
+  // Uploads hoisted before a render pass (VulkanCommandProcessor::CanHoistSharedMemoryUpload)
+  // share one barrier before their copies and one after: the render pass they were hoisted
+  // before, and where its closing barrier is in the hoisted command stream (dropped and
+  // written again after the next upload's copies).
+  uint64_t hoist_render_pass_serial_ = 0;
+  size_t hoist_closing_barrier_offset_ = 0;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;

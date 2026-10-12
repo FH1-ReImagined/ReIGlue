@@ -30,6 +30,24 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
 
 void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
+  hoisted_stream_.clear();
+  write_stream_ = &command_stream_;
+}
+
+size_t DeferredCommandBuffer::CmdHoistPoint() {
+  assert_true(write_stream_ == &command_stream_);
+  auto& args = *reinterpret_cast<ArgsHoistedCommands*>(
+      WriteCommand(Command::kHoistedCommands, sizeof(ArgsHoistedCommands)));
+  args.begin = hoisted_stream_.size();
+  args.end = args.begin;
+  return size_t(reinterpret_cast<const uintmax_t*>(&args) - command_stream_.data());
+}
+
+void DeferredCommandBuffer::ExtendHoistPoint(size_t hoist_point) {
+  assert_true(hoist_point < command_stream_.size());
+  auto& args = *reinterpret_cast<ArgsHoistedCommands*>(command_stream_.data() + hoist_point);
+  assert_true(args.begin <= hoisted_stream_.size());
+  args.end = hoisted_stream_.size();
 }
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
@@ -37,10 +55,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  ExecuteStream(command_buffer, command_stream_.data(), command_stream_.size());
+}
+
+void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                                          size_t stream_remaining) {
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -314,6 +335,14 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                  rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
       } break;
 
+      case Command::kHoistedCommands: {
+        auto& args = *reinterpret_cast<const ArgsHoistedCommands*>(stream);
+        if (args.end > args.begin) {
+          ExecuteStream(command_buffer, hoisted_stream_.data() + args.begin,
+                        args.end - args.begin);
+        }
+      } break;
+
       default:
         assert_unhandled_case(header.command);
         break;
@@ -416,12 +445,13 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
-  size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
-  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
+  std::vector<uintmax_t>& stream = *write_stream_;
+  size_t offset = stream.size();
+  stream.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
+  CommandHeader& header = *reinterpret_cast<CommandHeader*>(stream.data() + offset);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);
-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+  return stream.data() + (offset + kCommandHeaderSizeElements);
 }
 
 }  // namespace rex::graphics::vulkan

@@ -31,6 +31,26 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
+  // Hoisting: commands recorded later but executed earlier, at a hoist point written into the
+  // stream before (the shared memory uploads that VulkanSharedMemory moves before the current
+  // render pass instead of ending it). The hoisted commands go to a second stream; a hoist
+  // point covers a contiguous range of it, which Execute replays where the hoist point is.
+  // Writes a hoist point covering nothing yet, and returns its handle.
+  size_t CmdHoistPoint();
+  // Directs the commands written from now on to the hoisted stream (true) or the main one.
+  void SetWritingHoisted(bool hoisted) {
+    write_stream_ = hoisted ? &hoisted_stream_ : &command_stream_;
+  }
+  size_t hoisted_stream_size() const { return hoisted_stream_.size(); }
+  // Drops the hoisted commands from `size` on (only those of the latest hoist point).
+  void TruncateHoistedStream(size_t size) {
+    assert_true(size <= hoisted_stream_.size());
+    hoisted_stream_.resize(size);
+  }
+  // Makes the hoist point cover the hoisted stream from where it was at CmdHoistPoint to its
+  // current end.
+  void ExtendHoistPoint(size_t hoist_point);
+
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
                             VkSubpassContents contents) {
@@ -381,6 +401,7 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
+    kHoistedCommands,
   };
 
   struct CommandHeader {
@@ -570,6 +591,12 @@ class DeferredCommandBuffer {
     uint32_t mask_reference;
   };
 
+  struct ArgsHoistedCommands {
+    // Range of hoisted_stream_, in elements.
+    size_t begin;
+    size_t end;
+  };
+
   struct ArgsVkSetViewport {
     uint32_t first_viewport;
     uint32_t viewport_count;
@@ -578,11 +605,15 @@ class DeferredCommandBuffer {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                     size_t stream_remaining);
 
   const VulkanCommandProcessor& command_processor_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  std::vector<uintmax_t> hoisted_stream_;
+  std::vector<uintmax_t>* write_stream_ = &command_stream_;
 };
 
 }  // namespace rex::graphics::vulkan

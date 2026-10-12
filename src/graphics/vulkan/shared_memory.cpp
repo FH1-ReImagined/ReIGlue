@@ -273,15 +273,32 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  // In a render pass whose draws have not read these pages, copy before the render pass
+  // instead of ending it: between a barrier after everything that read the buffer before the
+  // render pass and one before the render pass's reads, which all the uploads hoisted before
+  // the same render pass share.
+  bool hoist = last_usage_ == Usage::kRead && !last_written_range_.second &&
+               command_processor_.CanHoistSharedMemoryUpload(upload_page_ranges);
+  if (hoist) {
+    command_processor_.BeginHoistedCommands();
+    uint64_t hoist_render_pass_serial = command_processor_.hoist_render_pass_serial();
+    if (hoist_render_pass_serial_ != hoist_render_pass_serial) {
+      hoist_render_pass_serial_ = hoist_render_pass_serial;
+      WriteUsageBarrier(Usage::kRead, Usage::kTransferDestination);
+    } else {
+      command_buffer.TruncateHoistedStream(hoist_closing_barrier_offset_);
+    }
+  } else {
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                        upload_page_ranges.front().first)
+                           << page_size_log2()));
+    command_processor_.SubmitBarriers(true);
+  }
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();
@@ -329,7 +346,37 @@ bool VulkanSharedMemory::UploadRanges(
                                    uint32_t(upload_regions_.size()), upload_regions_.data());
     upload_regions_.clear();
   }
+  if (hoist) {
+    hoist_closing_barrier_offset_ = command_buffer.hoisted_stream_size();
+    WriteUsageBarrier(Usage::kTransferDestination, Usage::kRead);
+    command_processor_.EndHoistedCommands();
+    // Another upload of these pages before this render pass would need a barrier between the
+    // two copies: let it end the render pass instead.
+    for (const std::pair<uint32_t, uint32_t>& upload_range : upload_page_ranges) {
+      command_processor_.MarkSharedMemoryReadInRenderPass(upload_range.first << page_size_log2(),
+                                                          upload_range.second << page_size_log2());
+    }
+  }
   return successful;
+}
+
+void VulkanSharedMemory::WriteUsageBarrier(Usage from, Usage to) {
+  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+  VkAccessFlags src_access_mask, dst_access_mask;
+  GetUsageMasks(from, src_stage_mask, src_access_mask);
+  GetUsageMasks(to, dst_stage_mask, dst_access_mask);
+  VkBufferMemoryBarrier barrier;
+  barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  barrier.pNext = nullptr;
+  barrier.srcAccessMask = src_access_mask;
+  barrier.dstAccessMask = dst_access_mask;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.buffer = buffer_;
+  barrier.offset = 0;
+  barrier.size = VK_WHOLE_SIZE;
+  command_processor_.deferred_command_buffer().CmdVkPipelineBarrier(
+      src_stage_mask, dst_stage_mask, 0, 0, nullptr, 1, &barrier, 0, nullptr);
 }
 
 void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,

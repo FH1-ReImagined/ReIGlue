@@ -204,6 +204,26 @@ class VulkanCommandProcessor : public CommandProcessor {
   // scope. Submission must be open.
   void EndRenderPass();
 
+  // Shared memory upload hoisting (VulkanSharedMemory::UploadRanges): in a render pass begun for
+  // guest draws, an upload of pages that no draw in the render pass has read yet is recorded
+  // before the render pass (after the barriers preceding it) instead of ending it. Without
+  // this, every vertex or index upload in a render pass (tens of thousands a second in a Forza
+  // race) ends it, copies between two barriers and begins it again.
+  // Whether an upload of these shared memory pages (first, count) can be hoisted now.
+  bool CanHoistSharedMemoryUpload(
+      const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) const;
+  // A new value for every render pass that hoisted commands can go before.
+  uint64_t hoist_render_pass_serial() const { return hoist_render_pass_serial_; }
+  // Between these, the deferred command buffer's commands go before the current render pass.
+  void BeginHoistedCommands() { deferred_command_buffer_.SetWritingHoisted(true); }
+  void EndHoistedCommands() {
+    deferred_command_buffer_.SetWritingHoisted(false);
+    deferred_command_buffer_.ExtendHoistPoint(hoist_point_);
+  }
+  // Records that the GPU reads (or will read, for the upload itself) these bytes of the shared
+  // memory in the current render pass, so they are not uploaded before it any more.
+  void MarkSharedMemoryReadInRenderPass(uint32_t start, uint32_t length);
+
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
     return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
@@ -794,6 +814,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+
+  // Upload hoisting (CanHoistSharedMemoryUpload): whether the current render pass takes
+  // hoisted commands, its hoist point in the deferred command buffer, and the shared memory
+  // pages its draws read (a bit per page, in 64-page words that only count if their serial is
+  // the render pass's, so nothing needs clearing between render passes).
+  bool hoist_render_pass_ = false;
+  size_t hoist_point_ = 0;
+  uint64_t hoist_render_pass_serial_ = 0;
+  std::vector<uint64_t> hoist_read_pages_;
+  std::vector<uint64_t> hoist_read_pages_serial_;
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is
