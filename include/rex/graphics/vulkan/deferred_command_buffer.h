@@ -31,6 +31,25 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
+  // The recorded commands, taken out for another thread to execute (threaded submission).
+  struct Streams {
+    std::vector<uintmax_t> main;
+    std::vector<uintmax_t> hoisted;
+  };
+  // Swaps the recorded commands with `streams` (normally empty ones, whose allocations are
+  // reused) and starts recording anew.
+  void TakeStreams(Streams& streams) {
+    command_stream_.swap(streams.main);
+    hoisted_stream_.swap(streams.hoisted);
+    Reset();
+  }
+  // Executes commands taken with TakeStreams. Touches nothing else in the deferred command
+  // buffer, so it may run on another thread while new commands are recorded.
+  void ExecuteStreams(VkCommandBuffer command_buffer, const Streams& streams) const {
+    ExecuteStream(command_buffer, streams.main.data(), streams.main.size(),
+                  streams.hoisted.data());
+  }
+
   // Hoisting: commands recorded later but executed earlier, at a hoist point written into the
   // stream before (the shared memory uploads that VulkanSharedMemory moves before the current
   // render pass instead of ending it). The hoisted commands go to a second stream; a hoist
@@ -606,7 +625,7 @@ class DeferredCommandBuffer {
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
   void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
-                     size_t stream_remaining);
+                     size_t stream_remaining, const uintmax_t* hoisted_stream) const;
 
   const VulkanCommandProcessor& command_processor_;
 

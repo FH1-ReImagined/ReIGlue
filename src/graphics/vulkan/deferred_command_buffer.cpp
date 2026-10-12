@@ -55,11 +55,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  ExecuteStream(command_buffer, command_stream_.data(), command_stream_.size());
+  ExecuteStream(command_buffer, command_stream_.data(), command_stream_.size(),
+                hoisted_stream_.data());
 }
 
 void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
-                                          size_t stream_remaining) {
+                                          size_t stream_remaining,
+                                          const uintmax_t* hoisted_stream) const {
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
   while (stream_remaining) {
@@ -338,8 +340,8 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
       case Command::kHoistedCommands: {
         auto& args = *reinterpret_cast<const ArgsHoistedCommands*>(stream);
         if (args.end > args.begin) {
-          ExecuteStream(command_buffer, hoisted_stream_.data() + args.begin,
-                        args.end - args.begin);
+          ExecuteStream(command_buffer, hoisted_stream + args.begin, args.end - args.begin,
+                        hoisted_stream);
         }
       } break;
 

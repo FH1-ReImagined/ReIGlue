@@ -11,11 +11,14 @@
  */
 
 #include <array>
+#include <atomic>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -38,6 +41,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/system/kernel_state.h>
+#include <rex/thread.h>
 #include <rex/ui/vulkan/linked_type_descriptor_set_allocator.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
@@ -298,6 +302,24 @@ class VulkanCommandProcessor : public CommandProcessor {
     size_t bind_offset;
     uint32_t bind_count;
   };
+
+  // Threaded submission (vulkan_threaded_submission): EndSubmission hands the closed
+  // submission to a thread that records its deferred commands into the Vulkan command buffer
+  // and submits it, while the command processor goes on with the next packets. Before, that
+  // replay (mostly driver time) ran on the command processor thread at every submission.
+  struct SubmissionJob {
+    uint64_t submission;
+    DeferredCommandBuffer::Streams streams;
+    CommandBuffer command_buffer;
+    VkFence fence;
+    std::vector<VkSemaphore> wait_semaphores;
+    std::vector<VkPipelineStageFlags> wait_stage_masks;
+  };
+  void SubmissionThread();
+  // Waits until the submission thread has submitted everything up to `submission` (or
+  // failed to).
+  void AwaitSubmissionThread(uint64_t submission);
+  void ShutdownSubmissionThread();
 
   union TextureDescriptorSetLayoutKey {
     uint32_t key;
@@ -572,6 +594,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+
+  // Threaded submission (SubmissionJob). A submission's fence may only be waited for once the
+  // thread has submitted it (submission_thread_submitted_).
+  std::unique_ptr<rex::thread::Thread> submission_thread_;
+  std::mutex submission_thread_mutex_;
+  std::condition_variable submission_thread_request_cond_;
+  std::condition_variable submission_thread_done_cond_;
+  std::deque<SubmissionJob> submission_thread_jobs_;
+  std::vector<DeferredCommandBuffer::Streams> submission_thread_free_streams_;
+  bool submission_thread_shutdown_ = false;
+  // The last submission the thread has handled (submitted, or failed to).
+  std::atomic<uint64_t> submission_thread_submitted_{0};
+  std::atomic<bool> submission_thread_failed_{false};
+  std::atomic<bool> submission_thread_device_lost_{false};
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
