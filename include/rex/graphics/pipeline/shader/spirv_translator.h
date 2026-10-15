@@ -399,6 +399,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+    // NVIDIA's explicit cube Grad path can corrupt ordinary reflection fetches.
+    bool implicit_cube_lod;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,

@@ -1491,8 +1491,16 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // 2D vectors for k1D (because 1D images are emulated as 2D arrays),
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
+        // Ordinary cubemap fetches already request automatic LOD. Let NVIDIA
+        // derive it in the sample instruction: manually emitting coarse Grad
+        // here produced checkerboard car reflections and bloom blowouts. This
+        // matches the captured shader's reference result and retains mip bias
+        // and filtering. Guest register gradients and explicit LOD stay explicit.
+        const bool implicit_cube_lod = features_.implicit_cube_lod && is_pixel_shader() &&
+            instr.dimension == xenos::FetchOpDimension::kCube && use_computed_lod &&
+            !instr.attributes.use_register_gradients;
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
-        if (use_computed_lod) {
+        if (use_computed_lod && !implicit_cube_lod) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
           // gradient exponent biases from the word 4 of the fetch constant in
@@ -1655,7 +1663,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::ImageOperandsMask image_operands_mask =
             use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
         spv::Id sample_result_unsigned, sample_result_signed;
-        if (!use_computed_lod) {
+        if (implicit_cube_lod) {
+          image_operands_mask = spv::ImageOperandsBiasMask;
+          texture_parameters.bias = lod;
+        } else if (!use_computed_lod) {
           texture_parameters.lod = lod;
         }
         if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
@@ -1875,7 +1886,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod) {
+          if (use_computed_lod && !implicit_cube_lod) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }

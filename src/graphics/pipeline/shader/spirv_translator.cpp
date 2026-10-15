@@ -21,10 +21,14 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_implicit_cube_lod, true, "GPU/Vulkan",
+    "Use hardware implicit LOD for automatic cubemap fetches on NVIDIA");
 
 namespace rex::graphics {
 
@@ -42,7 +46,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       rounding_mode_rte_float32(all),
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
-      sample_rate_shading(all) {}
+      sample_rate_shading(all),
+      implicit_cube_lod(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -59,7 +64,9 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
-      sample_rate_shading(vulkan_device->properties().sampleRateShading) {
+      sample_rate_shading(vulkan_device->properties().sampleRateShading),
+      implicit_cube_lod(vulkan_device->properties().vendorID == 0x10DE &&
+                        REXCVAR_GET(vulkan_implicit_cube_lod)) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
