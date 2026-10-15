@@ -2902,7 +2902,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
-  uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+  uint64_t resolve_key = GetReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
 

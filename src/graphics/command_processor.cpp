@@ -189,6 +189,26 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
                                          : ReadbackResolveMode::kDisabled;
 }
 
+uint64_t CommandProcessor::GetReadbackResolveKey(uint32_t written_address,
+                                                 uint32_t written_length) const {
+  const RegisterFile& regs = *register_file_;
+  reg::RB_COPY_CONTROL copy_control = regs.Get<reg::RB_COPY_CONTROL>();
+  reg::RB_COPY_DEST_INFO dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
+  // Not the exponent bias, the EDRAM base or the size: they may change from frame to frame
+  // in the same pass, and each change would be a GPU wait.
+  uint64_t signature = uint64_t(copy_control.copy_src_select >= 4) |
+                       (uint64_t(dest_info.copy_dest_format) << 1) |
+                       (uint64_t(dest_info.copy_dest_number) << 7) |
+                       (uint64_t(dest_info.copy_dest_endian) << 10) |
+                       (uint64_t(dest_info.copy_dest_swap) << 13) |
+                       (uint64_t(dest_info.copy_dest_array) << 14) |
+                       (uint64_t(dest_info.copy_dest_slice) << 15);
+  // Distinct keys for distinct signatures; signature 0 (a color copy to k_1_REVERSE) keeps
+  // the plain (address, length) key.
+  return ((uint64_t(written_address) << 32) | uint64_t(written_length)) ^
+         (signature * UINT64_C(0x9E3779B97F4A7C15));
+}
+
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
   if (legacy_readback_memexport_cvar_name_ &&
       rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {

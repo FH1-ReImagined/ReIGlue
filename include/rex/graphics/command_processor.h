@@ -229,6 +229,12 @@ class CommandProcessor {
 
   // Shared readback resolve mode with backend legacy-flag alias support.
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
+  // Key of the resolve readback buffers of the current copy: the written range, plus whether
+  // the copy is from depth or color and its destination format. A range that one pass resolves
+  // every frame (a depth buffer) and another pass resolves once for the CPU to read (a color
+  // image) then has a buffer per pass, so the rare copy is a first-seen key: "some" copies it
+  // back, and "fast" does not hand the CPU the other pass's data of the previous resolve.
+  uint64_t GetReadbackResolveKey(uint32_t written_address, uint32_t written_length) const;
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 

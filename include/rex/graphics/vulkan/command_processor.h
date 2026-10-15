@@ -517,9 +517,6 @@ class VulkanCommandProcessor : public CommandProcessor {
     }
     return rex::align(size, kReadbackBufferSizeIncrement);
   }
-  static inline uint64_t MakeReadbackResolveKey(uint32_t address, uint32_t length) {
-    return (uint64_t(address) << 32) | uint64_t(length);
-  }
   static inline uint64_t MakeMemexportReadbackKey(uint32_t first_base_address_dwords,
                                                   uint32_t total_size) {
     return (uint64_t(first_base_address_dwords) << 32) | uint64_t(total_size);

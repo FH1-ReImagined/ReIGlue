@@ -5151,7 +5151,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   };
 
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
-  uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+  uint64_t resolve_key = GetReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
   readback.last_used_frame = frame_current_;
   uint32_t write_index = readback.current_index;
