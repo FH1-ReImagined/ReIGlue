@@ -116,12 +116,14 @@ target_link_libraries(rexui PUBLIC
 )
 target_link_libraries(rexui PRIVATE utf8cpp)
 
+# REX_HAS_FIDELITYFX_SDK (the spatial effects, CAS and FSR 1) is defined for the whole SDK in
+# the top-level CMakeLists.txt; only the temporal upscaler (REX_HAS_FIDELITYFX_RUNTIME below)
+# needs the FidelityFX SDK.
 if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
     target_include_directories(rexui PRIVATE
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include"
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
-    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)

@@ -41,10 +41,20 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
     .range(0, 100);
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#else
+// Without the FidelityFX runtime there is no temporal upscaler: fsr2 / fsr3 would only run
+// the spatial FSR 1 passes under a name that promises more.
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                      "Guest output effect: bilinear, cas (sharpen, up to 2x), fsr (FSR 1 "
+                      "upscaling and sharpening)")
+    .allowed({"bilinear", "cas", "fsr"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,

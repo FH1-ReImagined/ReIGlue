@@ -256,6 +256,10 @@ add_compile_options(
 
 include_directories(${REXGLUE_ROOT}/include)
 
+# The spatial output effects (CAS, FSR 1) run precompiled shaders from src/ui/shaders and need
+# no FidelityFX library. The macro changes the layout of ui::Presenter, so every target that
+# includes <rex/ui/presenter.h> (rexui, the Xenos plugin, the games) must see it.
+add_compile_definitions(REX_HAS_FIDELITYFX_SDK=1)
 add_subdirectory(src/core)
 add_subdirectory(src/filesystem)
 add_subdirectory(src/ui)
