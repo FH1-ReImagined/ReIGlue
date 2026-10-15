@@ -1838,6 +1838,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             assert_true(guest_output_paint_fs_[size_t(swapchain_effect)] != VK_NULL_HANDLE);
             swapchain_effect_pipeline.swapchain_pipeline = CreateGuestOutputPaintPipeline(
                 swapchain_effect, paint_context_.swapchain_render_pass);
+            if (swapchain_effect_pipeline.swapchain_pipeline != VK_NULL_HANDLE) {
+              swapchain_effect_pipeline.swapchain_format =
+                  paint_context_.swapchain_render_pass_format;
+            }
             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
               guest_output_flow.effect_count = 0;
             }
