@@ -249,10 +249,11 @@ endif()
 add_subdirectory(thirdparty)
 
 # Enable warnings after thirdparty
-add_compile_options(
-    -Wall
-    -Wextra
-)
+if(MSVC)
+    add_compile_options(/clang:-Wall /clang:-Wextra)
+else()
+    add_compile_options(-Wall -Wextra)
+endif()
 
 include_directories(${REXGLUE_ROOT}/include)
 
