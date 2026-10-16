@@ -14,6 +14,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/ui/gpu_vendor.h>
 #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -29,8 +30,11 @@ REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_break_on_warning, false, "UI/D3D12",
                     "Break on Direct3D 12 validation warnings");
 
+REXCVAR_DECLARE(std::string, gpu_vendor);
+
 REXCVAR_DEFINE_INT32(d3d12_adapter, -1, "UI/D3D12",
-                     "Index of the DXGI adapter to use (-1 for any physical, -2 for WARP)")
+                     "Index of the DXGI adapter to use (-1 for the gpu_vendor one, else the one with "
+                     "the most dedicated video memory, -2 for WARP)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
@@ -250,32 +254,64 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter.
+  // Choose the adapter. An index (d3d12_adapter >= 0) or WARP (-2) is taken as given. Otherwise the
+  // adapters that can create a device compete: the vendor asked for with gpu_vendor first, then the
+  // one with the most dedicated video memory (a laptop's integrated GPU is often listed first and
+  // has little of its own, #89), then the lowest index.
+  const int32_t wanted_adapter = REXCVAR_GET(d3d12_adapter);
+  const uint32_t wanted_vendor = rex::ui::PreferredGpuVendorId(REXCVAR_GET(gpu_vendor));
   uint32_t adapter_index = 0;
+  uint32_t chosen_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
-    DXGI_ADAPTER_DESC1 adapter_desc;
-    if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
-      if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
-                                             nullptr))) {
-        if (REXCVAR_GET(d3d12_adapter) >= 0) {
-          if (adapter_index == REXCVAR_GET(d3d12_adapter)) {
-            break;
-          }
-        } else if (REXCVAR_GET(d3d12_adapter) == -2) {
-          if (adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
-            break;
-          }
-        } else {
-          if (!(adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-            break;
+  {
+    IDXGIAdapter1* candidate = nullptr;
+    bool vendor_found = false;
+    uint32_t best_vendor_match = 0;
+    SIZE_T best_memory = 0;
+    while (dxgi_factory->EnumAdapters1(adapter_index, &candidate) == S_OK) {
+      DXGI_ADAPTER_DESC1 desc;
+      bool keep = false;
+      if (SUCCEEDED(candidate->GetDesc1(&desc)) &&
+          SUCCEEDED(pfn_d3d12_create_device_(candidate, D3D_FEATURE_LEVEL_11_0,
+                                             _uuidof(ID3D12Device), nullptr))) {
+        const bool software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        REXLOG_INFO("DXGI adapter {}: vendor 0x{:04X}, device 0x{:04X}, {} MB dedicated{}",
+                    adapter_index, desc.VendorId, desc.DeviceId,
+                    uint64_t(desc.DedicatedVideoMemory >> 20), software ? ", software" : "");
+        if (wanted_adapter >= 0) {
+          keep = adapter_index == uint32_t(wanted_adapter);
+        } else if (wanted_adapter == -2) {
+          keep = software;
+        } else if (!software) {
+          const uint32_t vendor_match = wanted_vendor && desc.VendorId == wanted_vendor ? 1 : 0;
+          vendor_found = vendor_found || vendor_match;
+          keep = !adapter || vendor_match > best_vendor_match ||
+                 (vendor_match == best_vendor_match && desc.DedicatedVideoMemory > best_memory);
+          if (keep) {
+            best_vendor_match = vendor_match;
+            best_memory = desc.DedicatedVideoMemory;
           }
         }
       }
+      if (keep) {
+        if (adapter) {
+          adapter->Release();
+        }
+        adapter = candidate;
+        chosen_index = adapter_index;
+        if (wanted_adapter >= 0 || wanted_adapter == -2) {
+          break;
+        }
+      } else {
+        candidate->Release();
+      }
+      candidate = nullptr;
+      ++adapter_index;
     }
-    adapter->Release();
-    adapter = nullptr;
-    ++adapter_index;
+    if (wanted_vendor && wanted_adapter < 0 && !vendor_found) {
+      REXLOG_WARN("gpu_vendor '{}' matches no Direct3D 12 adapter; choosing automatically",
+                  REXCVAR_GET(gpu_vendor));
+    }
   }
   if (adapter == nullptr) {
     REXLOG_ERROR(
@@ -298,8 +334,8 @@ bool D3D12Provider::Initialize() {
     char* adapter_name_mb = reinterpret_cast<char*>(alloca(adapter_name_mb_size));
     if (WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, adapter_name_mb,
                             adapter_name_mb_size, nullptr, nullptr) != 0) {
-      REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X})", adapter_name_mb,
-                  adapter_desc.VendorId, adapter_desc.DeviceId);
+      REXGPU_INFO("DXGI adapter in use: {}: {} (vendor 0x{:04X}, device 0x{:04X})", chosen_index,
+                  adapter_name_mb, adapter_desc.VendorId, adapter_desc.DeviceId);
     }
   }
 

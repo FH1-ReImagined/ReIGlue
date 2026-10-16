@@ -14,6 +14,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/ui/gpu_vendor.h>
 #include <rex/ui/vulkan/immediate_drawer.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
@@ -23,6 +24,13 @@ REXCVAR_DEFINE_BOOL(vulkan_validation_enabled, false, "UI/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_INT32(vulkan_device, -1, "UI/Vulkan", "Vulkan device index (-1 for auto selection)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(
+    gpu_vendor, "", "GPU",
+    "Graphics card to use: nvidia, amd, intel or a PCI vendor id such as 0x10de (Vulkan and "
+    "Direct3D 12). Empty prefers a discrete GPU over an integrated one. vulkan_device / "
+    "d3d12_adapter name an index and win over this.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(vulkan_prefer_geometry_shader, true, "UI/Vulkan",
@@ -83,24 +91,30 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
   }
 
   if (!provider->vulkan_device_) {
-    std::vector<VkPhysicalDevice> physical_devices_ordered = physical_devices;
-    bool prefer_geometry_shader = REXCVAR_GET(vulkan_prefer_geometry_shader);
-    bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
-    bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
-    bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
-    if (with_gpu_emulation && physical_devices.size() > 1 &&
-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
-         prefer_fill_mode_non_solid)) {
-      struct PhysicalDeviceScore {
-        VkPhysicalDevice physical_device;
-        uint32_t score;
-      };
-      std::vector<PhysicalDeviceScore> scored_devices;
-      scored_devices.reserve(physical_devices.size());
-      for (const VkPhysicalDevice physical_device : physical_devices) {
+    // Order: the vendor asked for with gpu_vendor, then the supported features (the prefer_* cvars),
+    // then the kind of device (discrete before integrated before virtual before software), then the
+    // driver's own order. A laptop's integrated GPU is often listed first (#89).
+    const bool prefer_geometry_shader = REXCVAR_GET(vulkan_prefer_geometry_shader);
+    const bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
+    const bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
+    const bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
+    const uint32_t wanted_vendor = rex::ui::PreferredGpuVendorId(REXCVAR_GET(gpu_vendor));
+    struct PhysicalDeviceScore {
+      VkPhysicalDevice physical_device;
+      uint32_t vendor_match;
+      uint32_t score;
+      uint32_t type_rank;
+    };
+    std::vector<PhysicalDeviceScore> scored_devices;
+    scored_devices.reserve(physical_devices.size());
+    bool vendor_found = false;
+    for (const VkPhysicalDevice physical_device : physical_devices) {
+      VkPhysicalDeviceProperties properties;
+      ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
+      uint32_t score = 0;
+      if (with_gpu_emulation) {
         VkPhysicalDeviceFeatures supported_features = {};
         ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
-        uint32_t score = 0;
         if (prefer_geometry_shader && supported_features.geometryShader) {
           ++score;
         }
@@ -113,26 +127,48 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
         if (prefer_fill_mode_non_solid && supported_features.fillModeNonSolid) {
           ++score;
         }
-        scored_devices.push_back({physical_device, score});
       }
-
-      std::stable_sort(scored_devices.begin(), scored_devices.end(),
-                       [](const PhysicalDeviceScore& a, const PhysicalDeviceScore& b) {
-                         return a.score > b.score;
-                       });
-
-      if (!scored_devices.empty() && scored_devices.front().score != scored_devices.back().score) {
-        physical_devices_ordered.clear();
-        physical_devices_ordered.reserve(scored_devices.size());
-        for (const PhysicalDeviceScore& scored_device : scored_devices) {
-          physical_devices_ordered.push_back(scored_device.physical_device);
-        }
+      uint32_t type_rank = 0;
+      switch (properties.deviceType) {
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+          type_rank = 4;
+          break;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+          type_rank = 3;
+          break;
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+          type_rank = 2;
+          break;
+        case VK_PHYSICAL_DEVICE_TYPE_CPU:
+          type_rank = 1;
+          break;
+        default:
+          break;
       }
+      const uint32_t vendor_match = wanted_vendor && properties.vendorID == wanted_vendor ? 1 : 0;
+      vendor_found = vendor_found || vendor_match;
+      scored_devices.push_back({physical_device, vendor_match, score, type_rank});
     }
+    if (wanted_vendor && !vendor_found) {
+      REXLOG_WARN("gpu_vendor '{}' matches no Vulkan physical device; choosing automatically",
+                  REXCVAR_GET(gpu_vendor));
+    }
+    std::stable_sort(scored_devices.begin(), scored_devices.end(),
+                     [](const PhysicalDeviceScore& a, const PhysicalDeviceScore& b) {
+                       if (a.vendor_match != b.vendor_match) {
+                         return a.vendor_match > b.vendor_match;
+                       }
+                       if (a.score != b.score) {
+                         return a.score > b.score;
+                       }
+                       return a.type_rank > b.type_rank;
+                     });
 
-    for (const VkPhysicalDevice physical_device : physical_devices_ordered) {
-      provider->vulkan_device_ = VulkanDevice::CreateIfSupported(
-          provider->vulkan_instance_.get(), physical_device, with_gpu_emulation, with_presentation);
+    for (const PhysicalDeviceScore& scored_device : scored_devices) {
+      provider->vulkan_device_ =
+          VulkanDevice::CreateIfSupported(provider->vulkan_instance_.get(),
+                                          scored_device.physical_device, with_gpu_emulation,
+                                          with_presentation);
       if (provider->vulkan_device_) {
         break;
       }
@@ -144,6 +180,42 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
           "Vulkan logical device");
       return nullptr;
     }
+  }
+
+  {
+    // Said once: which card the game runs on (the list above only names what exists).
+    const VkPhysicalDevice chosen = provider->vulkan_device_->physical_device();
+    VkPhysicalDeviceProperties chosen_properties;
+    ifn.vkGetPhysicalDeviceProperties(chosen, &chosen_properties);
+    size_t chosen_index = 0;
+    for (size_t i = 0; i < physical_devices.size(); ++i) {
+      if (physical_devices[i] == chosen) {
+        chosen_index = i;
+      }
+    }
+    const char* chosen_type = "other";
+    switch (chosen_properties.deviceType) {
+      case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+        chosen_type = "discrete";
+        break;
+      case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+        chosen_type = "integrated";
+        break;
+      case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+        chosen_type = "virtual";
+        break;
+      case VK_PHYSICAL_DEVICE_TYPE_CPU:
+        chosen_type = "software";
+        break;
+      default:
+        break;
+    }
+    REXLOG_INFO("Vulkan device in use: {}: {} (vendor 0x{:04X}, device 0x{:04X}, {}, API {}.{}.{})",
+                chosen_index, chosen_properties.deviceName, chosen_properties.vendorID,
+                chosen_properties.deviceID, chosen_type,
+                VK_VERSION_MAJOR(chosen_properties.apiVersion),
+                VK_VERSION_MINOR(chosen_properties.apiVersion),
+                VK_VERSION_PATCH(chosen_properties.apiVersion));
   }
 
   if (with_presentation) {
