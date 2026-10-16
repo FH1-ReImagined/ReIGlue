@@ -86,6 +86,14 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(sync_pipeline_creation, false, "GPU",
+                    "While set, draws wait for their real pipeline (created at once, or waited "
+                    "for when it is queued) instead of being skipped with a placeholder, "
+                    "whatever async_shader_compilation says. A game sets it around a render that "
+                    "is made once and read back (a car's picture), which would otherwise lose "
+                    "the skipped draws for good.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;

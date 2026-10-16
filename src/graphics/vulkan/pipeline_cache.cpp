@@ -1144,7 +1144,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
   }
 
-  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+  bool use_async = REXCVAR_GET(async_shader_compilation) && !REXCVAR_GET(sync_pipeline_creation) &&
+                   !creation_threads_.empty() &&
                    pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
   uint8_t async_priority = pipeline_util::kPriorityLowest;
   if (use_async) {

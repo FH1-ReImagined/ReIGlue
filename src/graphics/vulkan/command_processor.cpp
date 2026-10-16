@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -21,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -4406,6 +4408,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // may happen between pipeline configuration and binding.
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
+  if (pipeline_is_placeholder && REXCVAR_GET(async_shader_compilation) &&
+      REXCVAR_GET(sync_pipeline_creation)) {
+    // A render that is made once (a car's picture) cannot lose this draw: wait for the
+    // creation thread to swap the real pipeline in (a stuck creation falls back to the skip).
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (pipeline_is_placeholder && std::chrono::steady_clock::now() < wait_deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+      pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline,
+                                                    pipeline_layout_provider,
+                                                    &pipeline_is_placeholder);
+    }
+  }
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
     return true;
