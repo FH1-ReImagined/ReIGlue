@@ -3684,7 +3684,8 @@ void VulkanPipelineCache::StorageWriteThread() {
     bool write_pipeline = false;
     {
       std::unique_lock<std::mutex> lock(storage_write_request_lock_);
-      if (storage_write_thread_shutdown_) {
+      if (storage_write_thread_shutdown_ && storage_write_shader_queue_.empty() &&
+          storage_write_pipeline_queue_.empty()) {
         return;
       }
       if (!storage_write_shader_queue_.empty()) {
@@ -3704,6 +3705,12 @@ void VulkanPipelineCache::StorageWriteThread() {
         flush_pipelines = true;
       }
       if (!shader && !write_pipeline) {
+        // A flush request is work too. Sleeping here left the last batch in
+        // stdio's buffer until another shader appeared, losing cached states
+        // when the game hard-exited. Complete it at the top of the loop first.
+        if (flush_shaders || flush_pipelines) {
+          continue;
+        }
         storage_write_request_cond_.wait(lock);
         continue;
       }
