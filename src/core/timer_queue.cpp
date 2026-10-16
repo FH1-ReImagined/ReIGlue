@@ -16,12 +16,30 @@
 #include <disruptorplus/ring_buffer.hpp>
 #include <disruptorplus/sequence_barrier.hpp>
 #include <disruptorplus/spin_wait_strategy.hpp>
+#ifndef _WIN32
+#include <disruptorplus/blocking_wait_strategy.hpp>
+#endif
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include <rex/assert.h>
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
 
 namespace dp = disruptorplus;
+
+// The timer thread waits for the next due timer or a new one. The spin strategy polls in
+// between (pause loops, then sched_yield 19 times out of 20 and a 1 ms sleep the 20th): with
+// the 1 ms timestamp timer that was 5-7% of a core in a race, and up to 1 ms late in its sleep
+// phase. On POSIX it blocks on a condition variable with the due time as the deadline (a
+// futex: as precise as the thread's timer slack, set to 1 us below). Windows keeps the spin
+// strategy: its condition variable deadlines are whole timer ticks.
+#ifdef _WIN32
+using TimerWaitStrategy = dp::spin_wait_strategy;
+#else
+using TimerWaitStrategy = dp::blocking_wait_strategy;
+#endif
 
 namespace rex::thread {
 
@@ -63,6 +81,9 @@ class TimerQueue {
     };
 
     set_current_thread_name("rex::thread::TimerQueue");
+#ifdef __linux__
+    prctl(PR_SET_TIMERSLACK, 1000UL);
+#endif
 
     while (!stop_token.stop_requested()) {
       {
@@ -142,9 +163,9 @@ class TimerQueue {
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
-  dp::spin_wait_strategy wait_strategy_;
-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  TimerWaitStrategy wait_strategy_;
+  dp::multi_threaded_claim_strategy<TimerWaitStrategy> claim_strategy_;
+  dp::sequence_barrier<TimerWaitStrategy> consumed_;
 
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread
