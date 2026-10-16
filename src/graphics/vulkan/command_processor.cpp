@@ -5279,6 +5279,13 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint64_t resolve_key = GetReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
   readback.last_used_frame = frame_current_;
+  // "some" only needs the first CPU copy of this address/size/format key.
+  // Keep the normal GPU resolve above, but avoid downscaling and transferring
+  // every subsequent result to a host buffer that the CPU will never read.
+  // Touch last_used_frame first so active entries retain the existing lifetime.
+  if (readback_mode == ReadbackResolveMode::kSome && readback.resolve_cpu_copy_valid) {
+    return true;
+  }
   uint32_t write_index = readback.current_index;
   uint32_t readback_size = AlignReadbackBufferSize(written_length);
   if (!ensure_readback_slot(readback, write_index, readback_size)) {
@@ -5485,6 +5492,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
       std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      readback.resolve_cpu_copy_valid = true;
     }
   }
 
