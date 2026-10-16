@@ -575,7 +575,10 @@ class TextureCache {
 
   // Checks if there are any pages that contain scaled resolve data within the
   // range.
-  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // With min_coverage_percent 0, true if any page of the range was resolved to; otherwise only
+  // if resolves wrote at least that percentage of the range's pages.
+  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                             uint32_t min_coverage_percent = 0);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(

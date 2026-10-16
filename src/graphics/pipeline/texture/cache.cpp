@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <utility>
 
@@ -76,6 +77,13 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
                      "draw_resolution_scale_x and draw_resolution_scale_y)")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(scaled_resolve_min_coverage_percent, 50, "GPU",
+                     "A texture is treated as a scaled resolve target (loaded from the scaled "
+                     "resolve buffer, which is zero where nothing was resolved) only if resolves "
+                     "wrote at least this percentage of its guest memory range; 0 treats any "
+                     "overlap as one (Xenia's behavior)")
+    .range(0, 100);
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
@@ -787,10 +795,12 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
     if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
          IsRangeScaledResolved(key.base_page << 12,
-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
+                               scaled_resolve_guest_layout.base.level_data_extent_bytes,
+                               REXCVAR_GET(scaled_resolve_min_coverage_percent))) ||
         (scaled_resolve_guest_layout.mips_total_extent_bytes &&
          IsRangeScaledResolved(key.mip_page << 12,
-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+                               scaled_resolve_guest_layout.mips_total_extent_bytes,
+                               REXCVAR_GET(scaled_resolve_min_coverage_percent)))) {
       key.scaled_resolve = 1;
     }
   }
@@ -1034,7 +1044,8 @@ void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t sub
       uint32_t((textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20));
 }
 
-bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                         uint32_t min_coverage_percent) {
   if (!IsDrawResolutionScaled()) {
     return false;
   }
@@ -1055,6 +1066,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
+  uint32_t resolved_page_count = 0;
   auto global_lock = global_critical_region_.Acquire();
   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
     uint64_t l2_block = scaled_resolve_pages_l2_[i];
@@ -1075,12 +1087,18 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
       if (block_index == block_last && (page_last & 31) != 31) {
         check_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      if (scaled_resolve_pages_[block_index] & check_bits) {
-        return true;
+      uint32_t resolved_bits = scaled_resolve_pages_[block_index] & check_bits;
+      if (resolved_bits) {
+        if (!min_coverage_percent) {
+          return true;
+        }
+        resolved_page_count += uint32_t(std::popcount(resolved_bits));
       }
     }
   }
-  return false;
+  return min_coverage_percent && resolved_page_count &&
+         uint64_t(resolved_page_count) * 100 >=
+             uint64_t(page_last - page_first + 1) * min_coverage_percent;
 }
 
 void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
