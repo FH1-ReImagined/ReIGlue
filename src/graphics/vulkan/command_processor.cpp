@@ -30,6 +30,7 @@
 
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
+#include <glslang/Include/Types.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/util/fh1_hud.h>
@@ -52,6 +53,7 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/util/fh1_jitter.h>
 #include <rex/graphics/vulkan/fh1_dlss.h>
+#include <rex/graphics/vulkan/fh1_fsr3.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -68,7 +70,7 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 REXCVAR_DEFINE_BOOL(fh1_scene_720p_native_hud, false, "GPU/Vulkan",
                     "Experimental FH1: 720p world with a separate native 1440p HUD")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_STRING(fh1_upscaler, "off", "GPU/Vulkan", "FH1 scene reconstruction: off, quality, balanced, performance (dlss), dlaa").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_upscaler, "off", "GPU/Vulkan", "FH1 scene reconstruction: off; NVIDIA DLSS quality, balanced, performance (dlss), dlaa; AMD FSR 3 fsr3_quality, fsr3_balanced, fsr3_performance, fsr3_native").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_UINT32(fh1_output_width, 2560, "GPU/Vulkan", "FH1 reconstruction output width").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_UINT32(fh1_output_height, 1440, "GPU/Vulkan", "FH1 reconstruction output height")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -613,6 +615,70 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
 
 bool CompileFh1Compute(std::string_view source, std::vector<uint32_t>& spirv, std::string& error) {
   return CompileGlslToSpirvInternal(EShLangCompute, source, spirv, error);
+}
+
+bool CompileFh1ComputeReflected(std::string_view source, std::string_view preamble,
+                                const Fh1ShaderInclude& include, std::vector<uint32_t>& spirv,
+                                std::vector<Fh1ShaderBinding>& bindings, std::string& error) {
+  static std::once_flag glslang_initialize_once;
+  std::call_once(glslang_initialize_once, []() { glslang::InitializeProcess(); });
+  class Includer : public glslang::TShader::Includer {
+   public:
+    explicit Includer(const Fh1ShaderInclude& include) : include_(include) {}
+    IncludeResult* includeLocal(const char* name, const char* includer, size_t) override {
+      std::string resolved;
+      std::string_view text;
+      if (!include_(name, includer ? includer : "", resolved, text)) return nullptr;
+      return new IncludeResult(resolved, text.data(), text.size(), nullptr);
+    }
+    IncludeResult* includeSystem(const char* name, const char* includer, size_t depth) override {
+      return includeLocal(name, includer, depth);
+    }
+    void releaseInclude(IncludeResult* result) override { delete result; }
+
+   private:
+    const Fh1ShaderInclude& include_;
+  } includer(include);
+  const std::string preamble_text(preamble);
+  const char* source_c_str = source.data();
+  const int source_length = int(source.size());
+  glslang::TShader shader(EShLangCompute);
+  shader.setStringsWithLengths(&source_c_str, &source_length, 1);
+  shader.setPreamble(preamble_text.c_str());
+  shader.setEnvInput(glslang::EShSourceGlsl, EShLangCompute, glslang::EShClientVulkan, 450);
+  shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
+  shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
+  const EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
+  if (!shader.parse(&kGlslangDefaultTBuiltInResource, 450, false, messages, includer)) {
+    error = std::string("parse failed: ") + shader.getInfoLog();
+    return false;
+  }
+  glslang::TProgram program;
+  program.addShader(&shader);
+  if (!program.link(messages) || !program.buildReflection()) {
+    error = std::string("link failed: ") + program.getInfoLog();
+    return false;
+  }
+  bindings.clear();
+  for (int i = 0; i < program.getNumUniformVariables(); ++i) {
+    const auto& uniform = program.getUniform(i);
+    const glslang::TType* type = uniform.getType();
+    if (!type || type->getBasicType() != glslang::EbtSampler || uniform.getBinding() < 0) continue;
+    bindings.push_back({uniform.name, uint32_t(uniform.getBinding()), false});
+  }
+  for (int i = 0; i < program.getNumUniformBlocks(); ++i) {
+    const auto& block = program.getUniformBlock(i);
+    if (block.getBinding() >= 0) bindings.push_back({block.name, uint32_t(block.getBinding()), true});
+  }
+  glslang::SpvOptions options = {};
+  options.disableOptimizer = true;
+  spirv.clear();
+  glslang::GlslangToSpv(*program.getIntermediate(EShLangCompute), spirv, &options);
+  if (spirv.empty()) {
+    error = "glslang produced empty SPIR-V";
+    return false;
+  }
+  return true;
 }
 
 // Generated with `xb buildshaders`.
@@ -1208,6 +1274,8 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   if (REXCVAR_GET(fh1_scene_720p_native_hud) || REXCVAR_GET(fh1_upscaler) != "off") {
+    const bool fh1_fsr3 = REXCVAR_GET(fh1_upscaler).rfind("fsr3_", 0) == 0;
+    const std::string fh1_backend = fh1_fsr3 ? "AMD FSR 3" : "NVIDIA DLSS";
     const uint32_t output_width = REXCVAR_GET(fh1_output_width);
     const uint32_t output_height = REXCVAR_GET(fh1_output_height);
     const uint32_t output_scale = (output_height + 719) / 720;
@@ -1217,7 +1285,7 @@ bool VulkanCommandProcessor::SetupContext() {
         draw_resolution_scale_y == output_scale &&
         render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
     if (!compatible) {
-      Fh1Dlss::ReportStatus("error: DLSS output/scale or render-target path is incompatible; continuing with native rendering.");
+      Fh1Dlss::ReportStatus("error: " + fh1_backend + " output/scale or render-target path is incompatible; continuing with native rendering.");
       REXGPU_WARN("FH1 reconstruction disabled: incompatible output, scale or render-target path; using native rendering");
     } else {
       bool ready = true;
@@ -1252,8 +1320,8 @@ bool VulkanCommandProcessor::SetupContext() {
         ready = fh1_other_pipelines_->Initialize();
       }
       if (!ready) {
-        Fh1Dlss::ReportStatus("error: NVIDIA DLSS initialization failed; continuing with native rendering. See the game log.");
-        REXGPU_WARN("DLSS unavailable: retaining native rendering");
+        Fh1Dlss::ReportStatus("error: " + fh1_backend + " initialization failed; continuing with native rendering. See the game log.");
+        REXGPU_WARN("{} unavailable: retaining native rendering", fh1_backend);
         fh1_dlss_.reset();
         fh1_other_pipelines_.reset();
         fh1_other_render_targets_.reset();

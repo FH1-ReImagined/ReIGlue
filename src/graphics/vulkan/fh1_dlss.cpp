@@ -7,6 +7,9 @@
 #include <filesystem>
 #include <fstream>
 #include <array>
+#include <chrono>
+#include <cmath>
+#include <rex/graphics/vulkan/fh1_fsr3.h>
 #if defined(REX_FH1_NGX)
 #include <nvsdk_ngx_helpers_vk.h>
 #include <nvsdk_ngx_helpers.h>
@@ -26,6 +29,13 @@ struct Fh1Dlss::State {
 #if defined(REX_FH1_NGX)
   NVSDK_NGX_Parameter* parameters = nullptr;
   NVSDK_NGX_Handle* feature = nullptr;
+#endif
+  // AMD FidelityFX FSR 3 backend: the same inputs, a different reconstruction.
+  bool fsr_mode = false;
+  std::unique_ptr<Fh1Fsr3> fsr;
+  std::chrono::steady_clock::time_point last_frame{};
+  bool InitializeFsr3();
+  void EvaluateFsr3(VkCommandBuffer command, VkImage scene, VkImage destination, const FrameInput& input, bool temporal);
   bool initialized = false, images_ready = false, failed = false;
   uint64_t frames = 0;
   uint64_t submissions = 0;
@@ -180,13 +190,13 @@ void main() {
     region.dstOffsets[1] = {int32_t(dw), int32_t(dh), 1};
     blit(command, src, src_layout, dst, dst_layout, 1, &region, VK_FILTER_LINEAR);
   }
-#endif
 };
 Fh1Dlss::Fh1Dlss(const ui::vulkan::VulkanDevice* device, uint32_t output_width,
                    uint32_t output_height, std::string_view mode) : state_(std::make_unique<State>()) {
   state_->device = device;
   state_->mode = mode;
   state_->dlaa = mode == "dlaa";
+  state_->fsr_mode = mode.rfind("fsr3_", 0) == 0;
   state_->output_width = output_width;
   state_->output_height = output_height;
 }
@@ -196,11 +206,13 @@ uint32_t Fh1Dlss::output_width() const { return state_->output_width; }
 uint32_t Fh1Dlss::output_height() const { return state_->output_height; }
 void Fh1Dlss::SetSceneBacking(uint32_t scale) { state_->backing_scale = scale; }
 Fh1Dlss::~Fh1Dlss() {
-#if defined(REX_FH1_NGX)
   auto& s = *state_;
+  s.fsr.reset();
+#if defined(REX_FH1_NGX)
   if (s.feature) NVSDK_NGX_VULKAN_ReleaseFeature(s.feature);
   if (s.parameters) NVSDK_NGX_VULKAN_DestroyParameters(s.parameters);
   if (s.initialized) NVSDK_NGX_VULKAN_Shutdown1(s.device->device());
+#endif
   for (auto& image : s.images) {
     const auto& f = s.device->functions(); const auto d = s.device->device();
     if (image.view) f.vkDestroyImageView(d, image.view, nullptr);
@@ -215,7 +227,6 @@ Fh1Dlss::~Fh1Dlss() {
   if (s.temporal_sampler) f.vkDestroySampler(d, s.temporal_sampler, nullptr);
   if (s.temporal_constants) f.vkDestroyBuffer(d, s.temporal_constants, nullptr);
   if (s.temporal_memory) f.vkFreeMemory(d, s.temporal_memory, nullptr);
-#endif
 }
 void Fh1Dlss::ReportStatus(std::string_view message) {
 #if defined(_WIN32)
@@ -240,13 +251,18 @@ void Fh1Dlss::BeginFrame(uint64_t frame) {
       while (n) { factor /= float(radix); value += factor * float(n % radix); n /= radix; }
       return value;
     };
-    input_.jitter_x = halton(frame % 16 + 1, 2) - 0.5f;
-    input_.jitter_y = halton(frame % 16 + 1, 3) - 0.5f;
+    // DLSS: 16 Halton(2,3) phases. FSR 3: the same sequence over its recommended
+    // phase count (ffxFsr3UpscalerGetJitterPhaseCount, 32 for 2x per axis).
+    const uint64_t phases = state_->fsr_mode ?
+        Fh1Fsr3::JitterPhases(state_->width, state_->output_width) : 16;
+    input_.jitter_x = halton(frame % phases + 1, 2) - 0.5f;
+    input_.jitter_y = halton(frame % phases + 1, 3) - 0.5f;
   }
 
 bool Fh1Dlss::Initialize() {
-#if defined(REX_FH1_NGX)
   auto& s = *state_;
+  if (s.fsr_mode) return s.InitializeFsr3();
+#if defined(REX_FH1_NGX)
 #if defined(_WIN32)
   const wchar_t* root = _wgetenv(L"FORZA_DLSS_RUNTIME");
 #else
@@ -309,8 +325,19 @@ bool Fh1Dlss::Initialize() {
 #endif
 }
 void Fh1Dlss::Execute(VkCommandBuffer command, VkImage scene, VkImage destination, const FrameInput& frame_input) {
-#if defined(REX_FH1_NGX)
   auto& s = *state_;
+  if (s.fsr_mode) {
+    ++s.submissions;
+    if (s.failed) {
+      s.Blit(command, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1280 * s.backing_scale, 720 * s.backing_scale, s.output_width, s.output_height);
+      return;
+    }
+    s.EvaluateFsr3(command, scene, destination, frame_input, frame_input.depth_view != VK_NULL_HANDLE);
+    evaluating_.store(true, std::memory_order_release);
+    return;
+  }
+#if defined(REX_FH1_NGX)
   ++s.submissions;
   if (s.failed) {
     s.Blit(command, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
@@ -401,5 +428,90 @@ void Fh1Dlss::Execute(VkCommandBuffer command, VkImage scene, VkImage destinatio
   } else s.Blit(command, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1280 * s.backing_scale, 720 * s.backing_scale, s.output_width, s.output_height);
 #endif
+}
+bool Fh1Dlss::State::InitializeFsr3() {
+  const float ratio = Fh1Fsr3::Ratio(mode);
+  if (ratio <= 0.0f) { REXGPU_ERROR("FSR 3: unknown mode {}", mode); return false; }
+  // ffxFsr3UpscalerGetRenderResolutionFromQualityMode
+  width = uint32_t(float(output_width) / ratio);
+  height = uint32_t(float(output_height) / ratio);
+  const auto& functions = device->vulkan_instance()->functions();
+  blit = reinterpret_cast<PFN_vkCmdBlitImage>(functions.vkGetDeviceProcAddr(device->device(), "vkCmdBlitImage"));
+  update_buffer = reinterpret_cast<PFN_vkCmdUpdateBuffer>(functions.vkGetDeviceProcAddr(device->device(), "vkCmdUpdateBuffer"));
+  if (!blit || !update_buffer || !Create(images[0], width, height, VK_FORMAT_R16G16B16A16_SFLOAT) ||
+      !Create(images[1], output_width, output_height, VK_FORMAT_R16G16B16A16_SFLOAT) ||
+      !Create(images[2], width, height, VK_FORMAT_R32_SFLOAT) ||
+      !Create(images[3], width, height, VK_FORMAT_R16G16_SFLOAT) || !CreateTemporalPipeline()) {
+    REXGPU_ERROR("FSR 3: could not create the reconstruction inputs");
+    return false;
+  }
+  // RCAS after accumulation, on FSR's 0 (soft) to 1 (sharpest) scale; negative turns it off.
+  float sharpness = 0.4f;
+  if (const char* value = std::getenv("FORZA_FSR3_SHARPNESS"); value && *value)
+    sharpness = std::min(float(std::atof(value)), 1.0f);
+  fsr = std::make_unique<Fh1Fsr3>(device);
+  const bool forced_failure = test_failure && std::string_view(test_failure) == "create";
+  if (forced_failure || !fsr->Initialize(width, height, output_width, output_height, images[0].view,
+                                         images[2].view, images[3].view, images[1].view, sharpness,
+                                         update_buffer)) {
+    // Keep the split scene and native HUD; scale the scene bilinearly (logged once).
+    fsr.reset();
+    failed = true;
+    REXGPU_ERROR("FSR 3: upscaler unavailable; this session scales the scene bilinearly");
+    ReportStatus("error: AMD FSR 3 could not start. This session uses bilinear scaling; choose AMD FSR 1 and restart for the spatial filter. See the game log.");
+  } else {
+    REXGPU_INFO("FSR 3: {} input={}x{}, output={}x{}", mode, width, height, output_width, output_height);
+  }
+  return true;
+}
+
+void Fh1Dlss::State::EvaluateFsr3(VkCommandBuffer command, VkImage scene, VkImage destination, const FrameInput& input, bool temporal) {
+  const auto& f = device->functions();
+  if (!images_ready) {
+    for (auto& image : images) {
+      Barrier(command, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+      VkClearColorValue clear{};
+      const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      f.vkCmdClearColorImage(command, image.image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+    }
+    images_ready = true;
+  }
+  Barrier(command, images[0].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+      VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+  Blit(command, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[0].image,
+      VK_IMAGE_LAYOUT_GENERAL, 1280 * backing_scale, 720 * backing_scale, width, height);
+  for (auto& image : images)
+    Barrier(command, image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+  if (temporal) {
+    Temporal(command, input);
+    if (!logged_temporal) { REXGPU_INFO("FSR 3: game reprojection=true"); logged_temporal = true; }
+  }
+  Fh1Fsr3::Frame frame;
+  // Same displacement as DLSS: the viewport jitter in upright color space.
+  frame.jitter_x = -input.jitter_x;
+  frame.jitter_y = -input.jitter_y;
+  frame.reset = !temporal || !previous_temporal;
+  const auto now = std::chrono::steady_clock::now();
+  if (last_frame.time_since_epoch().count())
+    frame.delta_time_ms = std::chrono::duration<float, std::milli>(now - last_frame).count();
+  last_frame = now;
+  // The game's reconstruction (see Temporal) is view z = B / (1 - A - depth).
+  const float a = input.constants[132 * 4], b = input.constants[132 * 4 + 1];
+  frame.device_to_view[0] = -0.001f; frame.device_to_view[1] = 1.0f;
+  if (temporal && std::isfinite(a) && std::isfinite(b) && b != 0.0f) {
+    frame.device_to_view[0] = 1.0f - a;
+    frame.device_to_view[1] = -b / (0.5f - (1.0f - a)) > 0.0f ? -b : b;
+  }
+  fsr->Execute(command, frame);
+  previous_temporal = temporal;
+  if (++frames == 1) ReportStatus("ready: " + mode + " active: " + std::to_string(width) + "x" +
+      std::to_string(height) + " FSR 3 input to " + std::to_string(output_width) + "x" +
+      std::to_string(output_height) + ", native UI. Scene raster " +
+      std::to_string(1280 * backing_scale) + "x" + std::to_string(720 * backing_scale) + ".");
+  Barrier(command, images[1].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+      VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  Blit(command, images[1].image, VK_IMAGE_LAYOUT_GENERAL, destination,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, output_width, output_height, output_width, output_height);
 }
 }

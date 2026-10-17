@@ -46,6 +46,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
     vulkan/fh1_dlss.cpp
+    vulkan/fh1_fsr3.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
@@ -99,6 +100,18 @@ endif()
 
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+
+option(REXGLUE_USE_FSR3 "Build the FH1 AMD FidelityFX FSR 3 upscaler (fetches pinned MIT sources)" ON)
+set(REXGLUE_FSR3_SDK "" CACHE PATH "Optional local FidelityFX SDK v1.1.4; otherwise fetch the pinned FSR 3 sources")
+if(REXGLUE_USE_VULKAN AND REXGLUE_USE_FSR3)
+    include(${REXGLUE_ROOT}/cmake/ForzaFsr3Sdk.cmake)
+    target_compile_definitions(rexgpu-xenos PRIVATE REX_FH1_FSR3=1)
+    target_include_directories(rexgpu-xenos PRIVATE "${FH1_FSR3_GENERATED}")
+    add_custom_command(TARGET rexgpu-xenos POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FH1_FSR3_LICENSE}"
+            "$<TARGET_FILE_DIR:rexgpu-xenos>/AMD-FidelityFX-LICENSE.txt")
+    install(FILES "${FH1_FSR3_LICENSE}" DESTINATION share/licenses/amd-fidelityfx-fsr3)
+endif()
 
 option(REXGLUE_USE_DLSS "Build native FH1 DLSS support (NVIDIA SDK terms apply)" ${WIN32})
 set(REXGLUE_DLSS_SDK "" CACHE PATH "Optional local NVIDIA DLSS SDK; otherwise fetch pinned SDK files")
