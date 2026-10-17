@@ -20,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/wheel/wheel_input_driver.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
@@ -589,6 +590,10 @@ void SDLInputDriver::OnJoystickDeviceAddedLocked(const SDL_Event& event) {
 }
 
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
+  // A wheel that SDL also maps as a gamepad belongs to the wheel driver.
+  if (wheel::IsWheelDevice(event.gdevice.which)) {
+    return;
+  }
   const auto controller = SDL_OpenGamepad(event.gdevice.which);
   if (!controller) {
     assert_always();

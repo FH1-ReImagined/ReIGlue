@@ -21,6 +21,7 @@
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/wheel/wheel_input_driver.h>
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
@@ -505,6 +506,14 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
       auto sdl_driver = std::make_unique<sdl::SDLInputDriver>(nullptr, 0);
       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
         input->AddDriver(std::move(sdl_driver));
+      }
+    }
+
+    // Racing wheels: SDL joysticks that are not gamepads, presented as the 360 wheel.
+    if (REXCVAR_GET(wheel_mode) != "off") {
+      auto wheel_driver = std::make_unique<wheel::WheelInputDriver>(nullptr, 0);
+      if (wheel_driver->Setup() == X_STATUS_SUCCESS) {
+        input->AddDriver(std::move(wheel_driver));
       }
     }
 
