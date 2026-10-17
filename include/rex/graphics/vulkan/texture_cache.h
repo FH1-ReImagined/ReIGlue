@@ -192,6 +192,7 @@ class VulkanTextureCache final : public TextureCache {
     enum class Usage {
       kUndefined,
       kTransferDestination,
+      kComputeDestination,
       kGuestShaderSampled,
       kSwapSampled,
     };
@@ -202,6 +203,8 @@ class VulkanTextureCache final : public TextureCache {
     ~VulkanTexture();
 
     VkImage image() const { return image_; }
+    VkImageView storage_view() const { return storage_view_; }
+    void set_storage_view(VkImageView view) { storage_view_ = view; }
 
     VulkanTexture* upload_texture() { return cube_upload_ ? cube_upload_.get() : this; }
     void SetCubeUpload(std::unique_ptr<VulkanTexture> texture) {
@@ -267,6 +270,7 @@ class VulkanTextureCache final : public TextureCache {
       }
     }
 
+    VkImageView storage_view_ = VK_NULL_HANDLE;
     VkImage image_;
     VmaAllocation allocation_;
 
@@ -354,6 +358,9 @@ class VulkanTextureCache final : public TextureCache {
   static const HostFormatPair kHostFormatDXT5AUnaligned;
   HostFormatPair host_formats_[64];
 
+  bool LoadScaledTextureDirect(VulkanTexture& texture);
+  VkPipelineLayout load_image_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline load_image_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
