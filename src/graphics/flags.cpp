@@ -52,3 +52,27 @@ bool IsGpuDebugMarkersEnabled() {
   }
   return result;
 }
+
+REXCVAR_DEFINE_INT32(forza_native_width, 0, "GPU",
+                     "FH1 active drawing width (0 uses integer scale)")
+    .range(0, 8960)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(forza_native_height, 0, "GPU",
+                     "FH1 active drawing height (0 uses integer scale)")
+    .range(0, 5040)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// Built-in FH1 ultrawide presentation, adapted from Pinyon Shift (BSD-3-Clause).
+REXCVAR_DEFINE_BOOL(forza_present_16_9, false, "GPU",
+                    "Use FH1's 16:9 source aspect before presentation");
+REXCVAR_DEFINE_DOUBLE(forza_ultrawide_hud_x, 1.0, "GPU", "FH1 HUD X scale")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(forza_ultrawide_hud_y, 1.0, "GPU", "FH1 HUD Y scale")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(forza_ultrawide_hud_offset_x, 0.0, "GPU", "FH1 HUD X offset")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(forza_ultrawide_hud_offset_y, 0.0, "GPU", "FH1 HUD Y offset")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(forza_ultrawide_hud_edge_shift, 0.0, "GPU", "FH1 horizontal HUD edge-anchor distance")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);

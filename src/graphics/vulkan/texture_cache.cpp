@@ -1168,6 +1168,25 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     image_create_info.extent.width *= draw_resolution_scale_x();
     image_create_info.extent.height *= draw_resolution_scale_y();
   }
+  const bool rectangular_cube = key.dimension == xenos::DataDimension::kCube &&
+                                image_create_info.extent.width != image_create_info.extent.height;
+  const VkExtent2D upload_extent{image_create_info.extent.width, image_create_info.extent.height};
+  if (rectangular_cube) {
+    VkFormatProperties properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), image_create_info.format, &properties);
+    constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                              VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    if ((properties.optimalTilingFeatures & required) != required) {
+      REXGPU_ERROR("Square cube resolve: format {} does not support filtered blits",
+                   uint32_t(image_create_info.format));
+      return nullptr;
+    }
+    const auto side = std::min(image_create_info.extent.width, image_create_info.extent.height);
+    image_create_info.extent.width = side;
+    image_create_info.extent.height = side;
+  }
   image_create_info.extent.depth = is_3d ? depth_or_array_size : 1;
   image_create_info.mipLevels = key.mip_max_level + 1;
   image_create_info.arrayLayers = is_3d ? 1 : depth_or_array_size;
@@ -1199,7 +1218,26 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     return nullptr;
   }
 
-  return std::unique_ptr<Texture>(new VulkanTexture(*this, key, image, allocation));
+  auto result = std::make_unique<VulkanTexture>(*this, key, image, allocation);
+  if (rectangular_cube) {
+    image_create_info.flags &= ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    image_create_info.extent.width = upload_extent.width;
+    image_create_info.extent.height = upload_extent.height;
+    image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VkImage upload_image;
+    VmaAllocation upload_allocation;
+    if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &upload_image,
+                       &upload_allocation, nullptr) != VK_SUCCESS)
+      return nullptr;
+    auto upload_key = key;
+    upload_key.dimension = xenos::DataDimension::k2DOrStacked;
+    result->SetCubeUpload(
+        std::make_unique<VulkanTexture>(*this, upload_key, upload_image, upload_allocation, false));
+    REXGPU_INFO("Square cube resolve: {}x{} storage -> {}x{} faces", upload_extent.width,
+                upload_extent.height, std::min(upload_extent.width, upload_extent.height),
+                std::min(upload_extent.width, upload_extent.height));
+  }
+  return result;
 }
 
 bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
@@ -1725,8 +1763,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       scratch_buffer_acquisition.SetAccessMask(VK_ACCESS_TRANSFER_READ_BIT),
       VK_ACCESS_TRANSFER_READ_BIT);
   vulkan_texture.MarkAsUsed();
+  auto& upload_texture = *vulkan_texture.upload_texture();
   VulkanTexture::Usage texture_old_usage =
-      vulkan_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+      upload_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
   if (texture_old_usage != VulkanTexture::Usage::kTransferDestination) {
     VkPipelineStageFlags texture_src_stage_mask, texture_dst_stage_mask;
     VkAccessFlags texture_src_access_mask, texture_dst_access_mask;
@@ -1736,7 +1775,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, texture_dst_stage_mask,
                          texture_dst_access_mask, texture_new_layout);
     command_processor_.PushImageMemoryBarrier(
-        vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        upload_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
         texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
         texture_dst_access_mask, texture_old_layout, texture_new_layout);
   } else {
@@ -1747,7 +1786,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     // The source and destination masks are equal, so it must not be skipped as
     // a no-op (as in Xenia).
     command_processor_.PushImageMemoryBarrier(
-        vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        upload_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1755,7 +1794,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   }
   command_processor_.SubmitBarriers(true);
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
-      scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      scratch_buffer, upload_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       level_last - level_first + 1);
   for (uint32_t level = level_first; level <= level_last; ++level) {
     VkBufferImageCopy& copy_region = copy_regions[level - level_first];
@@ -1795,7 +1834,42 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         std::max((height * texture_resolution_scale_y) >> level, UINT32_C(1));
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
   }
-
+  if (&upload_texture != &vulkan_texture) {
+    command_processor_.PushImageMemoryBarrier(
+        upload_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    const auto old = vulkan_texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+    VkPipelineStageFlags stage;
+    VkAccessFlags access;
+    VkImageLayout layout;
+    GetTextureUsageMasks(old, stage, access, layout);
+    command_processor_.PushImageMemoryBarrier(
+        vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(), stage,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT, layout,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        false);
+    command_processor_.SubmitBarriers(true);
+    const auto square_scale = std::min(texture_resolution_scale_x, texture_resolution_scale_y);
+    for (uint32_t level = level_first; level <= level_last; ++level) {
+      VkImageBlit blit{};
+      blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, array_size};
+      blit.dstSubresource = blit.srcSubresource;
+      blit.srcOffsets[1] = {int32_t(std::max(1u, (width * texture_resolution_scale_x) >> level)),
+                            int32_t(std::max(1u, (height * texture_resolution_scale_y) >> level)),
+                            1};
+      blit.dstOffsets[1] = {int32_t(std::max(1u, (width * square_scale) >> level)),
+                            int32_t(std::max(1u, (height * square_scale) >> level)), 1};
+      command_buffer.CmdFh1NativeCubeBlit(upload_texture.image(), vulkan_texture.image(), blit);
+    }
+    command_processor_.PushImageMemoryBarrier(
+        upload_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    command_processor_.SubmitBarriers(true);
+  }
   return true;
 }
 

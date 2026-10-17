@@ -42,6 +42,14 @@ class DeferredCommandBuffer {
         WriteCommand(Command::kVkBlitImage, sizeof(ArgsVkBlitImage)));
     args.src = src; args.dst = dst; args.region = region;
   }
+  // A square cube view is populated from an integer-stride 2D-array resolve.
+  void CmdFh1NativeCubeBlit(VkImage src, VkImage dst, const VkImageBlit& region) {
+    auto& args = *reinterpret_cast<ArgsFh1NativeCubeBlit*>(
+        WriteCommand(Command::kFh1NativeCubeBlit, sizeof(ArgsFh1NativeCubeBlit)));
+    args.src = src;
+    args.dst = dst;
+    args.region = region;
+  }
   void Execute(VkCommandBuffer command_buffer);
 
   // The recorded commands, taken out for another thread to execute (threaded submission).
@@ -407,6 +415,7 @@ class DeferredCommandBuffer {
   enum class Command {
     kFh1Dlss,
     kVkBlitImage,
+    kFh1NativeCubeBlit,
     kVkBeginRenderPass,
     kVkBeginQuery,
     kVkBindDescriptorSets,
@@ -454,6 +463,10 @@ class DeferredCommandBuffer {
   static constexpr size_t kCommandHeaderSizeElements =
       (sizeof(CommandHeader) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
 
+  struct ArgsFh1NativeCubeBlit {
+    VkImage src, dst;
+    VkImageBlit region;
+  };
   struct ArgsVkBeginRenderPass {
     VkRenderPass render_pass;
     VkFramebuffer framebuffer;

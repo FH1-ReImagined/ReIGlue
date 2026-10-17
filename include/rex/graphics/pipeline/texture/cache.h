@@ -116,6 +116,14 @@ class TextureCache {
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
+  bool IsActiveFh1ScreenTexture(uint32_t index) const {
+    const auto* binding = GetValidTextureBinding(index);
+    if (!binding || !binding->texture || !binding->texture->key().scaled_resolve ||
+        binding->key.dimension != xenos::DataDimension::k2DOrStacked)
+      return false;
+    const auto width = binding->key.GetWidth();
+    return width == 1280 || width == 640 || width == 320 || width == 160;
+  }
   uint32_t GetActiveTextureHostSwizzle(uint32_t fetch_constant_index) const {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->host_swizzle : xenos::XE_GPU_TEXTURE_SWIZZLE_0000;

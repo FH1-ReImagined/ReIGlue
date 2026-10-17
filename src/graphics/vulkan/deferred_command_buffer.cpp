@@ -83,6 +83,15 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
         blit_image_(command_buffer, args.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             args.dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &args.region, VK_FILTER_LINEAR);
       } break;
+      case Command::kFh1NativeCubeBlit: {
+        const auto& args = *reinterpret_cast<const ArgsFh1NativeCubeBlit*>(stream);
+        const auto* device = command_processor_.GetVulkanDevice();
+        const auto blit = reinterpret_cast<PFN_vkCmdBlitImage>(
+            device->vulkan_instance()->functions().vkGetDeviceProcAddr(device->device(),
+                                                                       "vkCmdBlitImage"));
+        blit(command_buffer, args.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, args.dst,
+             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &args.region, VK_FILTER_LINEAR);
+      } break;
       case Command::kVkBeginRenderPass: {
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);

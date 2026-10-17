@@ -203,6 +203,12 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image() const { return image_; }
 
+    VulkanTexture* upload_texture() { return cube_upload_ ? cube_upload_.get() : this; }
+    void SetCubeUpload(std::unique_ptr<VulkanTexture> texture) {
+      SetHostMemoryUsage(GetHostMemoryUsage() + texture->GetHostMemoryUsage());
+      texture->SetHostMemoryUsage(0);
+      cube_upload_ = std::move(texture);
+    }
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
       Usage old_usage = usage_;
@@ -268,6 +274,7 @@ class VulkanTextureCache final : public TextureCache {
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
+    std::unique_ptr<VulkanTexture> cube_upload_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
   };

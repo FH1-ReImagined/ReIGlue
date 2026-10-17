@@ -26,6 +26,10 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+REXCVAR_DECLARE(int32_t, forza_native_width);
+REXCVAR_DECLARE(int32_t, forza_native_height);
+
+
 
 REXCVAR_DEFINE_BOOL(vulkan_implicit_cube_lod, true, "GPU/Vulkan",
     "Use hardware implicit LOD for automatic cubemap fetches on NVIDIA");
@@ -47,7 +51,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
       sample_rate_shading(all),
-      implicit_cube_lod(false) {}
+      implicit_cube_lod(false),
+      fh1_native_viewport(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -66,7 +71,9 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
       sample_rate_shading(vulkan_device->properties().sampleRateShading),
       implicit_cube_lod(vulkan_device->properties().vendorID == 0x10DE &&
-                        REXCVAR_GET(vulkan_implicit_cube_lod)) {
+                        REXCVAR_GET(vulkan_implicit_cube_lod)),
+      fh1_native_viewport(REXCVAR_GET(forza_native_width) > 0 &&
+                          REXCVAR_GET(forza_native_height) > 0) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -316,6 +323,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"fh1_native", offsetof(SystemConstants, fh1_native), type_float4_},
+      {"fh1_native_textures", offsetof(SystemConstants, fh1_native_textures), type_uint_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -3269,6 +3278,16 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
           spv::OpFMul, type_float_, param_gen_x,
           builder_->makeFloatConstant(1.0f / (float(draw_resolution_scale_x_) * ((GetSpirvShaderModification().value & kFh1FractionalRaster) ? raster_scale_x_ : 1.0f))));
     }
+    if (features_.fh1_native_viewport) {
+      id_vector_temp_ = {builder_->makeIntConstant(kSystemConstantFh1Native),
+                         builder_->makeIntConstant(2)};
+      param_gen_x = builder_->createNoContractionBinOp(
+          spv::OpFMul, type_float_, param_gen_x,
+          builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                          id_vector_temp_),
+              spv::NoPrecision));
+    }
     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_x);
     if (!modification.pixel.param_gen_point) {
@@ -3304,6 +3323,16 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
       param_gen_y = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_y,
           builder_->makeFloatConstant(1.0f / (float(draw_resolution_scale_y_) * ((GetSpirvShaderModification().value & kFh1FractionalRaster) ? raster_scale_y_ : 1.0f))));
+    }
+    if (features_.fh1_native_viewport) {
+      id_vector_temp_ = {builder_->makeIntConstant(kSystemConstantFh1Native),
+                         builder_->makeIntConstant(3)};
+      param_gen_y = builder_->createNoContractionBinOp(
+          spv::OpFMul, type_float_, param_gen_y,
+          builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                          id_vector_temp_),
+              spv::NoPrecision));
     }
     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_y);

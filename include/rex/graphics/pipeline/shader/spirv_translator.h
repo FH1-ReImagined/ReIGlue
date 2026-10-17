@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,7 +34,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 0x20261017;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -307,7 +308,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_max;
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
+    // XY: active drawing / integer storage dimensions for screen resolves.
+    // ZW: inverse of that ratio for generated guest pixel coordinates.
+    float fh1_native[4];
+    uint32_t fh1_native_textures;
   };
+  static_assert(offsetof(SystemConstants, fh1_native) % 16 == 0);
 
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
@@ -401,6 +407,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool sample_rate_shading;
     // NVIDIA's explicit cube Grad path can corrupt ordinary reflection fetches.
     bool implicit_cube_lod;
+    bool fh1_native_viewport;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -885,6 +892,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantFh1Native,
+    kSystemConstantFh1NativeTextures,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;

@@ -17,6 +17,13 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/util/fh1_hud.h>
+REXCVAR_DECLARE(bool, forza_present_16_9);
+REXCVAR_DECLARE(double, forza_ultrawide_hud_edge_shift);
+REXCVAR_DECLARE(double, forza_ultrawide_hud_x);
+REXCVAR_DECLARE(double, forza_ultrawide_hud_y);
+REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_x);
+REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
@@ -1984,6 +1991,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+  if (REXCVAR_GET(forza_present_16_9)) {
+    display_width = 16;
+    display_height = 9;
+  }
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
@@ -2458,6 +2469,29 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
+
+  // Keep screen-space HUD proportions and position separate from the widened world.
+  if (normalized_color_mask && !normalized_depth_control.z_enable &&
+      regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280 &&
+      regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
+          xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
+    const float sx = float(REXCVAR_GET(forza_ultrawide_hud_x));
+    const float sy = float(REXCVAR_GET(forza_ultrawide_hud_y));
+    float edge_offset = 0;
+    const float edge_shift = float(REXCVAR_GET(forza_ultrawide_hud_edge_shift));
+    const int translation = Fh1HudTranslationRegister(vertex_shader->ucode_data_hash());
+    if (edge_shift != 0 && translation >= 0) {
+      float origin[4];
+      std::memcpy(origin, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + translation * 4], sizeof(origin));
+      edge_offset = edge_shift * Fh1HudEdgeAnchor(origin[0], origin[3]);
+    }
+    viewport_info.ndc_scale[0] *= sx;
+    viewport_info.ndc_scale[1] *= sy;
+    viewport_info.ndc_offset[0] =
+        viewport_info.ndc_offset[0] * sx + float(REXCVAR_GET(forza_ultrawide_hud_offset_x)) + edge_offset;
+    viewport_info.ndc_offset[1] =
+        viewport_info.ndc_offset[1] * sy + float(REXCVAR_GET(forza_ultrawide_hud_offset_y));
+  }
 
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);

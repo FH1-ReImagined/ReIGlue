@@ -1126,6 +1126,30 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                   builder_->makeFloatConstant(scale)), coordinates[i]);
         }
       }
+      if (features_.fh1_native_viewport && instr.dimension == xenos::FetchOpDimension::k2D) {
+        id_vector_temp_ = {builder_->makeIntConstant(kSystemConstantFh1NativeTextures)};
+        const auto mask = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        const auto active = builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, mask,
+                                  builder_->makeUintConstant(UINT32_C(1) << fetch_constant_index)),
+            const_uint_0_);
+        for (uint32_t i = 0; i < 2; ++i) {
+          id_vector_temp_ = {builder_->makeIntConstant(kSystemConstantFh1Native),
+                             builder_->makeIntConstant(i)};
+          const auto ratio = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          coordinates[i] = builder_->createTriOp(
+              spv::OpSelect, type_float_, active,
+              builder_->createNoContractionBinOp(spv::OpFMul, type_float_, coordinates[i], ratio),
+              coordinates[i]);
+        }
+      }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
         spv::Id& z_coordinate_ref = coordinates[2];
         spv::Id z_offset =
