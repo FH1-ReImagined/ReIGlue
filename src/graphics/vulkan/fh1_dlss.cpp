@@ -84,12 +84,16 @@ void main() {
   ivec2 p=ivec2(gl_GlobalInvocationID.xy), size=imageSize(depthOut);
   if(any(greaterThanEqual(p,size))) return;
   vec2 uv=(vec2(p)+0.5)/vec2(size);
-  uvec4 b=uvec4(round(textureLod(packedDepth,vec3(uv,0),0).wxyz*255.0));
+  // The guest depth resolve precedes the final scene's 180-degree rotation.
+  // Sample its matching pixel, and reconstruct in the guest clip coordinates
+  // used by the game's reprojection matrices, not the upright color coordinates.
+  vec2 guestUV=vec2(1.0)-uv;
+  uvec4 b=uvec4(round(textureLod(packedDepth,vec3(guestUV,0),0).wxyz*255.0));
   float depth=exp2(float(int(b.x>>4)-15))*(1.0+float(((b.x&15u)<<16)|(b.y<<8)|b.z)/1048576.0);
   depth=clamp(depth,0.0,1.0);
   uint objectId=b.w>=128u?0u:min((b.w+1u)/3u,24u);
   uint row=32u+4u*objectId;
-  vec2 current=(uv-c[134].xy/vec2(size))*vec2(2.0,-2.0)+vec2(-1.0,1.0);
+  vec2 current=(guestUV-c[134].xy/vec2(size))*vec2(2.0,-2.0)+vec2(-1.0,1.0);
   float denominator=1.0-c[132].x-depth;
   float z=c[132].y/(abs(denominator)>1e-20?denominator:-1e-20);
   // Match the original shader's r3.xyzz products exactly: its homogeneous
@@ -98,7 +102,8 @@ void main() {
   vec4 a=c[row], y=c[row+1u], w=c[row+3u];
   float previousW=dot(position,w);
   vec2 previous=vec2(dot(position,a),dot(position,y))/previousW;
-  vec2 motion=(previous-current)*vec2(size)*vec2(0.5,-0.5);
+  // Rotate the guest current-to-previous displacement into upright color space.
+  vec2 motion=(previous-current)*vec2(size)*vec2(-0.5,0.5);
   if(any(isnan(motion))||any(isinf(motion))||abs(previousW)<1e-20) motion=vec2(0);
   motion=clamp(motion,-vec2(size),vec2(size));
   imageStore(depthOut,p,vec4(depth));
@@ -367,7 +372,9 @@ void Fh1Dlss::Execute(VkCommandBuffer command, VkImage scene, VkImage destinatio
     eval.Feature.pInColor = &resources[0]; eval.Feature.pInOutput = &resources[1];
     eval.pInDepth = &resources[2]; eval.pInMotionVectors = &resources[3];
     eval.InRenderSubrectDimensions = {s.width, s.height}; eval.InMVScaleX = eval.InMVScaleY = 1.0f;
-    eval.InJitterOffsetX = frame_input.jitter_x; eval.InJitterOffsetY = frame_input.jitter_y;
+    // Viewport jitter moves in guest raster space. The final scene rotates both
+    // axes, so NGX must receive that same displacement in upright color space.
+    eval.InJitterOffsetX = -frame_input.jitter_x; eval.InJitterOffsetY = -frame_input.jitter_y;
     eval.InReset = !temporal || !s.previous_temporal;
     eval.InPreExposure = eval.InExposureScale = 1.0f;
     auto result = NGX_VULKAN_EVALUATE_DLSS_EXT(command, s.feature, s.parameters, &eval);

@@ -40,6 +40,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include <rex/graphics/util/fh1_jitter.h>
 #include <rex/graphics/vulkan/fh1_dlss.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
@@ -4491,18 +4492,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
 
-  // Jitter projected scene geometry, preserving the coverage of window-space
-  // clears and depth-always background/screen passes. Moving those passes leaves
-  // stale edge texels that bloom spreads into bright flares before NGX runs.
+  // Keep window-space clears fixed so jitter cannot leave stale edge texels
+  // for bloom. Projected backgrounds still need the same jitter as geometry:
+  // depth-always draws may use a camera projection rather than screen space.
   if (fh1_dlss_ && fh1_dlss_->Evaluating() && !fh1_native_hud_active_ &&
       normalized_depth_control.z_enable &&
-      normalized_depth_control.zfunc != xenos::CompareFunction::kAlways &&
       !regs.Get<reg::PA_CL_VTE_CNTL>().vtx_xy_fmt &&
       regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280) {
     const auto& input = fh1_dlss_->input();
     if (viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
-      viewport_info.ndc_offset[0] += 2.0f * input.jitter_x / float(fh1_dlss_->width());
-      viewport_info.ndc_offset[1] += 2.0f * input.jitter_y / float(fh1_dlss_->height());
+      // Guest EDRAM tiling may crop the host viewport. Convert the desired
+      // full-scene pixel displacement using that viewport's actual extent, so
+      // each tile receives the same jitter instead of a fraction of it.
+      viewport_info.ndc_offset[0] += Fh1ViewportJitter(input.jitter_x,
+          fh1_dlss_->width(), 1280 * draw_resolution_scale_x, viewport_info.xy_extent[0]);
+      viewport_info.ndc_offset[1] += Fh1ViewportJitter(input.jitter_y,
+          fh1_dlss_->height(), 720 * draw_resolution_scale_y, viewport_info.xy_extent[1]);
     }
   }
 
