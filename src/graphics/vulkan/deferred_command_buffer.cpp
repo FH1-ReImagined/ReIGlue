@@ -18,6 +18,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/fh1_dlss.h>
 #include <rex/math.h>
 
 namespace rex::graphics::vulkan {
@@ -70,6 +71,18 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
     stream_remaining -= kCommandHeaderSizeElements;
 
     switch (header.command) {
+      case Command::kFh1Dlss: {
+        const auto& args = *reinterpret_cast<const ArgsFh1Dlss*>(stream);
+        args.effect->Execute(command_buffer, args.src, args.dst, args.input);
+      } break;
+      case Command::kVkBlitImage: {
+        const auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
+        const auto* device = command_processor_.GetVulkanDevice();
+        if (!blit_image_) blit_image_ = reinterpret_cast<PFN_vkCmdBlitImage>(device->vulkan_instance()->functions()
+            .vkGetDeviceProcAddr(device->device(), "vkCmdBlitImage"));
+        blit_image_(command_buffer, args.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            args.dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &args.region, VK_FILTER_LINEAR);
+      } break;
       case Command::kVkBeginRenderPass: {
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);

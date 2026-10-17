@@ -818,6 +818,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           break;
       }
     }
+    if ((raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f) &&
+        instr.dimension == xenos::FetchOpDimension::k2D) size_needed_components |= 0b11;
     if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked && size_needed_components) {
       // Stacked and 3D textures have different size packing - need to get
       // whether the texture is 3D unconditionally.
@@ -994,13 +996,34 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         const_texture_resolution_scale[0] =
             builder_->makeFloatConstant(float(draw_resolution_scale_x_));
         const_texture_resolution_scale_reciprocal[0] =
-            builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_));
+            builder_->makeFloatConstant(1.0f / (float(draw_resolution_scale_x_) * (instr.dimension == xenos::FetchOpDimension::k2D ? raster_scale_x_ : 1.0f)));
       }
       if (revert_resolution_scale_axes & 0b010) {
         const_texture_resolution_scale[1] =
             builder_->makeFloatConstant(float(draw_resolution_scale_y_));
         const_texture_resolution_scale_reciprocal[1] =
-            builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_));
+            builder_->makeFloatConstant(1.0f / (float(draw_resolution_scale_y_) * (instr.dimension == xenos::FetchOpDimension::k2D ? raster_scale_y_ : 1.0f)));
+      }
+    }
+
+    spv::Id fractional_texture = spv::NoResult;
+    if (texture_resolution_scaled != spv::NoResult && instr.dimension == xenos::FetchOpDimension::k2D &&
+        (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f)) {
+      // Match the screen resolve pitches, including height padding (for
+      // example 1280x736). Testing aspect ratio would miss those textures.
+      spv::Id screen_width = builder_->makeBoolConstant(false);
+      for (float width : {1280.0f, 640.0f, 320.0f, 160.0f, 80.0f}) {
+        const spv::Id equal = builder_->createBinOp(spv::OpFOrdEqual, type_bool_, size[0],
+            builder_->makeFloatConstant(width));
+        screen_width = builder_->createBinOp(spv::OpLogicalOr, type_bool_, screen_width, equal);
+      }
+      fractional_texture = builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
+          texture_resolution_scaled, screen_width);
+      for (unsigned i = 0; i < 2; ++i) {
+        const float backing = float(i ? draw_resolution_scale_y_ : draw_resolution_scale_x_);
+        const_texture_resolution_scale_reciprocal[i] = builder_->createTriOp(spv::OpSelect,
+            type_float_, fractional_texture, const_texture_resolution_scale_reciprocal[i],
+            builder_->makeFloatConstant(1.0f / backing));
       }
     }
 
@@ -1092,6 +1115,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             coordinate_ref = builder_->createNoContractionBinOp(
                 spv::OpFAdd, type_float_, coordinate_ref, component_offset_normalized);
           }
+        }
+      }
+      if (fractional_texture != spv::NoResult) {
+        for (unsigned i = 0; i < 2; ++i) {
+          const float scale = i ? raster_scale_y_ : raster_scale_x_;
+          if (scale != 1.0f) coordinates[i] = builder_->createTriOp(spv::OpSelect,
+              type_float_, fractional_texture,
+              builder_->createBinOp(spv::OpFMul, type_float_, coordinates[i],
+                  builder_->makeFloatConstant(scale)), coordinates[i]);
         }
       }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {

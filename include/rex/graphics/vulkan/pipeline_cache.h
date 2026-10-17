@@ -72,6 +72,8 @@ class VulkanPipelineCache {
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                            uint32_t dword_count);
+  // Own a separate translation for this render scale, preserving native-endian ucode.
+  VulkanShader* LoadShaderForDraw(const Shader& shader);
   // Analyze shader microcode on the translator thread.
   void AnalyzeShaderUcode(Shader& shader) { shader.AnalyzeUcode(ucode_disasm_buffer_); }
 

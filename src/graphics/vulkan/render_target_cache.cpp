@@ -1914,9 +1914,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    if (REXCVAR_GET(vulkan_render_target_initial_fill)) {
-      image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    }
+    if (REXCVAR_GET(vulkan_render_target_initial_fill) || command_processor_.fh1_split_enabled())
+      image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   }
   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
     REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
@@ -6243,6 +6242,54 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
     MarkEdramBufferModified();
   }
   return all_pipelines_available;
+}
+
+bool VulkanRenderTargetCache::SeedNativeHud(VulkanRenderTargetCache& scene,
+                                           uint32_t width, uint32_t height) {
+  if (GetPath() != Path::kHostRenderTargets || scene.GetPath() != Path::kHostRenderTargets)
+    return false;
+  auto* src = static_cast<VulkanRenderTarget*>(scene.last_update_accumulated_render_targets()[1]);
+  auto* dst = static_cast<VulkanRenderTarget*>(last_update_accumulated_render_targets()[1]);
+  if (!src || !dst || src->key().msaa_samples != xenos::MsaaSamples::k1X ||
+      dst->key().msaa_samples != xenos::MsaaSamples::k1X ||
+    src->key().GetWidth() < width || dst->key().GetWidth() < width) {
+    REXGPU_WARN("FH1 scene transfer rejected: src={}, dst={}, src samples={}, dst samples={}, src width={}, dst width={}",
+        bool(src), bool(dst), src ? int(src->key().msaa_samples) : -1,
+        dst ? int(dst->key().msaa_samples) : -1,
+        src ? src->key().GetWidth() : 0, dst ? dst->key().GetWidth() : 0);
+    return false;
+  }
+  command_processor_.EndRenderPass();
+  const auto range = ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+  auto transition = [&](VulkanRenderTarget& rt, VkImageLayout layout, VkAccessFlags access) {
+    command_processor_.PushImageMemoryBarrier(rt.image(), range, rt.current_stage_mask(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, rt.current_access_mask(), access, rt.current_layout(), layout);
+    rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, access, layout);
+  };
+  transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT);
+  transition(*dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
+  command_processor_.SubmitBarriers(true);
+  VkImageBlit region{};
+  region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.srcOffsets[1] = {int32_t(width * scene.draw_resolution_scale_x()),
+                          int32_t(height * scene.draw_resolution_scale_y()), 1};
+  region.dstOffsets[1] = {int32_t(width * draw_resolution_scale_x()),
+                          int32_t(height * draw_resolution_scale_y()), 1};
+  if (command_processor_.fh1_dlss()) {
+    command_processor_.deferred_command_buffer().CmdFh1Dlss(
+        command_processor_.fh1_dlss(), src->image(), dst->image());
+    command_processor_.Fh1InvalidateBindings();
+    // NGX may change pipeline bindings on the real command buffer; subsequent
+    // guest work is rebound by the command processor before rendering the HUD.
+  } else {
+    command_processor_.deferred_command_buffer().CmdVkBlitImage(src->image(), dst->image(), region);
+  }
+  command_processor_.PushImageMemoryBarrier(dst->image(), range, dst->current_stage_mask(),
+      VulkanRenderTarget::kColorDrawStageMask, dst->current_access_mask(),
+      VulkanRenderTarget::kColorDrawAccessMask, dst->current_layout(), VulkanRenderTarget::kColorDrawLayout);
+  dst->SetUsage(VulkanRenderTarget::kColorDrawStageMask, VulkanRenderTarget::kColorDrawAccessMask,
+                VulkanRenderTarget::kColorDrawLayout);
+  return true;
 }
 
 }  // namespace rex::graphics::vulkan

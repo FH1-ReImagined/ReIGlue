@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <fstream>
+#include <filesystem>
 #include <deque>
 #include <unordered_map>
 #include <mutex>
@@ -36,6 +38,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include <rex/graphics/vulkan/fh1_dlss.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -49,6 +52,13 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(fh1_scene_720p_native_hud, false, "GPU/Vulkan",
+                    "Experimental FH1: 720p world with a separate native 1440p HUD")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_upscaler, "off", "GPU/Vulkan", "FH1 scene reconstruction: off, quality, balanced, performance (dlss), dlaa").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(fh1_output_width, 2560, "GPU/Vulkan", "FH1 reconstruction output width").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(fh1_output_height, 1440, "GPU/Vulkan", "FH1 reconstruction output height")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -562,6 +572,10 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
 
 }  // namespace
 
+bool CompileFh1Compute(std::string_view source, std::vector<uint32_t>& spirv, std::string& error) {
+  return CompileGlslToSpirvInternal(EShLangCompute, source, spirv, error);
+}
+
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "../shaders/vulkan_spirv/apply_gamma_pwl_cs.h"
@@ -656,7 +670,12 @@ void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first
 void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                      uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
-  pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
+  const auto storage_root = fh1_dlss_ ? cache_root / ("fh1-output-v6-" +
+      std::to_string(fh1_dlss_->output_width()) + "x" + std::to_string(fh1_dlss_->output_height()) +
+      "-" + std::to_string(fh1_dlss_->width()) + "x" + std::to_string(fh1_dlss_->height())) : cache_root;
+  pipeline_cache_->InitializeShaderStorage(fh1_dlss_ ? storage_root / "ui" : storage_root, title_id, blocking);
+  if (fh1_other_pipelines_) fh1_other_pipelines_->InitializeShaderStorage(
+      storage_root / "scene", title_id, blocking);
 }
 
 // Occlusion queries (EVENT_WRITE_ZPD), as Xenia's default "fast" mode does them.
@@ -1117,12 +1136,6 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  pipeline_cache_ = std::make_unique<VulkanPipelineCache>(
-      *this, *register_file_, *render_target_cache_, guest_shader_vertex_stages_);
-  if (!pipeline_cache_->Initialize()) {
-    REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
-    return false;
-  }
 
   // Requires the transient descriptor set layouts.
   texture_cache_ =
@@ -1130,6 +1143,73 @@ bool VulkanCommandProcessor::SetupContext() {
                                  draw_resolution_scale_y, *this, guest_shader_pipeline_stages_);
   if (!texture_cache_) {
     REXGPU_ERROR("Failed to initialize the texture cache");
+    return false;
+  }
+
+  if (REXCVAR_GET(fh1_scene_720p_native_hud) || REXCVAR_GET(fh1_upscaler) != "off") {
+    const uint32_t output_width = REXCVAR_GET(fh1_output_width);
+    const uint32_t output_height = REXCVAR_GET(fh1_output_height);
+    const uint32_t output_scale = (output_height + 719) / 720;
+    const bool supported_output = (output_width == 1920 && output_height == 1080) ||
+        (output_width == 2560 && output_height == 1440) || (output_width == 3840 && output_height == 2160);
+    const bool compatible = supported_output && draw_resolution_scale_x == output_scale &&
+        draw_resolution_scale_y == output_scale &&
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+    if (!compatible) {
+      Fh1Dlss::ReportStatus("error: DLSS output/scale or render-target path is incompatible; continuing with native rendering.");
+      REXGPU_WARN("FH1 reconstruction disabled: incompatible output, scale or render-target path; using native rendering");
+    } else {
+      bool ready = true;
+      uint32_t scene_width = 1280, scene_height = 720;
+      if (REXCVAR_GET(fh1_upscaler) != "off") {
+        fh1_dlss_ = std::make_unique<Fh1Dlss>(GetVulkanDevice(), output_width, output_height,
+            REXCVAR_GET(fh1_upscaler));
+        ready = fh1_dlss_->Initialize();
+        if (ready) { scene_width = fh1_dlss_->width(); scene_height = fh1_dlss_->height(); }
+      }
+      // Guest EDRAM resolves require an integer scene scale. Use a ceiling
+      // raster and resample into NGX's exact recommended input dimensions.
+      // Do not claim that fractional modes shade only the NGX input pixels.
+      const uint32_t scene_scale = std::max((scene_width + 1279) / 1280, (scene_height + 719) / 720);
+      if (ready) {
+        fh1_split_enabled_ = true;
+        render_target_cache_->SetRasterSize(output_width, output_height);
+        fh1_other_render_targets_ = std::make_unique<VulkanRenderTargetCache>(
+            *register_file_, *memory_, scene_scale, scene_scale, *this);
+        fh1_other_render_targets_->SetRasterSize(1280 * scene_scale, 720 * scene_scale);
+        ready = fh1_other_render_targets_->Initialize(shared_memory_binding_count);
+        if (fh1_dlss_) fh1_dlss_->SetSceneBacking(scene_scale);
+      }
+      if (ready && scene_scale != output_scale) {
+        fh1_other_textures_ = VulkanTextureCache::Create(*register_file_, *shared_memory_,
+            scene_scale, scene_scale, *this, guest_shader_pipeline_stages_);
+        ready = bool(fh1_other_textures_);
+      }
+      if (ready) {
+        fh1_other_pipelines_ = std::make_unique<VulkanPipelineCache>(
+            *this, *register_file_, *fh1_other_render_targets_, guest_shader_vertex_stages_);
+        ready = fh1_other_pipelines_->Initialize();
+      }
+      if (!ready) {
+        Fh1Dlss::ReportStatus("error: NVIDIA DLSS initialization failed; continuing with native rendering. See the game log.");
+        REXGPU_WARN("DLSS unavailable: retaining native rendering");
+        fh1_dlss_.reset();
+        fh1_other_pipelines_.reset();
+        fh1_other_render_targets_.reset();
+        fh1_other_textures_.reset();
+        fh1_split_enabled_ = false;
+        render_target_cache_->SetRasterSize(1280 * draw_resolution_scale_x, 720 * draw_resolution_scale_y);
+      } else {
+        REXGPU_INFO("FH1 split rendering initialized: scene={}x{}, UI={}x{}; independent pipeline caches/translators", 1280 * scene_scale, 720 * scene_scale, output_width, output_height);
+        REXGPU_INFO("FH1 reconstruction input={}x{}; raster={}x{}", scene_width, scene_height, 1280 * scene_scale, 720 * scene_scale);
+      }
+    }
+  }
+
+  pipeline_cache_ = std::make_unique<VulkanPipelineCache>(
+      *this, *register_file_, *render_target_cache_, guest_shader_vertex_stages_);
+  if (!pipeline_cache_->Initialize()) {
+    REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
     return false;
   }
 
@@ -2248,10 +2328,18 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
 
+  fh1_dlss_.reset();
+  if (fh1_resolve_pipeline_) dfn.vkDestroyPipeline(device, fh1_resolve_pipeline_, nullptr);
+  if (fh1_resolve_layout_) dfn.vkDestroyPipelineLayout(device, fh1_resolve_layout_, nullptr);
+  fh1_resolve_pipeline_ = VK_NULL_HANDLE;
+  fh1_resolve_layout_ = VK_NULL_HANDLE;
+  fh1_other_textures_.reset();
   texture_cache_.reset();
 
+  fh1_other_pipelines_.reset();
   pipeline_cache_.reset();
 
+  fh1_other_render_targets_.reset();
   render_target_cache_.reset();
 
   primitive_processor_.reset();
@@ -2387,6 +2475,8 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
+      if (fh1_other_textures_) fh1_other_textures_->TextureFetchConstantWritten(
+          (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
     }
     InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
@@ -2489,6 +2579,8 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     uint32_t last_fetch_dword = start_index + last_changed - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+      if (fh1_other_textures_) fh1_other_textures_->TextureFetchConstantsWritten(
+          first_fetch_dword / 6, last_fetch_dword / 6);
     }
     InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
@@ -2643,6 +2735,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         frontbuffer_height_scaled
             ? frontbuffer_height_scaled
             : (frontbuffer_height ? frontbuffer_height : frontbuffer_height_unscaled);
+  }
+  if (fh1_dlss_) {
+    guest_output_width = fh1_dlss_->output_width();
+    guest_output_height = fh1_dlss_->output_height();
   }
   bool swap_source_scaled = frontbuffer_width_unscaled && frontbuffer_height_unscaled &&
                             (frontbuffer_width_scaled != frontbuffer_width_unscaled ||
@@ -2802,6 +2898,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           }
         }
         bool use_compute_gamma = swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE;
+        if (fh1_dlss_ && !use_compute_gamma) {
+          REXGPU_ERROR("DLSS: native output requires the texel-addressed compute presentation path");
+          return false;
+        }
 
         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
@@ -3947,6 +4047,23 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+void VulkanCommandProcessor::Fh1SelectNativeHud(bool native_hud) {
+  if (!fh1_other_render_targets_ || native_hud == fh1_native_hud_active_) return;
+  EndRenderPass();
+  if (fh1_other_textures_) std::swap(texture_cache_, fh1_other_textures_);
+  std::swap(render_target_cache_, fh1_other_render_targets_);
+  std::swap(pipeline_cache_, fh1_other_pipelines_);
+  Fh1InvalidateBindings();
+  fh1_native_hud_active_ = native_hud;
+  dynamic_viewport_update_needed_ = true;
+  dynamic_scissor_update_needed_ = true;
+  dynamic_depth_bias_update_needed_ = true;
+  current_constant_buffers_up_to_date_ = 0;
+  current_graphics_descriptor_set_values_up_to_date_ =
+      UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+  current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -4065,6 +4182,38 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   for (uint32_t i = 0; i < 2; ++i) {
     if (!BeginSubmission(true)) {
       return draw_fail("begin_submission");
+    }
+
+    if (fh1_other_render_targets_ && is_rasterization_done && pixel_shader) {
+      const auto color = regs.Get<reg::RB_COLOR_INFO>();
+      const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+      // The same packed formats also occur in small intermediate targets in
+      // the title sequence. Only the full front buffer marks the scene/UI split.
+      const bool front_buffer = surface.surface_pitch == 1280 &&
+          surface.msaa_samples == xenos::MsaaSamples::k1X;
+      if (front_buffer &&
+          color.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 &&
+          !fh1_native_hud_active_) {
+        fh1_scene_composited_ = true;
+        fh1_scene_base_ = color.color_base;
+      } else if (front_buffer && color.color_format ==
+                 xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 &&
+                 !fh1_native_hud_active_ &&
+                 (!fh1_scene_composited_ || color.color_base == fh1_scene_base_)) {
+        fh1_seed_pending_ = fh1_scene_composited_;
+        Fh1SelectNativeHud(true);
+      }
+    }
+
+    // Shader translations and render passes belong to the active render scale.
+    // Never share a 2x VPOS/memexport translation with the 1x scene.
+    if (fh1_other_pipelines_) {
+      vertex_shader = pipeline_cache_->LoadShaderForDraw(*vertex_shader);
+      pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+      if (pixel_shader) {
+        pixel_shader = pipeline_cache_->LoadShaderForDraw(*pixel_shader);
+        pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+      }
     }
 
     // Process primitives.
@@ -4197,11 +4346,47 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
 
+
+  if (fh1_dlss_ && pixel_shader && pixel_shader->ucode_data_hash() == 0xE68FE55ECD482EC5ull) {
+    std::array<float, 136 * 4> constants;
+    std::memcpy(constants.data(), &regs[XE_GPU_REG_SHADER_CONSTANT_256_X], sizeof(constants));
+    fh1_dlss_->Observe(texture_cache_->GetActiveBindingOrNullImageView(
+        2, xenos::FetchOpDimension::k2D, false), constants.data());
+    static bool dumped = false;
+    static const char* folder = std::getenv("FORZA_DLSS_DIAGNOSTICS");
+    if (!dumped && folder && *folder) {
+      {
+        std::ofstream(std::filesystem::u8path(folder) / "velocity-shader.txt") << pixel_shader->ucode_disassembly();
+        std::ofstream(std::filesystem::u8path(folder) / "velocity-vertex-shader.txt") << vertex_shader->ucode_disassembly();
+        std::ofstream constants(std::filesystem::u8path(folder) / "velocity-constants.txt");
+        constants << "texture-mask=" << used_texture_mask << '\n';
+        for (unsigned i = 0; i < 256; ++i) {
+          constants << i;
+          for (unsigned c = 0; c < 4; ++c)
+            constants << ',' << regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * i + c);
+          constants << '\n';
+        }
+        dumped = true;
+      }
+    }
+  }
+
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
+  }
+  // A depth-only draw can precede the first HUD color export. Keep the scene
+  // transfer pending until there is a native color attachment to seed.
+  if (fh1_seed_pending_ && render_target_cache_->HasNativeHudColorTarget()) {
+    fh1_seed_pending_ = false;
+    if (!render_target_cache_->SeedNativeHud(*fh1_other_render_targets_, 1280, 720))
+      return draw_fail("native_hud_seed");
+    if (frame_current_ % 120 == 0)
+      REXGPU_INFO("FH1 frame {}: world={}x{}, HUD={}x{}, scene transferred before UI", frame_current_,
+          1280 * fh1_other_render_targets_->draw_resolution_scale_x(), 720 * fh1_other_render_targets_->draw_resolution_scale_y(),
+          fh1_dlss_ ? fh1_dlss_->output_width() : 2560, fh1_dlss_ ? fh1_dlss_->output_height() : 1440);
   }
 
   // Create the pipeline (for this, need the render pass from the render target
@@ -4291,6 +4476,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       normalized_depth_control,
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
+
+  if (fh1_dlss_ && fh1_dlss_->Evaluating() && !fh1_native_hud_active_ && normalized_depth_control.z_enable &&
+      regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280) {
+    const auto& input = fh1_dlss_->input();
+    if (viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+      viewport_info.ndc_offset[0] += 2.0f * input.jitter_x / float(fh1_dlss_->width());
+      viewport_info.ndc_offset[1] += 2.0f * input.jitter_y / float(fh1_dlss_->height());
+    }
+  }
 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
@@ -4782,11 +4976,104 @@ bool VulkanCommandProcessor::IssueCopy() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+    const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
+    if (resolved && written_length && !Fh1SynchronizeResolve(written_address, written_length))
+      REXGPU_ERROR("FH1 cross-scale resolve synchronization failed");
+    return resolved;
   }
 
   return IssueCopy_ReadbackResolvePath();
+}
+
+// Scaled resolves are stored per guest pixel, with a scale_x*scale_y block
+// of host samples. Mirror these blocks on the GPU when the scene/UI caches
+// have different integer scales. This keeps minimap and other render-to-texture
+// HUD inputs coherent without a CPU readback or borrowing foreign image views.
+bool VulkanCommandProcessor::Fh1SynchronizeResolve(uint32_t address, uint32_t length) {
+  if (!fh1_split_enabled_ || !fh1_other_textures_ || !texture_cache_->IsDrawResolutionScaled() ||
+      !fh1_other_textures_->IsDrawResolutionScaled() || !length ||
+      !texture_cache_->HasScaledResolveRange(address, length)) return true;
+  auto& source = *texture_cache_;
+  auto& destination = *fh1_other_textures_;
+  const auto* vulkan_device = GetVulkanDevice();
+  const auto& f = vulkan_device->functions(); const auto device = vulkan_device->device();
+  const auto dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+  const auto bpp = FormatInfo::Get(uint32_t(dest_info.copy_dest_format))->bits_per_pixel;
+  if (bpp != 8 && bpp != 16 && bpp != 32 && bpp != 64 && bpp != 128) return false;
+  const uint32_t pixel_bytes = bpp / 8;
+  const uint32_t source_scale = source.draw_resolution_scale_x();
+  const uint32_t destination_scale = destination.draw_resolution_scale_x();
+  if (source.draw_resolution_scale_y() != source_scale ||
+      destination.draw_resolution_scale_y() != destination_scale ||
+      length > UINT32_MAX / (destination_scale * destination_scale)) return false;
+  uint64_t source_start, source_length, dest_start, dest_length;
+  if (!source.GetScaledResolveRange(address, length, 0, source_start, source_length) ||
+      !destination.CommitScaledResolveRange(address, length) ||
+      !destination.GetScaledResolveRange(address, length, 0, dest_start, dest_length)) return false;
+  if (!fh1_resolve_pipeline_) {
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 6 * sizeof(uint32_t)};
+    const auto set_layout = GetSingleTransientDescriptorLayout(SingleTransientDescriptorLayout::kStorageBufferPairCompute);
+    VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout.setLayoutCount = 1; layout.pSetLayouts = &set_layout;
+    layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
+    if (f.vkCreatePipelineLayout(device, &layout, nullptr, &fh1_resolve_layout_) != VK_SUCCESS) return false;
+    static constexpr char shader[] = R"glsl(#version 450
+layout(local_size_x=256) in;
+layout(binding=0,std430) readonly buffer Source { uint src[]; };
+layout(binding=1,std430) writeonly buffer Destination { uint dst[]; };
+layout(push_constant) uniform Parameters { uint sourceScale; uint destScale; uint pixelBytes;
+  uint byteCount; uint sourceOffset; uint destOffset; };
+uint loadByte(uint offset) {
+  uint pixel = offset / pixelBytes;
+  uint component = offset % pixelBytes;
+  uint subpixel = pixel % (destScale*destScale);
+  uint guestPixel = pixel / (destScale*destScale);
+  uint x = ((subpixel%destScale)*2u+1u)*sourceScale/(destScale*2u);
+  uint y = ((subpixel/destScale)*2u+1u)*sourceScale/(destScale*2u);
+  uint sourceByte = sourceOffset + (guestPixel*sourceScale*sourceScale+y*sourceScale+x)*pixelBytes+component;
+  return (src[sourceByte>>2u]>>((sourceByte&3u)*8u))&255u;
+}
+void main() {
+  uint i=gl_GlobalInvocationID.x+gl_GlobalInvocationID.y*65535u*256u;
+  uint offset=i*4u;
+  if(offset>=byteCount) return;
+  uint value=0u;
+  for(uint b=0u;b<4u;++b) value|=loadByte(offset+b)<<(8u*b);
+  dst[(destOffset+offset)>>2u]=value;
+})glsl";
+    std::vector<uint32_t> code; std::string error;
+    if (!CompileFh1Compute(shader, code, error)) { REXGPU_ERROR("FH1 resolve shader: {}", error); return false; }
+    fh1_resolve_pipeline_ = ui::vulkan::util::CreateComputePipeline(vulkan_device, fh1_resolve_layout_,
+        code.data(), code.size()*sizeof(uint32_t));
+    if (!fh1_resolve_pipeline_) return false;
+  }
+  const auto set = AllocateSingleTransientDescriptor(SingleTransientDescriptorLayout::kStorageBufferPairCompute);
+  if (!set) return false;
+  const uint64_t alignment = vulkan_device->properties().minStorageBufferOffsetAlignment;
+  const uint64_t source_base = source_start & ~(alignment-1), dest_base = dest_start & ~(alignment-1);
+  const VkDescriptorBufferInfo buffers[] = {
+      {source.scaled_resolve_buffer(), source_base, source_length+source_start-source_base},
+      {destination.scaled_resolve_buffer(), dest_base, dest_length+dest_start-dest_base}};
+  VkWriteDescriptorSet writes[2]{};
+  for (unsigned i=0;i<2;++i) {
+    writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet=set;
+    writes[i].dstBinding=i; writes[i].descriptorCount=1;
+    writes[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[i].pBufferInfo=&buffers[i];
+  }
+  f.vkUpdateDescriptorSets(device,2,writes,0,nullptr);
+  source.UseScaledResolveBufferForRead();
+  destination.UseScaledResolveBufferForWrite(dest_start,dest_length);
+  SubmitBarriers(true);
+  BindExternalComputePipeline(fh1_resolve_pipeline_);
+  const uint32_t constants[] = {source_scale,destination_scale,pixel_bytes,uint32_t(dest_length),
+      uint32_t(source_start-source_base),uint32_t(dest_start-dest_base)};
+  deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,fh1_resolve_layout_,0,1,&set,0,nullptr);
+  deferred_command_buffer_.CmdVkPushConstants(fh1_resolve_layout_,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(constants),constants);
+  const uint32_t groups = uint32_t((dest_length+1023)/1024);
+  deferred_command_buffer_.CmdVkDispatch(std::min(groups,65535u),(groups+65534)/65535,1);
+  destination.MarkRangeAsResolved(address,length);
+  return true;
 }
 
 bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -4800,6 +5087,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return false;
   }
 
+  if (written_length && !Fh1SynchronizeResolve(written_address, written_length))
+    REXGPU_ERROR("FH1 cross-scale resolve synchronization failed");
   if (!written_length) {
     return true;
   }
@@ -5451,8 +5740,10 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   primitive_processor_->CompletedSubmissionUpdated();
 
   render_target_cache_->CompletedSubmissionUpdated();
+  if (fh1_other_render_targets_) fh1_other_render_targets_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+  if (fh1_other_textures_) fh1_other_textures_->CompletedSubmissionUpdated(submission_completed_);
 
   // Destroy objects scheduled for destruction.
   while (!destroy_framebuffers_.empty()) {
@@ -5498,7 +5789,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
 }
 
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
-  return !submission_open_ || (!scratch_buffer_used_ && !pipeline_cache_->IsCreatingPipelines());
+  return !submission_open_ || (!scratch_buffer_used_ && !pipeline_cache_->IsCreatingPipelines() &&
+      (!fh1_other_pipelines_ || !fh1_other_pipelines_->IsCreatingPipelines()));
 }
 
 bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
@@ -5571,10 +5863,16 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginSubmission();
 
     texture_cache_->BeginSubmission(GetCurrentSubmission());
+    if (fh1_other_textures_) fh1_other_textures_->BeginSubmission(GetCurrentSubmission());
   }
 
   if (is_opening_frame) {
     frame_open_ = true;
+    if (fh1_other_render_targets_) Fh1SelectNativeHud(false);
+    if (fh1_dlss_) fh1_dlss_->BeginFrame(frame_current_);
+    fh1_scene_composited_ = false;
+    fh1_seed_pending_ = false;
+    fh1_scene_base_ = UINT32_MAX;
     frame_used_async_placeholder_pipeline_ = false;
 
     // Reset bindings that depend on transient data.
@@ -5635,6 +5933,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+    if (fh1_other_textures_) fh1_other_textures_->BeginFrame();
   }
 
   return true;
@@ -5706,6 +6005,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
   if (is_closing_frame) {
     texture_cache_->EndFrame();
+    if (fh1_other_textures_) fh1_other_textures_->EndFrame();
 
     primitive_processor_->EndFrame();
   }
@@ -5722,8 +6022,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     EndRenderPass();
 
     pipeline_cache_->EndSubmission();
+    if (fh1_other_pipelines_) fh1_other_pipelines_->EndSubmission();
 
     render_target_cache_->EndSubmission();
+    if (fh1_other_render_targets_) fh1_other_render_targets_->EndSubmission();
 
     primitive_processor_->EndSubmission();
 
@@ -5911,8 +6213,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       uniform_buffer_pool_->ClearCache();
 
       texture_cache_->ClearCache();
+      if (fh1_other_textures_) fh1_other_textures_->ClearCache();
 
       render_target_cache_->ClearCache();
+      if (fh1_other_render_targets_) fh1_other_render_targets_->ClearCache();
 
       // Not clearing the pipeline layouts and the descriptor set layouts as
       // they're referenced by pipelines, which are not destroyed.
@@ -6123,6 +6427,12 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     viewport.width = 1.0f;
     viewport.height = 1.0f;
   }
+  if (render_target_cache_->UsesFractionalRaster()) {
+  viewport.x *= render_target_cache_->raster_scale_x();
+  viewport.y *= render_target_cache_->raster_scale_y();
+  viewport.width *= render_target_cache_->raster_scale_x();
+  viewport.height *= render_target_cache_->raster_scale_y();
+  }
   viewport.minDepth = viewport_info.z_min;
   viewport.maxDepth = viewport_info.z_max;
   SetViewport(viewport);
@@ -6134,6 +6444,12 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
+  if (render_target_cache_->UsesFractionalRaster()) {
+  scissor.offset[0] = uint32_t(float(scissor.offset[0]) * render_target_cache_->raster_scale_x());
+  scissor.offset[1] = uint32_t(float(scissor.offset[1]) * render_target_cache_->raster_scale_y());
+  scissor.extent[0] = uint32_t(std::ceil(float(scissor.extent[0]) * render_target_cache_->raster_scale_x()));
+  scissor.extent[1] = uint32_t(std::ceil(float(scissor.extent[1]) * render_target_cache_->raster_scale_y()));
+  }
   VkRect2D scissor_rect;
   scissor_rect.offset.x = int32_t(scissor.offset[0]);
   scissor_rect.offset.y = int32_t(scissor.offset[1]);

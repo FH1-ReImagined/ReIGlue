@@ -45,6 +45,7 @@ set(REXGPU_XENOS_SPIRV_SOURCES
 set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
+    vulkan/fh1_dlss.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
@@ -98,6 +99,26 @@ endif()
 
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+
+option(REXGLUE_USE_DLSS "Build native FH1 DLSS support (NVIDIA SDK terms apply)" ${WIN32})
+set(REXGLUE_DLSS_SDK "" CACHE PATH "Optional local NVIDIA DLSS SDK; otherwise fetch pinned SDK files")
+if(WIN32 AND REXGLUE_USE_VULKAN AND REXGLUE_USE_DLSS)
+    include(${REXGLUE_ROOT}/cmake/ForzaDlssSdk.cmake)
+    target_compile_definitions(rexgpu-xenos PRIVATE REX_FH1_NGX=1)
+    target_include_directories(rexgpu-xenos SYSTEM PRIVATE "${REXGLUE_DLSS_SDK}/include")
+    target_link_libraries(rexgpu-xenos PRIVATE
+        "${REXGLUE_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    add_custom_command(TARGET rexgpu-xenos POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${REXGLUE_DLSS_SDK}/LICENSE.txt"
+            "$<TARGET_FILE_DIR:rexgpu-xenos>/NVIDIA-DLSS-LICENSE.txt"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFH1_GPU_DLL=$<TARGET_FILE:rexgpu-xenos>"
+            "-DFH1_CAPABILITIES=$<TARGET_FILE_DIR:rexgpu-xenos>/fh1-native-dlss.json"
+            -P "${REXGLUE_ROOT}/cmake/Fh1DlssCapabilities.cmake")
+    install(FILES "$<TARGET_FILE_DIR:rexgpu-xenos>/fh1-native-dlss.json" DESTINATION bin)
+    install(FILES "${REXGLUE_DLSS_SDK}/LICENSE.txt"
+        DESTINATION share/licenses/nvidia-dlss)
+endif()
 
 set_target_properties(rexgpu-xenos PROPERTIES
     EXPORT_NAME gpu-xenos

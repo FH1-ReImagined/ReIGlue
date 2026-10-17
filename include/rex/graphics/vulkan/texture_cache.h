@@ -86,6 +86,7 @@ class VulkanTextureCache final : public TextureCache {
   // preceding host GPU work.
   void RequestTextures(uint32_t used_texture_mask) override;
 
+
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
 
@@ -361,6 +362,7 @@ class VulkanTextureCache final : public TextureCache {
   bool null_images_cleared_ = false;
 
   std::array<VulkanTextureBinding, xenos::kTextureFetchConstantCount> vulkan_texture_bindings_;
+
 
   // Unsupported texture formats used during this frame (for research and
   // testing).

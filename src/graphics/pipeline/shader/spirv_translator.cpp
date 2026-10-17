@@ -3145,14 +3145,28 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision);
+        spv::Id position_is_center;
+        const float raster_scale = i ? raster_scale_y_ : raster_scale_x_;
+        if (raster_scale != 1.0f && (GetSpirvShaderModification().value & kFh1FractionalRaster)) {
+          const float scale = float(i ? draw_resolution_scale_y_ : draw_resolution_scale_x_) * raster_scale;
+          auto floor = [&](spv::Id v) { return builder_->createUnaryBuiltinCall(
+              type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor, v); };
+          const spv::Id guest = floor(builder_->createBinOp(spv::OpFDiv, type_float_, position,
+              builder_->makeFloatConstant(scale)));
+          const spv::Id center = floor(builder_->createBinOp(spv::OpFMul, type_float_,
+              builder_->createBinOp(spv::OpFAdd, type_float_, guest, builder_->makeFloatConstant(0.5f)),
+              builder_->makeFloatConstant(scale)));
+          position_is_center = builder_->createBinOp(spv::OpFOrdEqual, type_bool_, floor(position), center);
+        } else {
         spv::Id position_mod = builder_->createBinOp(
             spv::OpUMod, type_uint_,
             builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position),
             builder_->makeUintConstant(i ? draw_resolution_scale_y_ : draw_resolution_scale_x_));
-        spv::Id position_is_center =
+        position_is_center =
             builder_->createBinOp(spv::OpIEqual, type_bool_, position_mod,
                                   builder_->makeUintConstant(i ? (draw_resolution_scale_y_ >> 1)
                                                                : (draw_resolution_scale_x_ >> 1)));
+        }
         memexport_allowed = memexport_allowed != spv::NoResult
                                 ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
                                                         memexport_allowed, position_is_center)
@@ -3246,7 +3260,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     if (draw_resolution_scale_x_ > 1) {
       param_gen_x = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_x,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
+          builder_->makeFloatConstant(1.0f / (float(draw_resolution_scale_x_) * ((GetSpirvShaderModification().value & kFh1FractionalRaster) ? raster_scale_x_ : 1.0f))));
     }
     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_x);
@@ -3282,7 +3296,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     if (draw_resolution_scale_y_ > 1) {
       param_gen_y = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_y,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
+          builder_->makeFloatConstant(1.0f / (float(draw_resolution_scale_y_) * ((GetSpirvShaderModification().value & kFh1FractionalRaster) ? raster_scale_y_ : 1.0f))));
     }
     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_y);

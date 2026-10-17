@@ -48,6 +48,7 @@
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
 namespace rex::graphics::vulkan {
+class Fh1Dlss;
 
 class VulkanCommandProcessor : public CommandProcessor {
  public:
@@ -155,6 +156,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
 
   bool submission_open() const { return submission_open_; }
+  Fh1Dlss* fh1_dlss() const { return fh1_dlss_.get(); }
+  bool fh1_split_enabled() const { return fh1_split_enabled_; }
+  void Fh1InvalidateBindings() {
+    current_external_compute_pipeline_ = VK_NULL_HANDLE;
+    current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+    current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+    current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+  }
   uint64_t GetCurrentSubmission() const {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
   }
@@ -670,6 +679,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
   std::unique_ptr<VulkanTextureCache> texture_cache_;
+  // Experimental FH1 scene/UI split. The inactive pair stays alive across frames.
+  std::unique_ptr<VulkanRenderTargetCache> fh1_other_render_targets_;
+  std::unique_ptr<VulkanTextureCache> fh1_other_textures_;
+  std::unique_ptr<VulkanPipelineCache> fh1_other_pipelines_;
+  std::unique_ptr<Fh1Dlss> fh1_dlss_;
+  bool fh1_split_enabled_ = false;
+  bool fh1_native_hud_active_ = true;
+  bool fh1_scene_composited_ = false;
+  bool fh1_seed_pending_ = false;
+  uint32_t fh1_scene_base_ = UINT32_MAX;
+  VkPipeline fh1_resolve_pipeline_ = VK_NULL_HANDLE;
+  VkPipelineLayout fh1_resolve_layout_ = VK_NULL_HANDLE;
+  bool Fh1SynchronizeResolve(uint32_t address, uint32_t length);
+  void Fh1SelectNativeHud(bool native_hud);
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;

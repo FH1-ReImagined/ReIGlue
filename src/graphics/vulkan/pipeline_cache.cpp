@@ -314,7 +314,8 @@ bool VulkanPipelineCache::Initialize() {
       render_target_cache_.msaa_2x_attachments_supported(),
       render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
       render_target_cache_.draw_resolution_scale_x(),
-      render_target_cache_.draw_resolution_scale_y());
+      render_target_cache_.draw_resolution_scale_y(),
+      render_target_cache_.raster_scale_x(), render_target_cache_.raster_scale_y());
 
   if (edram_fragment_shader_interlock) {
     std::vector<uint8_t> depth_only_fragment_shader_code =
@@ -921,6 +922,16 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
   return shader;
 }
 
+VulkanShader* VulkanPipelineCache::LoadShaderForDraw(const Shader& source) {
+  const auto hash = source.ucode_data_hash();
+  auto it = shaders_.find(hash);
+  if (it != shaders_.end()) return it->second;
+  auto* shader = new VulkanShader(command_processor_.GetVulkanDevice(), source.type(),
+      hash, source.ucode_dwords(), source.ucode_dword_count(), std::endian::native);
+  shaders_.emplace(hash, shader);
+  return shader;
+}
+
 SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderModification(
     const Shader& shader, Shader::HostVertexShaderType host_vertex_shader_type,
     uint32_t interpolator_mask, bool ps_param_gen_used) const {
@@ -973,6 +984,8 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
       device_properties.shaderCullDistance &&
       (shader.writes_point_size_edge_flag_kill_vertex() & 0b100) && !pa_cl_clip_cntl.vtx_kill_or);
 
+  // Bit 63 is reserved for the FH1 screen-raster variant in both stage layouts.
+  if (render_target_cache_.UsesFractionalRaster()) modification.value |= UINT64_C(1) << 63;
   return modification;
 }
 
@@ -1025,6 +1038,8 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     }
   }
 
+  // Bit 63 is reserved for the FH1 screen-raster variant in both stage layouts.
+  if (render_target_cache_.UsesFractionalRaster()) modification.value |= UINT64_C(1) << 63;
   return modification;
 }
 

@@ -97,6 +97,22 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   void CompletedSubmissionUpdated();
   void EndSubmission();
+  bool UsesFractionalRaster() const {
+    const auto pitch = register_file().Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    return (pitch == 1280 || pitch == 640 || pitch == 320 || pitch == 160 || pitch == 80) &&
+        (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f);
+  }
+  void SetRasterSize(uint32_t width, uint32_t height) {
+    raster_scale_x_ = float(width) / float(1280 * draw_resolution_scale_x());
+    raster_scale_y_ = float(height) / float(720 * draw_resolution_scale_y());
+  }
+  float raster_scale_x() const { return raster_scale_x_; }
+  float raster_scale_y() const { return raster_scale_y_; }
+  float raster_scale_x_ = 1.0f, raster_scale_y_ = 1.0f;
+  bool SeedNativeHud(VulkanRenderTargetCache& scene, uint32_t width, uint32_t height);
+  bool HasNativeHudColorTarget() const {
+    return last_update_accumulated_render_targets()[1] != nullptr;
+  }
 
   Path GetPath() const override { return path_; }
 

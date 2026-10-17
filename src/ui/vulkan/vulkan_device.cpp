@@ -170,6 +170,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   request_promoted_extension("VK_" #name, major, minor, &ext_##major##_##minor##_##name);
 
   bool ext_KHR_portability_subset = false;
+  const auto reconstruction = rex::cvar::GetFlagByName("fh1_upscaler");
+  const bool dlss_requested = with_gpu_emulation && properties.vendorID == 0x10DE &&
+      (reconstruction == "dlss" || reconstruction == "dlaa" || reconstruction == "quality" ||
+       reconstruction == "balanced" || reconstruction == "performance");
+  bool ext_KHR_push_descriptor = false;
+  if (dlss_requested) requested_extensions.emplace("VK_KHR_push_descriptor", &ext_KHR_push_descriptor);
+  bool ext_NVX_binary_import = false, ext_NVX_image_view_handle = false;
+  if (dlss_requested) requested_extensions.emplace("VK_NVX_binary_import", &ext_NVX_binary_import);
+  if (dlss_requested) requested_extensions.emplace("VK_NVX_image_view_handle", &ext_NVX_image_view_handle);
   bool ext_1_2_KHR_driver_properties = false;
   if (get_physical_device_properties2_supported) {
     // #164. Must be enabled according to the specification if the physical
@@ -650,6 +659,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+      if (dlss_requested) features_1_2.enabled.shaderFloat16 = features_1_2.supported.shaderFloat16;
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {

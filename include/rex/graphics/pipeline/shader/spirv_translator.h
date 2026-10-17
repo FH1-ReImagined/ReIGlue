@@ -403,13 +403,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
-                        uint32_t draw_resolution_scale_x = 1, uint32_t draw_resolution_scale_y = 1)
+                        uint32_t draw_resolution_scale_x = 1, uint32_t draw_resolution_scale_y = 1,
+                        float raster_scale_x = 1.0f, float raster_scale_y = 1.0f)
       : features_(features),
         native_2x_msaa_with_attachments_(native_2x_msaa_with_attachments),
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
         draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
-        draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1) {}
+        draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1),
+        raster_scale_x_(raster_scale_x), raster_scale_y_(raster_scale_y) {}
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -756,6 +758,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // flow of the main function, and that there are no returns before either
   // (there's a single return from the shader).
   bool edram_fragment_shader_interlock_;
+  static constexpr uint64_t kFh1FractionalRaster = UINT64_C(1) << 63;
+  float raster_scale_x_, raster_scale_y_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
 

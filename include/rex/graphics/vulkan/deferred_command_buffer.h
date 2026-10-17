@@ -18,10 +18,12 @@
 #include <rex/assert.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/api.h>
+#include <rex/graphics/vulkan/fh1_dlss.h>
 
 namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor;
+class Fh1Dlss;
 
 class DeferredCommandBuffer {
  public:
@@ -29,6 +31,17 @@ class DeferredCommandBuffer {
                         size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
+  void CmdFh1Dlss(Fh1Dlss* effect, VkImage src, VkImage dst) {
+    auto& args = *reinterpret_cast<ArgsFh1Dlss*>(
+        WriteCommand(Command::kFh1Dlss, sizeof(ArgsFh1Dlss)));
+    args.effect = effect; args.src = src; args.dst = dst; args.input = effect->input();
+  }
+  mutable PFN_vkCmdBlitImage blit_image_ = nullptr;
+  void CmdVkBlitImage(VkImage src, VkImage dst, const VkImageBlit& region) {
+    auto& args = *reinterpret_cast<ArgsVkBlitImage*>(
+        WriteCommand(Command::kVkBlitImage, sizeof(ArgsVkBlitImage)));
+    args.src = src; args.dst = dst; args.region = region;
+  }
   void Execute(VkCommandBuffer command_buffer);
 
   // The recorded commands, taken out for another thread to execute (threaded submission).
@@ -392,6 +405,8 @@ class DeferredCommandBuffer {
 
  private:
   enum class Command {
+    kFh1Dlss,
+    kVkBlitImage,
     kVkBeginRenderPass,
     kVkBeginQuery,
     kVkBindDescriptorSets,
@@ -426,6 +441,15 @@ class DeferredCommandBuffer {
   struct CommandHeader {
     Command command;
     uint32_t arguments_size_elements;
+  };
+  struct ArgsFh1Dlss {
+    Fh1Dlss* effect;
+    VkImage src, dst;
+    Fh1Dlss::FrameInput input;
+  };
+  struct ArgsVkBlitImage {
+    VkImage src, dst;
+    VkImageBlit region;
   };
   static constexpr size_t kCommandHeaderSizeElements =
       (sizeof(CommandHeader) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
