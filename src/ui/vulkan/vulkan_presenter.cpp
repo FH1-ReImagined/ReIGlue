@@ -58,6 +58,12 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_latest_ready, true, "UI/Vulkan",
+                    "Use FIFO latest ready (VK_EXT_present_mode_fifo_latest_ready) instead of "
+                    "plain FIFO when the device and the surface support it: vsync without "
+                    "tearing, but a frame queued while an older one waits for the vblank "
+                    "replaces it instead of being shown after it. false keeps plain FIFO");
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -1399,9 +1405,34 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     // Limiting the frame rate, but lets too long frames cause tearing not to
     // make the latency even worse.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_latest_ready) &&
+             vulkan_device->properties().presentModeFifoLatestReady &&
+             std::find(present_modes.cbegin(), present_modes.cend(),
+                       VK_PRESENT_MODE_FIFO_LATEST_READY_KHR) != present_modes.cend()) {
+    // Still limited to the refresh rate and without tearing, but when frames come faster than
+    // the display shows them, the vblank takes the newest finished one instead of the oldest
+    // queued: plain FIFO shows every frame, so a game drawing at a rate that is not a
+    // divisor of the refresh rate gets a queue that delays and drops frames irregularly.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
   } else {
     // Highest latency (but always guaranteed to be available).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  }
+  {
+    static bool present_mode_logged = false;
+    if (!present_mode_logged) {
+      present_mode_logged = true;
+      const bool fifo_latest_ready_offered =
+          std::find(present_modes.cbegin(), present_modes.cend(),
+                    VK_PRESENT_MODE_FIFO_LATEST_READY_KHR) != present_modes.cend();
+      REXLOG_INFO(
+          "VulkanPresenter: presentation mode {} (FIFO latest ready: device feature {}, surface "
+          "offers {}, vulkan_allow_present_mode_fifo_latest_ready {})",
+          uint32_t(swapchain_create_info.presentMode),
+          vulkan_device->properties().presentModeFifoLatestReady ? "yes" : "no",
+          fifo_latest_ready_offered ? "yes" : "no",
+          REXCVAR_GET(vulkan_allow_present_mode_fifo_latest_ready) ? "true" : "false");
+    }
   }
   swapchain_create_info.clipped = VK_TRUE;
   swapchain_create_info.oldSwapchain = old_swapchain;
@@ -1421,7 +1452,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   image_format_out = swapchain_create_info.imageFormat;
   image_extent_out = swapchain_create_info.imageExtent;
   is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
-                swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+                swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
+                swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
   return swapchain;
 }
 

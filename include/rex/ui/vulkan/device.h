@@ -168,6 +168,10 @@ class VulkanDevice {
     // VK_EXT_robustness2
 
     bool nullDescriptor = false;
+
+    // VK_EXT_present_mode_fifo_latest_ready / VK_KHR_present_mode_fifo_latest_ready
+
+    bool presentModeFifoLatestReady = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.

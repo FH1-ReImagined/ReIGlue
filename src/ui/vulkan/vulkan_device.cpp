@@ -207,9 +207,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
   }
 
+  bool ext_EXT_present_mode_fifo_latest_ready = false;
+  bool ext_KHR_present_mode_fifo_latest_ready = false;
   if (with_swapchain) {
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
+    if (get_physical_device_properties2_supported) {
+      // #362 (the KHR one is its promotion, with the same feature structure and present mode
+      // value): FIFO that shows the newest queued image instead of every one.
+      XE_UI_VULKAN_LOCAL_EXTENSION(EXT_present_mode_fifo_latest_ready)
+      XE_UI_VULKAN_LOCAL_EXTENSION(KHR_present_mode_fifo_latest_ready)
+    }
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -344,6 +352,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR>
+      features_KHR_present_mode_fifo_latest_ready;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -384,6 +395,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (ext_EXT_present_mode_fifo_latest_ready || ext_KHR_present_mode_fifo_latest_ready) {
+      features_KHR_present_mode_fifo_latest_ready.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -739,6 +753,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
     }
+  }
+
+  if (ext_EXT_present_mode_fifo_latest_ready || ext_KHR_present_mode_fifo_latest_ready) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_present_mode_fifo_latest_ready, presentModeFifoLatestReady)
   }
 
 #undef XE_UI_VULKAN_LIMIT
