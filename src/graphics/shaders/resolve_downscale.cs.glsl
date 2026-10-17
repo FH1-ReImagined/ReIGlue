@@ -14,7 +14,7 @@
 // Each thread handles one output pixel (one 32x32 tile = 1024 threads).
 //
 // By default, picks the top-left pixel of each scale_x * scale_y block.
-// When xe_downscale_half_pixel_offset is set, samples from (scale/2, scale/2)
+// Bit 0 of xe_downscale_half_pixel_offset samples from (scale/2, scale/2)
 // within each block to compensate for the half-pixel offset becoming a
 // full-pixel offset at higher resolutions.
 
@@ -26,7 +26,8 @@ layout(push_constant) uniform ResolveDownscaleConstants {
   uint xe_downscale_pixel_size_log2;   // 0=8bit, 1=16bit, 2=32bit, 3=64bit
   uint xe_downscale_tile_count;        // Number of 32x32 tiles to process
   uint xe_downscale_source_offset_bytes;   // Byte offset into source buffer
-  // When non-zero, apply half-pixel offset correction by sampling from
+  // Bit 1 enables an RGBA8 box filter for thumbnail capture (32-bit only).
+  // Bit 0 applies half-pixel offset correction by sampling from
   // (scale/2, scale/2) within each scaled block instead of (0, 0).
   // This compensates for the D3D9-style half-pixel offset used by Xbox 360
   // games, which at Nx resolution scaling shifts rendered content by
@@ -70,7 +71,7 @@ void main() {
   // for the D3D9-style half-pixel offset shifting content by (N/2, N/2) pixels
   // at Nx resolution.
   uint block_sample_offset = 0u;
-  if (xe_downscale_half_pixel_offset != 0u && scale_xy > 1u) {
+  if ((xe_downscale_half_pixel_offset & 1u) != 0u && scale_xy > 1u) {
     uint offset_x = xe_downscale_scale_x >> 1u;
     uint offset_y = xe_downscale_scale_y >> 1u;
     block_sample_offset = offset_x + offset_y * xe_downscale_scale_x;
@@ -147,7 +148,23 @@ void main() {
       break;
     }
     case 2u: {  // 32-bit - direct copy
-      xe_resolve_dest.data[dst_offset] = xe_resolve_source.data[src_offset];
+      if ((xe_downscale_half_pixel_offset & 2u) != 0u) {
+        // Opt-in RGBA8 box filter (FH1 thumbnail capture only). Other 32-bit
+        // formats, depth and ordinary resolves keep point sampling.
+        uint block_base = (xe_downscale_source_offset_bytes +
+            tile_index * tile_size_scaled + pixel_index * pixel_size * scale_xy) >> 2u;
+        uvec4 sum = uvec4(0u);
+        for (uint sample_index = 0u; sample_index < scale_xy; ++sample_index) {
+          uint value = xe_resolve_source.data[block_base + sample_index];
+          sum += uvec4(value & 255u, (value >> 8u) & 255u,
+                       (value >> 16u) & 255u, value >> 24u);
+        }
+        uvec4 average = (sum + uvec4(scale_xy / 2u)) / scale_xy;
+        xe_resolve_dest.data[dst_offset] = average.x | (average.y << 8u) |
+            (average.z << 16u) | (average.w << 24u);
+      } else {
+        xe_resolve_dest.data[dst_offset] = xe_resolve_source.data[src_offset];
+      }
       break;
     }
     case 3u: {  // 64-bit - direct copy (2 uints)

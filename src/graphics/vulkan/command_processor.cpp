@@ -5416,6 +5416,9 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                                    (constants.scale_x > 1 || constants.scale_y > 1))
                                       ? 1u
                                       : 0u;
+    // RGBA8 car thumbnails are saved at guest resolution. Average their
+    // supersampled pixels rather than discarding all but one sample.
+    if (thumbnail_readback) constants.half_pixel_offset = 2u;
     deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
                                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
                                                 &constants);

@@ -529,6 +529,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t pixel_size_log2;
     uint32_t tile_count;
     uint32_t source_offset_bytes;
+    // Bit 0: center sample; bit 1: RGBA8 box filter (thumbnail capture).
     uint32_t half_pixel_offset;
   };
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
