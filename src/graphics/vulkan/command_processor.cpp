@@ -78,7 +78,7 @@ REXCVAR_DEFINE_STRING(fh1_graphics_request, "", "GPU/Vulkan", "FH1 live graphics
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(fh1_graphics_result, "", "GPU/Vulkan", "FH1 live graphics result")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_STRING(fh1_upscaler, "off", "GPU/Vulkan", "FH1 scene reconstruction: off; NVIDIA DLSS quality, balanced, performance (dlss), dlaa; AMD FSR 3 fsr3_quality, fsr3_balanced, fsr3_performance, fsr3_native").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_upscaler, "off", "GPU/Vulkan", "FH1 scene reconstruction: off, smaa; NVIDIA DLSS quality, balanced, performance (dlss), dlaa; AMD FSR 3 fsr3_quality, fsr3_balanced, fsr3_performance, fsr3_native").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_UINT32(fh1_output_width, 2560, "GPU/Vulkan", "FH1 reconstruction output width").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_UINT32(fh1_output_height, 1440, "GPU/Vulkan", "FH1 reconstruction output height")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -4230,7 +4230,7 @@ void VulkanCommandProcessor::Fh1ApplyGraphicsRequest() {
       !((width == 1920 && height == 1080) || (width == 2560 && height == 1440) ||
         (width == 3840 && height == 2160)) || scene_scale < 1 || scene_scale > 3 ||
       !(mode == "off" || mode == "quality" || mode == "balanced" || mode == "dlss" ||
-        mode == "dlaa" || mode == "fsr3_quality" || mode == "fsr3_balanced" ||
+        mode == "smaa" || mode == "dlaa" || mode == "fsr3_quality" || mode == "fsr3_balanced" ||
         mode == "fsr3_performance" || mode == "fsr3_native")) {
     result("error: unsupported graphics settings");
     return;
@@ -4265,7 +4265,7 @@ void VulkanCommandProcessor::Fh1ApplyGraphicsRequest() {
       std::max((fh1_dlss_->width() + 1279) / 1280, (fh1_dlss_->height() + 719) / 720) : 1;
   const char* names[] = {"fh1_upscaler", "fh1_output_width", "fh1_output_height",
       "fh1_scene_720p_native_hud", "fh1_native_scene_scale", "resolution_scale",
-      "draw_resolution_scale_x", "draw_resolution_scale_y"};
+      "draw_resolution_scale_x", "draw_resolution_scale_y", "swap_post_effect"};
   std::vector<std::string> previous;
   for (auto name : names) previous.push_back(rex::cvar::GetFlagByName(name));
   // NGX initialization/shutdown is per device. Release the old feature before
@@ -4274,6 +4274,7 @@ void VulkanCommandProcessor::Fh1ApplyGraphicsRequest() {
   fh1_split_enabled_ = false;
   const uint32_t output_scale = (height + 719) / 720;
   rex::cvar::SetFlagByName("fh1_upscaler", mode);
+  if (mode != "off") rex::cvar::SetFlagByName("swap_post_effect", "none");
   rex::cvar::SetFlagByName("fh1_output_width", std::to_string(width));
   rex::cvar::SetFlagByName("fh1_output_height", std::to_string(height));
   rex::cvar::SetFlagByName("fh1_scene_720p_native_hud", "true");
@@ -4480,6 +4481,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (fh1_other_render_targets_ && is_rasterization_done && pixel_shader) {
       const auto color = regs.Get<reg::RB_COLOR_INFO>();
       const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+      static const bool aa_diagnostics = std::getenv("FORZA_AA_DIAGNOSTICS") != nullptr;
+      if (aa_diagnostics) {
+        static uint32_t seen = 0;
+        const auto samples = uint32_t(surface.msaa_samples);
+        if (samples < 3 && !(seen & (1u << samples))) {
+          seen |= 1u << samples;
+          REXGPU_INFO("FH1 AA: guest requests {}x MSAA, pitch={}, color format={}",
+              1u << samples, surface.surface_pitch, uint32_t(color.color_format));
+        }
+      }
       // The same packed formats also occur in small intermediate targets in
       // the title sequence. Only the full front buffer marks the scene/UI split.
       const bool front_buffer = surface.surface_pitch == 1280 &&

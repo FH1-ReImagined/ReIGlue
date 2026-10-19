@@ -47,6 +47,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/deferred_command_buffer.cpp
     vulkan/fh1_dlss.cpp
     vulkan/fh1_fsr3.cpp
+    vulkan/fh1_smaa.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
@@ -100,6 +101,10 @@ endif()
 
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+
+if(REXGLUE_USE_VULKAN)
+    include(${REXGLUE_ROOT}/cmake/ForzaSmaa.cmake)
+endif()
 
 option(REXGLUE_USE_FSR3 "Build the FH1 AMD FidelityFX FSR 3 upscaler (fetches pinned MIT sources)" ON)
 set(REXGLUE_FSR3_SDK "" CACHE PATH "Optional local FidelityFX SDK v1.1.4; otherwise fetch the pinned FSR 3 sources")

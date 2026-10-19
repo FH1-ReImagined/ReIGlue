@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <rex/graphics/vulkan/fh1_fsr3.h>
+#include <rex/graphics/vulkan/fh1_smaa.h>
 #if defined(REX_FH1_NGX)
 #include <nvsdk_ngx_helpers_vk.h>
 #include <nvsdk_ngx_helpers.h>
@@ -46,6 +47,10 @@ struct Fh1Dlss::State {
   NVSDK_NGX_Handle* feature = nullptr;
 #endif
   // AMD FidelityFX FSR 3 backend: the same inputs, a different reconstruction.
+  bool smaa_mode = false;
+  std::unique_ptr<Fh1Smaa> smaa;
+  bool InitializeSmaa();
+  void EvaluateSmaa(VkCommandBuffer command, VkImage scene, VkImage destination);
   bool fsr_mode = false;
   std::unique_ptr<Fh1Fsr3> fsr;
   std::chrono::steady_clock::time_point last_frame{};
@@ -282,6 +287,7 @@ Fh1Dlss::Fh1Dlss(const ui::vulkan::VulkanDevice* device, uint32_t output_width,
   state_->device = device;
   state_->mode = mode;
   state_->dlaa = mode == "dlaa";
+  state_->smaa_mode = mode == "smaa";
   state_->fsr_mode = mode.rfind("fsr3_", 0) == 0;
   state_->output_width = output_width;
   state_->output_height = output_height;
@@ -293,6 +299,7 @@ uint32_t Fh1Dlss::output_height() const { return state_->output_height; }
 void Fh1Dlss::SetSceneBacking(uint32_t scale) { state_->backing_scale = scale; }
 Fh1Dlss::~Fh1Dlss() {
   auto& s = *state_;
+  s.smaa.reset();
   s.fsr.reset();
 #if defined(REX_FH1_NGX)
   if (s.feature) NVSDK_NGX_VULKAN_ReleaseFeature(s.feature);
@@ -347,6 +354,7 @@ void Fh1Dlss::BeginFrame(uint64_t frame) {
 
 bool Fh1Dlss::Initialize() {
   auto& s = *state_;
+  if (s.smaa_mode) return s.InitializeSmaa();
   if (s.fsr_mode) return s.InitializeFsr3();
 #if defined(REX_FH1_NGX)
 #if defined(_WIN32)
@@ -417,6 +425,10 @@ bool Fh1Dlss::Initialize() {
 }
 void Fh1Dlss::Execute(VkCommandBuffer command, VkImage scene, VkImage destination, const FrameInput& frame_input) {
   auto& s = *state_;
+  if (s.smaa_mode) {
+    s.EvaluateSmaa(command, scene, destination);
+    return; // Spatial SMAA must never enable viewport jitter or temporal history.
+  }
   if (s.fsr_mode) {
     ++s.submissions;
     if (s.failed) {
@@ -511,6 +523,40 @@ void Fh1Dlss::Execute(VkCommandBuffer command, VkImage scene, VkImage destinatio
   } else s.Blit(command, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1280 * s.backing_scale, 720 * s.backing_scale, s.output_width, s.output_height);
 #endif
+}
+bool Fh1Dlss::State::InitializeSmaa() {
+  width = output_width; height = output_height;
+  blit = reinterpret_cast<PFN_vkCmdBlitImage>(device->vulkan_instance()->functions().vkGetDeviceProcAddr(
+      device->device(), "vkCmdBlitImage"));
+  if (!blit || !Create(images[0], width, height, VK_FORMAT_R16G16B16A16_SFLOAT) ||
+      !Create(images[1], width, height, VK_FORMAT_R16G16B16A16_SFLOAT)) return false;
+  smaa = std::make_unique<Fh1Smaa>(device);
+  if (!smaa->Initialize(width, height, images[0].view, images[1].view)) return false;
+  REXGPU_INFO("SMAA 1x initialized: {}x{}, before native HUD, jitter off", width, height);
+  return true;
+}
+void Fh1Dlss::State::EvaluateSmaa(VkCommandBuffer command, VkImage scene, VkImage destination) {
+  if (!images_ready) {
+    for (unsigned i = 0; i < 2; ++i)
+      Barrier(command, images[i].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+          0, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    images_ready = true;
+  }
+  Barrier(command, images[0].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+      VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+  Blit(command, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[0].image,
+      VK_IMAGE_LAYOUT_GENERAL, 1280 * backing_scale, 720 * backing_scale, width, height);
+  Barrier(command, images[0].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+  Barrier(command, images[1].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+      VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+  smaa->Execute(command);
+  Barrier(command, images[1].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+      VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  Blit(command, images[1].image, VK_IMAGE_LAYOUT_GENERAL, destination,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, width, height, width, height);
+  if (++frames == 1) ReportStatus("ready: SMAA 1x at " + std::to_string(width) + "x" +
+      std::to_string(height) + ", native UI, no temporal jitter.");
 }
 bool Fh1Dlss::State::InitializeFsr3() {
   const float ratio = Fh1Fsr3::Ratio(mode);

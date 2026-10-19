@@ -1,0 +1,50 @@
+# SMAA 1x, official MIT sources and lookup tables. No NVIDIA runtime required.
+set(_smaa_revision "71c806a838bdd7d517df19192a20f0c61b3ca29d")
+set(_smaa_root "${CMAKE_BINARY_DIR}/_deps/smaa-${_smaa_revision}")
+set(_smaa_files
+  SMAA.hlsl 4db53d92ef0b45661f8450303589ffabce93c352cae4282a6f32dd2b80efbeb9
+  Textures/AreaTex.h 1933bf43ce86ba71f7ed5f0fa94b148610c634dc3395b9bc67a817d51ee73af2
+  Textures/SearchTex.h 1fac315ab5f87b60083c9b8387af17f056204d3d1bf21500f2acc5b3e8c1a37a
+  LICENSE.txt 2b848b67ba50ac40b53e11cf1ccdaee2a190ca83b4652cba695a5f1ce81f52ae)
+list(LENGTH _smaa_files _smaa_count)
+set(_smaa_index 0)
+while(_smaa_index LESS _smaa_count)
+  list(GET _smaa_files ${_smaa_index} relative)
+  math(EXPR _smaa_index "${_smaa_index}+1")
+  list(GET _smaa_files ${_smaa_index} expected)
+  math(EXPR _smaa_index "${_smaa_index}+1")
+  set(path "${_smaa_root}/${relative}")
+  set(actual "")
+  if(EXISTS "${path}")
+    file(SHA256 "${path}" actual)
+  endif()
+  if(NOT actual STREQUAL expected)
+    get_filename_component(parent "${path}" DIRECTORY)
+    file(MAKE_DIRECTORY "${parent}")
+    file(DOWNLOAD "https://raw.githubusercontent.com/iryoku/smaa/${_smaa_revision}/${relative}"
+      "${path}.download" EXPECTED_HASH "SHA256=${expected}" TLS_VERIFY ON TIMEOUT 180 STATUS status)
+    list(GET status 0 code)
+    if(NOT code EQUAL 0)
+      message(FATAL_ERROR "Pinned SMAA source download failed: ${status}")
+    endif()
+    file(RENAME "${path}.download" "${path}")
+  endif()
+endwhile()
+set(FH1_SMAA_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/fh1-smaa")
+file(MAKE_DIRECTORY "${FH1_SMAA_GENERATED}")
+set(_smaa_old "")
+if(EXISTS "${FH1_SMAA_GENERATED}/source.stamp")
+  file(READ "${FH1_SMAA_GENERATED}/source.stamp" _smaa_old)
+endif()
+if(NOT EXISTS "${FH1_SMAA_GENERATED}/fh1_smaa_source.inc" OR NOT _smaa_old STREQUAL _smaa_revision)
+  file(READ "${_smaa_root}/SMAA.hlsl" hex HEX)
+  string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," hex "${hex}")
+  file(WRITE "${FH1_SMAA_GENERATED}/fh1_smaa_source.inc"
+    "// Generated from official SMAA ${_smaa_revision} (MIT).\nstatic const unsigned char kSmaaSource[] = {${hex}};\n")
+  file(WRITE "${FH1_SMAA_GENERATED}/source.stamp" "${_smaa_revision}")
+endif()
+target_include_directories(rexgpu-xenos PRIVATE "${FH1_SMAA_GENERATED}" "${_smaa_root}/Textures")
+add_custom_command(TARGET rexgpu-xenos POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_smaa_root}/LICENSE.txt"
+    "$<TARGET_FILE_DIR:rexgpu-xenos>/SMAA-LICENSE.txt")
+install(FILES "${_smaa_root}/LICENSE.txt" DESTINATION share/licenses/smaa)
