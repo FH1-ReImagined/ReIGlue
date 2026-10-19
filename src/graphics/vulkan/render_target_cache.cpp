@@ -6277,10 +6277,10 @@ bool VulkanRenderTargetCache::SeedNativeHud(VulkanRenderTargetCache& scene,
   command_processor_.SubmitBarriers(true);
   VkImageBlit region{};
   region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.srcOffsets[1] = {int32_t(width * scene.draw_resolution_scale_x()),
-                          int32_t(height * scene.draw_resolution_scale_y()), 1};
-  region.dstOffsets[1] = {int32_t(width * draw_resolution_scale_x()),
-                          int32_t(height * draw_resolution_scale_y()), 1};
+  region.srcOffsets[1] = {int32_t(width * scene.draw_resolution_scale_x() * scene.raster_scale_x()),
+                          int32_t(height * scene.draw_resolution_scale_y() * scene.raster_scale_y()), 1};
+  region.dstOffsets[1] = {int32_t(width * draw_resolution_scale_x() * raster_scale_x()),
+                          int32_t(height * draw_resolution_scale_y() * raster_scale_y()), 1};
   if (command_processor_.fh1_dlss()) {
     command_processor_.deferred_command_buffer().CmdFh1Dlss(
         command_processor_.fh1_dlss(), src->image(), dst->image());

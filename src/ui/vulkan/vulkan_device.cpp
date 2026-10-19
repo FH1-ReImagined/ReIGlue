@@ -170,10 +170,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   request_promoted_extension("VK_" #name, major, minor, &ext_##major##_##minor##_##name);
 
   bool ext_KHR_portability_subset = false;
-  const auto reconstruction = rex::cvar::GetFlagByName("fh1_upscaler");
-  const bool dlss_requested = with_gpu_emulation && properties.vendorID == 0x10DE &&
-      (reconstruction == "dlss" || reconstruction == "dlaa" || reconstruction == "quality" ||
-       reconstruction == "balanced" || reconstruction == "performance");
+  // A session may enable DLSS later from the graphics menu.
+  const bool dlss_requested = with_gpu_emulation && properties.vendorID == 0x10DE;
   bool ext_KHR_push_descriptor = false;
   if (dlss_requested) requested_extensions.emplace("VK_KHR_push_descriptor", &ext_KHR_push_descriptor);
   bool ext_NVX_binary_import = false, ext_NVX_image_view_handle = false;

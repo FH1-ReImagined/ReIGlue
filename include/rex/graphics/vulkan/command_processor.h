@@ -696,6 +696,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipelineLayout fh1_resolve_layout_ = VK_NULL_HANDLE;
   bool Fh1SynchronizeResolve(uint32_t address, uint32_t length);
   void Fh1SelectNativeHud(bool native_hud);
+  bool Fh1CreateRenderCaches(uint32_t scale_x, uint32_t scale_y);
+  void Fh1ApplyGraphicsRequest();
+  std::string fh1_last_graphics_request_;
+  std::filesystem::path fh1_storage_root_;
+  uint32_t fh1_storage_title_ = 0;
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;

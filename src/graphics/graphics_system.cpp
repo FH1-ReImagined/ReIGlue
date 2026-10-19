@@ -160,6 +160,14 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+          const double new_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+          if (new_hz != refresh_rate_hz) {
+            refresh_rate_hz = new_hz;
+            vsync_interval_ticks = std::max(uint64_t(1),
+                uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+            last_frame_time = current_time;
+          }
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
