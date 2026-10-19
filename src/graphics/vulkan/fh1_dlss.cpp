@@ -67,6 +67,77 @@ struct Fh1Dlss::State {
   VkBuffer temporal_constants{};
   VkDeviceMemory temporal_memory{};
   bool previous_temporal = false, logged_temporal = false;
+#if defined(REX_FH1_NGX)
+  bool InitializeFeatureGpu() {
+    // Finish feature creation and its lazy first evaluation before game frames
+    // can overlap on the submission thread. All GPU initialization uses private
+    // cleared inputs; the first real frame still resets temporal history.
+    const auto& f = device->functions();
+    const VkDevice d = device->device();
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    auto cleanup = [&] {
+      if (fence) f.vkDestroyFence(d, fence, nullptr);
+      if (pool) f.vkDestroyCommandPool(d, pool, nullptr);
+    };
+    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_info.queueFamilyIndex = device->queue_family_graphics_compute();
+    if (f.vkCreateCommandPool(d, &pool_info, nullptr, &pool) != VK_SUCCESS) return false;
+    VkCommandBuffer command;
+    VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    alloc.commandPool = pool; alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; alloc.commandBufferCount = 1;
+    if (f.vkAllocateCommandBuffers(d, &alloc, &command) != VK_SUCCESS) { cleanup(); return false; }
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (f.vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) { cleanup(); return false; }
+    NVSDK_NGX_DLSS_Create_Params create{};
+    create.Feature = {width, height, output_width, output_height, quality};
+    // The scene is already tonemapped; floating-point storage isn't HDR input.
+    create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+        NVSDK_NGX_DLSS_Feature_Flags_AutoExposure | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    auto result = NGX_VULKAN_CREATE_DLSS_EXT1(d, command, 1, 1, &feature, parameters, &create);
+    if (test_failure && std::string_view(test_failure) == "create") result = NVSDK_NGX_Result_FAIL_PlatformError;
+    if (NVSDK_NGX_FAILED(result)) { cleanup(); return false; }
+    for (auto& image : images) {
+      Barrier(command, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+      VkClearColorValue clear{};
+      const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      f.vkCmdClearColorImage(command, image.image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+    }
+    std::array<NVSDK_NGX_Resource_VK, 4> resources;
+    for (unsigned i = 0; i < resources.size(); ++i) {
+      const auto& image = images[i];
+      resources[i] = NVSDK_NGX_Create_ImageView_Resource_VK(image.view, image.image,
+          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, image.format, image.w, image.h, i == 1);
+    }
+    VkMemoryBarrier dependency{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    dependency.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    dependency.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    f.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 1, &dependency, 0, nullptr, 0, nullptr);
+    NVSDK_NGX_VK_DLSS_Eval_Params eval{};
+    eval.Feature.pInColor = &resources[0]; eval.Feature.pInOutput = &resources[1];
+    eval.pInDepth = &resources[2]; eval.pInMotionVectors = &resources[3];
+    eval.InRenderSubrectDimensions = {width, height}; eval.InMVScaleX = eval.InMVScaleY = 1.0f;
+    eval.InReset = true; eval.InPreExposure = eval.InExposureScale = 1.0f;
+    result = NGX_VULKAN_EVALUATE_DLSS_EXT(command, feature, parameters, &eval);
+    if (NVSDK_NGX_FAILED(result) || f.vkEndCommandBuffer(command) != VK_SUCCESS) { cleanup(); return false; }
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (f.vkCreateFence(d, &fence_info, nullptr, &fence) != VK_SUCCESS) { cleanup(); return false; }
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
+    VkResult submitted;
+    {
+      auto queue = device->AcquireQueue(device->queue_family_graphics_compute(), 0);
+      submitted = f.vkQueueSubmit(queue.queue(), 1, &submit, fence);
+    }
+    const bool ready = submitted == VK_SUCCESS && f.vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    cleanup();
+    images_ready = ready;
+    if (ready) REXGPU_INFO("DLSS: feature initialization completed on the GPU");
+    return ready;
+  }
+#endif
   bool CreateTemporalPipeline() {
     const auto& f = device->functions(); const auto d = device->device();
     const VkDescriptorSetLayoutBinding bindings[] = {
@@ -333,6 +404,10 @@ bool Fh1Dlss::Initialize() {
       !s.Create(s.images[2], s.width, s.height, VK_FORMAT_R32_SFLOAT) ||
       !s.Create(s.images[3], s.width, s.height, VK_FORMAT_R16G16_SFLOAT)) return false;
   if (!s.update_buffer || !s.CreateTemporalPipeline()) return false;
+  if (!s.InitializeFeatureGpu()) {
+    REXGPU_ERROR("DLSS: GPU feature initialization failed");
+    return false;
+  }
   REXGPU_INFO("DLSS: official NGX Vulkan runtime ready, no ReShade or D3D12 proxy");
   return true;
 #else
@@ -372,7 +447,7 @@ void Fh1Dlss::Execute(VkCommandBuffer command, VkImage scene, VkImage destinatio
   }
   auto& input = s.images[0]; auto& output = s.images[1];
   s.Barrier(command, input.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-      VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
   s.Blit(command, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, input.image,
       VK_IMAGE_LAYOUT_GENERAL, 1280 * s.backing_scale, 720 * s.backing_scale, s.width, s.height);
   for (auto& image : s.images)
@@ -386,22 +461,6 @@ void Fh1Dlss::Execute(VkCommandBuffer command, VkImage scene, VkImage destinatio
       REXGPU_INFO("DLSS: game reprojection=true");
       s.logged_temporal = true;
     }
-  }
-  if (!s.feature && !s.failed) {
-    NVSDK_NGX_DLSS_Create_Params create{};
-    create.Feature = {s.width, s.height, s.output_width, s.output_height,
-        s.quality};
-    // This is the game's tonemapped scene, before the HUD. A float Vulkan
-    // resource does not make those display-referred colors HDR input.
-    create.InFeatureCreateFlags =
-        NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
-        NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
-    auto result = NGX_VULKAN_CREATE_DLSS_EXT1(s.device->device(), command, 1, 1, &s.feature, s.parameters, &create);
-    if (s.test_failure && std::string_view(s.test_failure) == "create") result = NVSDK_NGX_Result_FAIL_PlatformError;
-    if (NVSDK_NGX_FAILED(result)) {
-      REXGPU_ERROR("DLSS: Vulkan feature creation failed: {:08X}", uint32_t(result)); s.failed = true;
-      ReportStatus("error: NVIDIA feature creation failed. This session uses bilinear scaling; turn DLSS off and restart for native rendering. See the game log.");
-    } else REXGPU_INFO("DLSS: created {} feature {}x{} -> {}x{}", s.mode, s.width, s.height, s.output_width, s.output_height);
   }
   bool rendered = false;
   if (s.feature && !s.failed) {
@@ -420,6 +479,14 @@ void Fh1Dlss::Execute(VkCommandBuffer command, VkImage scene, VkImage destinatio
     eval.InJitterOffsetX = -frame_input.jitter_x; eval.InJitterOffsetY = -frame_input.jitter_y;
     eval.InReset = !temporal || !s.previous_temporal;
     eval.InPreExposure = eval.InExposureScale = 1.0f;
+    // NGX also owns scratch buffers and history resources. Image-specific
+    // barriers for our inputs and output don't order accesses to that private
+    // state, including writes recorded while creating the feature.
+    VkMemoryBarrier ngx_dependency{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    ngx_dependency.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    ngx_dependency.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    f.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &ngx_dependency, 0, nullptr, 0, nullptr);
     auto result = NGX_VULKAN_EVALUATE_DLSS_EXT(command, s.feature, s.parameters, &eval);
     if (s.test_failure && std::string_view(s.test_failure) == "evaluate" && s.frames >= 8) result = NVSDK_NGX_Result_FAIL_PlatformError;
     rendered = NVSDK_NGX_SUCCEED(result);

@@ -135,9 +135,6 @@ VulkanPresenter::PaintContext::Submission::~Submission() {
     dfn.vkDestroyCommandPool(device, draw_command_pool_, nullptr);
   }
 
-  if (present_semaphore_ != VK_NULL_HANDLE) {
-    dfn.vkDestroySemaphore(device, present_semaphore_, nullptr);
-  }
   if (acquire_semaphore_ != VK_NULL_HANDLE) {
     dfn.vkDestroySemaphore(device, acquire_semaphore_, nullptr);
   }
@@ -155,13 +152,6 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
       VK_SUCCESS) {
     REXLOG_ERROR(
         "VulkanPresenter: Failed to create a swapchain image acquisition "
-        "semaphore");
-    return false;
-  }
-  if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &present_semaphore_) !=
-      VK_SUCCESS) {
-    REXLOG_ERROR(
-        "VulkanPresenter: Failed to create a swapchain image presentation "
         "semaphore");
     return false;
   }
@@ -1039,7 +1029,16 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
       paint_context_.DestroySwapchainAndVulkanSurface();
       return SurfacePaintConnectResult::kFailure;
     }
-    paint_context_.swapchain_framebuffers.emplace_back(image_view, framebuffer);
+    VkSemaphore present_semaphore;
+    const VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (dfn.vkCreateSemaphore(device, &semaphore_info, nullptr, &present_semaphore) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain image presentation semaphore");
+      dfn.vkDestroyFramebuffer(device, framebuffer, nullptr);
+      dfn.vkDestroyImageView(device, image_view, nullptr);
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    paint_context_.swapchain_framebuffers.emplace_back(image_view, framebuffer, present_semaphore);
   }
 
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
@@ -1460,10 +1459,21 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   if (swapchain != VK_NULL_HANDLE) {
     submission_tracker.AwaitAllSubmissionsCompletion();
+    // Submission fences don't cover presentation. Drain it before destroying
+    // the per-image semaphores during resize, reconnection, or shutdown.
+    if (present_queue_family != UINT32_MAX) {
+      auto queue = vulkan_device->AcquireQueue(present_queue_family, 0);
+      const auto wait_idle = reinterpret_cast<PFN_vkQueueWaitIdle>(
+          vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr(
+              vulkan_device->device(), "vkQueueWaitIdle"));
+      assert_not_null(wait_idle);
+      wait_idle(queue.queue());
+    }
   }
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   for (const SwapchainFramebuffer& framebuffer : swapchain_framebuffers) {
+    dfn.vkDestroySemaphore(device, framebuffer.present_semaphore, nullptr);
     dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
     dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
   }
@@ -2210,7 +2220,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     paint_context_.ui_setup_command_buffer_current_index = SIZE_MAX;
   }
   command_buffers[command_buffer_count++] = draw_command_buffer;
-  VkSemaphore present_semaphore = paint_submission.present_semaphore();
+  VkSemaphore present_semaphore =
+      paint_context_.swapchain_framebuffers[swapchain_image_index].present_semaphore;
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.pNext = nullptr;

@@ -173,6 +173,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   // A session may enable DLSS later from the graphics menu.
   const bool dlss_requested = with_gpu_emulation && properties.vendorID == 0x10DE;
   bool ext_KHR_push_descriptor = false;
+  bool ext_KHR_buffer_device_address = false;
+  if (dlss_requested) {
+    requested_extensions.emplace("VK_KHR_buffer_device_address", &ext_KHR_buffer_device_address);
+  }
   if (dlss_requested) requested_extensions.emplace("VK_KHR_push_descriptor", &ext_KHR_push_descriptor);
   bool ext_NVX_binary_import = false, ext_NVX_image_view_handle = false;
   if (dlss_requested) requested_extensions.emplace("VK_NVX_binary_import", &ext_NVX_binary_import);
@@ -671,7 +675,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
-      if (dlss_requested) features_1_2.enabled.shaderFloat16 = features_1_2.supported.shaderFloat16;
+      if (dlss_requested) {
+        features_1_2.enabled.shaderFloat16 = features_1_2.supported.shaderFloat16;
+        features_1_2.enabled.bufferDeviceAddress = features_1_2.supported.bufferDeviceAddress;
+      }
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
