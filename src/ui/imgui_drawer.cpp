@@ -14,6 +14,8 @@
 #include <filesystem>
 #include <map>
 
+#include "imgui_dialog_repaint.h"
+
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/logging.h>
@@ -35,6 +37,8 @@ const char kProggyTinyCompressedDataBase85[10950 + 1] =
 static_assert(sizeof(ImmediateVertex) == sizeof(ImDrawVert), "Vertex types must match");
 
 namespace {
+
+DialogRepaintHints dialog_repaint_hints;
 
 void ApplyDefaultStyle(ImGuiStyle& style) {
   style.ScrollbarRounding = 0;
@@ -88,6 +92,17 @@ void ApplyDefaultStyle(ImGuiStyle& style) {
 
 }  // namespace
 
+// UI-thread-only optional C extension. No public SDK header, class layout or
+// virtual table changes: clients may compile against the stock nightly headers.
+#ifdef _WIN32
+extern "C" __declspec(dllexport)
+#else
+extern "C" __attribute__((visibility("default")))
+#endif
+void rexui_SetDialogContinuousRepaint(const void* dialog, bool continuous) {
+  dialog_repaint_hints.SetContinuous(dialog, continuous);
+}
+
 ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallback font_setup,
                          StyleSetupCallback style_setup)
     : window_(window),
@@ -98,6 +113,7 @@ ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallb
 }
 
 ImGuiDrawer::~ImGuiDrawer() {
+  for (const auto* dialog : dialogs_) dialog_repaint_hints.Forget(dialog);
   SetPresenter(nullptr);
   SetWindowTextInputActive(false);
   if (!dialogs_.empty()) {
@@ -136,6 +152,7 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
   assert_not_null(dialog);
+  dialog_repaint_hints.Forget(dialog);
   auto it = std::find(dialogs_.cbegin(), dialogs_.cend(), dialog);
   if (it == dialogs_.cend()) {
     return;
@@ -436,7 +453,9 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // it now if needed.
   DetachIfLastDialogRemoved();
 
-  if (!dialogs_.empty()) {
+  if (std::any_of(dialogs_.begin(), dialogs_.end(), [](const ImGuiDialog* dialog) {
+        return dialog_repaint_hints.WantsContinuous(dialog);
+      })) {
     // Repaint (and handle input) continuously if still active. In detached mode
     // there is no presenter; the app drives repaint via its own present loop.
     if (presenter_) {
