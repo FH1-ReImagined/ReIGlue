@@ -98,7 +98,14 @@ std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view
                                                           uint32_t attributes) {
   auto full_path = host_path_ / rex::to_path(name);
   if (attributes & kFileAttributeDirectory) {
-    if (!std::filesystem::create_directories(full_path)) {
+    // A name the host refuses (Windows: ':' in it, or a path past MAX_PATH) must fail the
+    // guest's call, not throw through NtCreateFile into guest code.
+    std::error_code ec;
+    if (!std::filesystem::create_directories(full_path, ec)) {
+      if (ec) {
+        REXFS_WARN("CreateEntryInternal: cannot create directory '{}': {} ({})",
+                   rex::path_to_utf8(full_path), ec.message(), ec.value());
+      }
       return nullptr;
     }
   } else {
