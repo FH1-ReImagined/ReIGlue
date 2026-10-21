@@ -39,6 +39,9 @@ REXCVAR_DEFINE_BOOL(
     vulkan_direct_scaled_texture_upload, true, "Vulkan",
     "Load eligible scaled NVIDIA textures directly into images; false uses the copy-buffer path");
 
+REXCVAR_DEFINE_BOOL(vulkan_force_base_mip, false, "GPU/Vulkan",
+    "Work around texture filtering artifacts by sampling 2D textures at their base mip");
+
 namespace rex::graphics::vulkan {
 
 // Generated with `xb buildshaders`.
@@ -761,6 +764,15 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     parameters.mag_linear = 1;
     parameters.min_linear = 1;
     parameters.mip_linear = 1;
+  }
+  if (REXCVAR_GET(vulkan_force_base_mip) &&
+      fetch.dimension == xenos::DataDimension::k2DOrStacked) {
+    // Diagnostic fallback: avoid both mip selection and anisotropic footprints.
+    // Keep this opt-in; distant textures may shimmer without mip filtering.
+    parameters.mip_base_map = 1;
+    parameters.mip_min_level = 0;
+    parameters.mip_linear = 0;
+    aniso_filter = xenos::AnisoFilter::kDisabled;
   }
   parameters.aniso_filter = aniso_filter;
 
