@@ -22,6 +22,7 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <rex/graphics/vulkan/driver_cache_file.h>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -369,6 +370,34 @@ class VulkanPipelineCache {
   // available.
   bool EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                              VkShaderModule fragment_shader_override = VK_NULL_HANDLE);
+  // Driver pipeline data, one entry per description (driver_cache_file.h): each real
+  // pipeline is created with a VkPipelineCache of its own, seeded with its stored entry.
+  void InitializeDriverPipelineCache(const std::filesystem::path& cache_root, uint32_t title_id);
+  void SaveDriverPipelineCache();
+  void DestroyDriverPipelineCache();
+  // Drops stored entries of descriptions that are not in the pipeline store.
+  void PruneDriverPipelineCache(const std::vector<PipelineStoredDescription>& stored);
+  void LogDriverPipelineCacheUse();
+  VkPipelineCache CreateDriverCache(const std::vector<uint8_t>* data, bool* seeded = nullptr);
+  std::vector<uint8_t> GetDriverCacheData(VkPipelineCache cache);
+  void CreatePipelineWithDriverCache(const PipelineDescription& description,
+                                     const VkGraphicsPipelineCreateInfo& create_info,
+                                     VkPipeline& pipeline, VkResult& result);
+  std::mutex driver_cache_mutex_;
+  bool driver_cache_enabled_ = false;
+  std::unordered_map<uint64_t, driver_cache_file::Entry> driver_cache_stored_;
+  std::unordered_map<uint64_t, driver_cache_file::Entry> driver_cache_used_;
+  PFN_vkCreatePipelineCache create_driver_cache_ = nullptr;
+  PFN_vkGetPipelineCacheData get_driver_cache_data_ = nullptr;
+  PFN_vkDestroyPipelineCache destroy_driver_cache_ = nullptr;
+  driver_cache_file::Identity driver_cache_identity_;
+  std::filesystem::path driver_cache_path_;
+  uint64_t driver_cache_generation_ = 0;
+  uint64_t driver_cache_saved_generation_ = 0;
+  bool driver_cache_limit_logged_ = false;
+  std::atomic<uint32_t> driver_cache_reused_{0};
+  std::atomic<uint32_t> driver_cache_compiled_{0};
+  std::atomic<uint32_t> driver_cache_rebuilt_{0};
   void CreationThread(size_t thread_index);
   void CreateQueuedPipelinesOnProcessorThread();
   void ProcessDeferredPipelineDestructions(bool force_all);

@@ -12,6 +12,7 @@
 #include "thirdparty/dxbc/DXBCChecksum.h"
 
 #include <algorithm>
+#include <rex/graphics/shader_warmup.h>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
@@ -220,6 +221,7 @@ void PipelineCache::Shutdown() {
 
 void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                             uint32_t title_id, bool blocking) {
+  ShaderWarmupLog warmup("D3D12");
   ShutdownShaderStorage();
 
   auto shader_storage_root = cache_root / "shaders";
