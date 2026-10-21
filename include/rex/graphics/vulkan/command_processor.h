@@ -714,6 +714,27 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::filesystem::path fh1_storage_root_;
   uint32_t fh1_storage_title_ = 0;
 
+  // FH1 HDR: pre-HUD scene copies are retired independently per in-flight frame.
+  struct HdrScene {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t width = 0, height = 0;
+    uint64_t submission = 0, frame = UINT64_MAX;
+  };
+  std::array<HdrScene, kMaxFramesInFlight> hdr_scenes_{};
+  uint32_t hdr_scene_base_ = UINT32_MAX;
+  bool hdr_capture_attempted_ = false;
+  void CaptureHdrScene();
+  void DestroyHdrScene(HdrScene& scene);
+  bool EnsureSwapHudMask();
+  VkDescriptorSetLayout swap_hud_mask_set_layout_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_hud_mask_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
+  bool swap_hud_mask_failed_ = false;
+
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
 

@@ -110,6 +110,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   float raster_scale_y() const { return raster_scale_y_; }
   float raster_scale_x_ = 1.0f, raster_scale_y_ = 1.0f;
   bool SeedNativeHud(VulkanRenderTargetCache& scene, uint32_t width, uint32_t height);
+  bool CopyHdrScene(VkImage destination, uint32_t width, uint32_t height);
   bool HasNativeHudColorTarget() const {
     return last_update_accumulated_render_targets()[1] != nullptr;
   }

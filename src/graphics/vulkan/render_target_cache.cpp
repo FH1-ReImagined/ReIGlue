@@ -1914,6 +1914,12 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // HDR can be enabled after these targets were cached in SDR. Eligible
+    // single-sample scene images must always permit the pre-HUD snapshot.
+    if (image_create_info.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+        key.msaa_samples == xenos::MsaaSamples::k1X) {
+      image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
     if (REXCVAR_GET(vulkan_render_target_initial_fill) || command_processor_.fh1_split_enabled())
       image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   }
@@ -6295,6 +6301,35 @@ bool VulkanRenderTargetCache::SeedNativeHud(VulkanRenderTargetCache& scene,
       VulkanRenderTarget::kColorDrawAccessMask, dst->current_layout(), VulkanRenderTarget::kColorDrawLayout);
   dst->SetUsage(VulkanRenderTarget::kColorDrawStageMask, VulkanRenderTarget::kColorDrawAccessMask,
                 VulkanRenderTarget::kColorDrawLayout);
+  return true;
+}
+
+bool VulkanRenderTargetCache::CopyHdrScene(VkImage destination, uint32_t width, uint32_t height) {
+  if (GetPath() != Path::kHostRenderTargets)
+    return false;
+  auto* src = static_cast<VulkanRenderTarget*>(last_update_accumulated_render_targets()[1]);
+  if (!src || src->key().msaa_samples != xenos::MsaaSamples::k1X ||
+      GetColorVulkanFormat(src->key().GetColorFormat()) != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+      src->key().GetWidth() * draw_resolution_scale_x() < width ||
+      GetRenderTargetHeight(src->key().pitch_tiles_at_32bpp, src->key().msaa_samples) *
+              draw_resolution_scale_y() < height)
+    return false;
+  command_processor_.EndRenderPass();
+  const auto range = ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+  const auto stage = src->current_stage_mask();
+  const auto access = src->current_access_mask();
+  const auto layout = src->current_layout();
+  command_processor_.PushImageMemoryBarrier(
+      src->image(), range, stage, VK_PIPELINE_STAGE_TRANSFER_BIT, access,
+      VK_ACCESS_TRANSFER_READ_BIT, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  VkImageBlit copy{};
+  copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.srcOffsets[1] = copy.dstOffsets[1] = {int32_t(width), int32_t(height), 1};
+  command_processor_.deferred_command_buffer().CmdVkBlitImage(src->image(), destination, copy);
+  command_processor_.PushImageMemoryBarrier(src->image(), range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                            stage, VK_ACCESS_TRANSFER_READ_BIT, access,
+                                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout);
   return true;
 }
 
