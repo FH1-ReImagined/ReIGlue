@@ -34,6 +34,10 @@ REXCVAR_DECLARE(int32_t, forza_native_height);
 REXCVAR_DEFINE_BOOL(vulkan_implicit_cube_lod, true, "GPU/Vulkan",
     "Use hardware implicit LOD for automatic cubemap fetches on NVIDIA");
 
+REXCVAR_DEFINE_BOOL(spirv_pixel_shader_contraction, REX_PLATFORM_MAC, "GPU/Vulkan",
+    "Allow fused arithmetic in Apple GPU color shaders; avoids material filtering artifacts")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
 
 SpirvShaderTranslator::Features::Features(bool all)
@@ -52,7 +56,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       demote_to_helper_invocation(all),
       sample_rate_shading(all),
       implicit_cube_lod(false),
-      fh1_native_viewport(false) {}
+      fh1_native_viewport(false),
+      pixel_shader_contraction(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -73,7 +78,9 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       implicit_cube_lod(vulkan_device->properties().vendorID == 0x10DE &&
                         REXCVAR_GET(vulkan_implicit_cube_lod)),
       fh1_native_viewport(REXCVAR_GET(forza_native_width) > 0 &&
-                          REXCVAR_GET(forza_native_height) > 0) {
+                          REXCVAR_GET(forza_native_height) > 0),
+      pixel_shader_contraction(vulkan_device->properties().vendorID == 0x106B &&
+                               REXCVAR_GET(spirv_pixel_shader_contraction)) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -100,6 +107,7 @@ uint64_t SpirvShaderTranslator::GetDefaultPixelShaderModification(
     uint32_t dynamic_addressable_register_count) const {
   Modification shader_modification;
   shader_modification.pixel.dynamic_addressable_register_count = dynamic_addressable_register_count;
+  shader_modification.pixel.allow_contraction = features_.pixel_shader_contraction;
   return shader_modification.value;
 }
 
@@ -189,6 +197,13 @@ void SpirvShaderTranslator::StartTranslation() {
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                             nullptr);
+  // Pinyon Shift's macOS pixel-math tuning also permits contraction. Retain
+  // this SDK's existing SM3 zero/NaN rules, and keep positions, depth and
+  // memory exports precise. Strict Metal color shaders showed fine grids in
+  // normally filtered vehicle materials on M4 Pro; the contracted path does not.
+  builder_->allow_contraction = is_pixel_shader() && !is_depth_only_fragment_shader_ &&
+      GetSpirvShaderModification().pixel.allow_contraction &&
+      !current_shader().writes_depth() && !IsMemoryExportUsed();
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);

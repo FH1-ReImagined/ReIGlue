@@ -34,7 +34,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 0x20261017;
+    static constexpr uint32_t kVersion = 0x20261018;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -89,6 +89,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // Part of the shader/pipeline key so strict and contracted variants differ.
+      uint32_t allow_contraction : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -408,6 +410,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // NVIDIA's explicit cube Grad path can corrupt ordinary reflection fetches.
     bool implicit_cube_lod;
     bool fh1_native_viewport;
+    bool pixel_shader_contraction;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,

@@ -28,6 +28,9 @@ class SpirvBuilder : public spv::Builder {
   SpirvBuilder(unsigned int spv_version, unsigned int user_number, spv::SpvBuildLogger* logger)
       : spv::Builder(spv_version, user_number, logger) {}
 
+  // Keep vertex/depth arithmetic precise; selected color shaders may opt in.
+  bool allow_contraction = false;
+
   // Make public rather than protected.
   using spv::Builder::createSelectionMerge;
 
