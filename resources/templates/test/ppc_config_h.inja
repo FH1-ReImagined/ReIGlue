@@ -110,6 +110,8 @@
 #define REX_SET_FLUSH_MODE(enable) \
   do { if (enable) ctx.fpscr.enableFlushMode(); else ctx.fpscr.disableFlushMode(); } while (0)
 
+{% include "codegen/_ppc_fma.inja" %}
+
 //=============================================================================
 // Misc
 //=============================================================================
