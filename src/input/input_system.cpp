@@ -26,6 +26,7 @@
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
+#include <rex/runtime.h>
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
     .allowed({"sdl", "xinput"});
@@ -460,6 +461,28 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   return any_synthetic ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
+int InputSystem::SetTriggerRumble(uint32_t user_mask, uint16_t left, uint16_t right,
+                                  uint32_t duration) {
+  if (!assignment_) return 0;
+  if (!GetVibrationEnabled() || ui_input_blockers_.load() > 0) left = right = 0;
+  RefreshDevices();
+  int count = 0;
+  bool failed = false;
+  for (uint32_t user = 0; user < kMaxGuestUsers; ++user) {
+    if (!(user_mask & (1u << user))) continue;
+    std::vector<DeviceId> ids;
+    assignment_->DevicesForUser(user, ids);
+    for (DeviceId id : ids) {
+      auto* driver = dynamic_cast<sdl::SDLInputDriver*>(DriverForDevice(id));
+      if (!driver) continue;
+      const int result = driver->SetDeviceTriggerRumble(id, left, right, duration);
+      if (result > 0) ++count;
+      if (result < 0) failed = true;
+    }
+  }
+  return failed ? -1 : count;
+}
+
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
@@ -532,3 +555,18 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
 }
 
 }  // namespace rex::input
+
+// Dynamically discovered by the opt-in FH1 bridge, so older runtimes remain
+// loadable. No class layout or virtual table changes are required.
+#if defined(_WIN32)
+#define FORZA_TRIGGER_EXPORT __declspec(dllexport)
+#else
+#define FORZA_TRIGGER_EXPORT __attribute__((visibility("default")))
+#endif
+extern "C" FORZA_TRIGGER_EXPORT int ForzaInputTriggerRumble(
+    uint32_t user_mask, uint16_t left, uint16_t right, uint32_t duration) {
+  auto* kernel = rex::system::kernel_state();
+  if (!kernel || !kernel->emulator()) return 0;
+  auto* input = dynamic_cast<rex::input::InputSystem*>(kernel->emulator()->input_system());
+  return input ? input->SetTriggerRumble(user_mask & 15u, left, right, duration) : 0;
+}

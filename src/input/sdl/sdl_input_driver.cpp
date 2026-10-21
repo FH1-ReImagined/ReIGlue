@@ -370,6 +370,20 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
              : X_ERROR_FUNCTION_FAILED;
 }
 
+// Uses the very same SDL_Gamepad as ordinary rumble, preserving SDL's body
+// motor state when the backend assembles a combined hardware output report.
+int SDLInputDriver::SetDeviceTriggerRumble(DeviceId id, uint16_t left, uint16_t right,
+                                           uint32_t duration) {
+  auto guard = DrainAndLock();
+  auto* controller = FindController(id);
+  if (!controller || SDL_GetGamepadType(controller->sdl) != SDL_GAMEPAD_TYPE_XBOXONE ||
+      !SDL_GetBooleanProperty(SDL_GetGamepadProperties(controller->sdl),
+                              SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false)) return 0;
+  if (!is_active()) left = right = 0;
+  return SDL_RumbleGamepadTriggers(controller->sdl, left, right,
+                                   std::min(duration, uint32_t(150))) ? 1 : -1;
+}
+
 X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
                                             X_INPUT_KEYSTROKE* out_keystroke) {
   // TODO(JoelLinn): Figure out the flags

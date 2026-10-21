@@ -51,6 +51,8 @@ class InputSystem : public system::IInputSystem {
   /// GetState for the emulator's own UI, which reads while the guest is blocked.
   X_RESULT GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
+  // Additive API: impulse triggers only; body rumble remains owned by SetState.
+  int SetTriggerRumble(uint32_t user_mask, uint16_t left, uint16_t right, uint32_t duration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
   /// While any blocker is held the guest reads a neutral pad. Buttons still
