@@ -78,7 +78,7 @@ REXCVAR_DEFINE_STRING(fh1_graphics_request, "", "GPU/Vulkan", "FH1 live graphics
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(fh1_graphics_result, "", "GPU/Vulkan", "FH1 live graphics result")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_STRING(fh1_upscaler, "off", "GPU/Vulkan", "FH1 scene reconstruction: off, smaa; NVIDIA DLSS quality, balanced, performance (dlss), dlaa; AMD FSR 3 fsr3_quality, fsr3_balanced, fsr3_performance, fsr3_native").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_upscaler, "off", "GPU/Vulkan", "FH1 scene reconstruction: off, smaa; NVIDIA DLSS quality, balanced, performance (dlss), dlaa; AMD FSR 3 fsr3_quality, fsr3_balanced, fsr3_performance, fsr3_native; Apple metalfx_temporal, metalfx_spatial").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_UINT32(fh1_output_width, 2560, "GPU/Vulkan", "FH1 reconstruction output width").lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_UINT32(fh1_output_height, 1440, "GPU/Vulkan", "FH1 reconstruction output height")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -2162,6 +2162,73 @@ bool VulkanCommandProcessor::SetupContext() {
   return true;
 }
 
+VkResult VulkanCommandProcessor::ReplayAndSubmit(
+    const CommandBuffer& buffer, const DeferredCommandBuffer::Streams& streams,
+    VkFence fence, const std::vector<VkSemaphore>& waits,
+    const std::vector<VkPipelineStageFlags>& stages) {
+  const auto* device = GetVulkanDevice();
+  const auto& f = device->functions();
+  VkResult result = f.vkResetCommandPool(device->device(), buffer.pool, 0);
+  if (result != VK_SUCCESS) return result;
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  result = f.vkBeginCommandBuffer(buffer.buffer, &begin);
+  if (result != VK_SUCCESS) return result;
+  // Ordinary submissions retain the existing allocation-free replay path.
+  if (!streams.native_upscale) {
+    VkCommandBuffer command = deferred_command_buffer_.ExecuteStreams(buffer.buffer, streams);
+    if (!command) return VK_ERROR_DEVICE_LOST;
+    result = f.vkEndCommandBuffer(command);
+    if (result != VK_SUCCESS) return result;
+    VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    info.waitSemaphoreCount = uint32_t(waits.size());
+    info.pWaitSemaphores = waits.data(); info.pWaitDstStageMask = stages.data();
+    info.commandBufferCount = 1; info.pCommandBuffers = &command;
+    auto queue = device->AcquireQueue(device->queue_family_graphics_compute(), 0);
+    return f.vkQueueSubmit(queue.queue(), 1, &info, fence);
+  }
+  std::vector<VkSemaphore> pending_waits = waits;
+  std::vector<VkPipelineStageFlags> pending_stages = stages;
+  std::vector<uint64_t> pending_values(waits.size(), 0);
+  bool timeline_wait = false, split_used = false;
+  auto submit = [&](VkCommandBuffer command, VkSemaphore signal, uint64_t value, VkFence completion) {
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.waitSemaphoreValueCount = uint32_t(pending_values.size());
+    timeline.pWaitSemaphoreValues = pending_values.data();
+    timeline.signalSemaphoreValueCount = signal ? 1 : 0;
+    timeline.pSignalSemaphoreValues = signal ? &value : nullptr;
+    VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    if (signal || timeline_wait) info.pNext = &timeline;
+    info.waitSemaphoreCount = uint32_t(pending_waits.size());
+    info.pWaitSemaphores = pending_waits.data(); info.pWaitDstStageMask = pending_stages.data();
+    info.commandBufferCount = 1; info.pCommandBuffers = &command;
+    info.signalSemaphoreCount = signal ? 1 : 0; info.pSignalSemaphores = signal ? &signal : nullptr;
+    auto queue = device->AcquireQueue(device->queue_family_graphics_compute(), 0);
+    return f.vkQueueSubmit(queue.queue(), 1, &info, completion);
+  };
+  Fh1Dlss::SplitSubmission split = [&](VkCommandBuffer& command, const Fh1Dlss::NativeSubmission& native) {
+    // One reconstruction point per submission. Both buffers live until the final fence.
+    if (split_used || !buffer.continuation || !native.ready || !native.complete || !native.encode)
+      return false;
+    result = f.vkEndCommandBuffer(command);
+    if (result != VK_SUCCESS) return false;
+    result = submit(command, native.ready, native.value, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS || !native.encode()) return false;
+    command = buffer.continuation;
+    result = f.vkBeginCommandBuffer(command, &begin);
+    if (result != VK_SUCCESS) return false;
+    pending_waits = {native.complete}; pending_values = {native.value};
+    pending_stages = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    timeline_wait = split_used = true;
+    return true;
+  };
+  VkCommandBuffer command = deferred_command_buffer_.ExecuteStreams(buffer.buffer, streams, split);
+  if (!command) return result == VK_SUCCESS ? VK_ERROR_DEVICE_LOST : result;
+  result = f.vkEndCommandBuffer(command);
+  if (result != VK_SUCCESS) return result;
+  return submit(command, VK_NULL_HANDLE, 0, fence);
+}
+
 void VulkanCommandProcessor::SubmissionThread() {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2182,48 +2249,9 @@ void VulkanCommandProcessor::SubmissionThread() {
     // After a failure the following submissions are dropped: their fences are never waited for
     // (the command processor treats the device as lost).
     if (!submission_thread_failed_.load(std::memory_order_relaxed)) {
-      const char* failure = nullptr;
-      VkResult result = VK_SUCCESS;
-      if (dfn.vkResetCommandPool(device, job.command_buffer.pool, 0) != VK_SUCCESS) {
-        failure = "Failed to reset a Vulkan command pool";
-      } else {
-        VkCommandBufferBeginInfo command_buffer_begin_info;
-        command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        command_buffer_begin_info.pNext = nullptr;
-        command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        command_buffer_begin_info.pInheritanceInfo = nullptr;
-        if (dfn.vkBeginCommandBuffer(job.command_buffer.buffer, &command_buffer_begin_info) !=
-            VK_SUCCESS) {
-          failure = "Failed to begin a Vulkan command buffer";
-        } else {
-          deferred_command_buffer_.ExecuteStreams(job.command_buffer.buffer, job.streams);
-          if (dfn.vkEndCommandBuffer(job.command_buffer.buffer) != VK_SUCCESS) {
-            failure = "Failed to end a Vulkan command buffer";
-          }
-        }
-      }
-      if (!failure) {
-        VkSubmitInfo submit_info;
-        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit_info.pNext = nullptr;
-        submit_info.waitSemaphoreCount = uint32_t(job.wait_semaphores.size());
-        submit_info.pWaitSemaphores =
-            job.wait_semaphores.empty() ? nullptr : job.wait_semaphores.data();
-        submit_info.pWaitDstStageMask =
-            job.wait_stage_masks.empty() ? nullptr : job.wait_stage_masks.data();
-        submit_info.commandBufferCount = 1;
-        submit_info.pCommandBuffers = &job.command_buffer.buffer;
-        submit_info.signalSemaphoreCount = 0;
-        submit_info.pSignalSemaphores = nullptr;
-        {
-          ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
-              vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
-          result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, job.fence);
-        }
-        if (result != VK_SUCCESS) {
-          failure = "Failed to submit a Vulkan command buffer";
-        }
-      }
+      const VkResult result = ReplayAndSubmit(job.command_buffer, job.streams, job.fence,
+                                              job.wait_semaphores, job.wait_stage_masks);
+      const char* failure = result == VK_SUCCESS ? nullptr : "Failed to replay/submit Vulkan work";
       if (failure) {
         REXGPU_ERROR("{} (submission {}, threaded submission)", failure, job.submission);
         if (result == VK_ERROR_DEVICE_LOST) {
@@ -4144,13 +4172,19 @@ bool VulkanCommandProcessor::Fh1CreateRenderCaches(uint32_t draw_resolution_scal
 
   if (REXCVAR_GET(fh1_scene_720p_native_hud) || REXCVAR_GET(fh1_upscaler) != "off") {
     const bool fh1_fsr3 = REXCVAR_GET(fh1_upscaler).rfind("fsr3_", 0) == 0;
-    const std::string fh1_backend = fh1_fsr3 ? "AMD FSR 3" : "NVIDIA DLSS";
+    const bool fh1_metalfx = REXCVAR_GET(fh1_upscaler).rfind("metalfx", 0) == 0;
+    const std::string fh1_backend = fh1_metalfx ? "Apple MetalFX" : (fh1_fsr3 ? "AMD FSR 3" : "NVIDIA DLSS");
     const uint32_t output_width = REXCVAR_GET(fh1_output_width);
     const uint32_t output_height = REXCVAR_GET(fh1_output_height);
     const uint32_t output_scale = (output_height + 719) / 720;
-    const bool supported_output = (output_width == 1920 && output_height == 1080) ||
+    const bool supported_output =
+#if REX_PLATFORM_MAC
+        (output_width == 1280 && output_height == 720 && REXCVAR_GET(fh1_upscaler) == "off") ||
+#endif
+        (output_width == 1920 && output_height == 1080) ||
         (output_width == 2560 && output_height == 1440) || (output_width == 3840 && output_height == 2160);
-    const bool compatible = supported_output && draw_resolution_scale_x == output_scale &&
+    const bool compatible = supported_output && (!fh1_metalfx || output_height % 720 == 0) &&
+        draw_resolution_scale_x == output_scale &&
         draw_resolution_scale_y == output_scale &&
         render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
     if (!compatible) {
@@ -4228,11 +4262,22 @@ void VulkanCommandProcessor::Fh1ApplyGraphicsRequest() {
   std::string mode, extra;
   if (!(input >> id >> width >> height >> scene_scale >> mode) || (input >> extra) ||
       !((width == 1920 && height == 1080) || (width == 2560 && height == 1440) ||
+#if REX_PLATFORM_MAC
+        (width == 1280 && height == 720 && mode == "off") ||
+#endif
         (width == 3840 && height == 2160)) || scene_scale < 1 || scene_scale > 3 ||
       !(mode == "off" || mode == "quality" || mode == "balanced" || mode == "dlss" ||
         mode == "smaa" || mode == "dlaa" || mode == "fsr3_quality" || mode == "fsr3_balanced" ||
-        mode == "fsr3_performance" || mode == "fsr3_native")) {
+        mode == "fsr3_performance" || mode == "fsr3_native"
+#if REX_PLATFORM_MAC
+        || mode == "metalfx_temporal" || mode == "metalfx_spatial"
+#endif
+        )) {
     result("error: unsupported graphics settings");
+    return;
+  }
+  if ((mode == "metalfx_temporal" || mode == "metalfx_spatial") && height % 720 != 0) {
+    result("error: MetalFX currently requires 1440p or 4K output");
     return;
   }
   if (width == REXCVAR_GET(fh1_output_width) && height == REXCVAR_GET(fh1_output_height) &&
@@ -6422,13 +6467,18 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       command_buffer_allocate_info.pNext = nullptr;
       command_buffer_allocate_info.commandPool = command_buffer.pool;
       command_buffer_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-      command_buffer_allocate_info.commandBufferCount = 1;
+      // Reserve the continuation before a session can enable MetalFX live.
+      const bool native = REX_PLATFORM_MAC;
+      command_buffer_allocate_info.commandBufferCount = native ? 2 : 1;
+      VkCommandBuffer buffers[2]{};
       if (dfn.vkAllocateCommandBuffers(device, &command_buffer_allocate_info,
-                                       &command_buffer.buffer) != VK_SUCCESS) {
+                                       buffers) != VK_SUCCESS) {
         REXGPU_ERROR("Failed to allocate a Vulkan command buffer");
         dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
         return false;
       }
+      command_buffer.buffer = buffers[0];
+      command_buffer.continuation = buffers[1];
       command_buffers_writable_.push_back(command_buffer);
     }
   }
@@ -6543,6 +6593,16 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         submission_thread_jobs_.push_back(std::move(job));
       }
       submission_thread_request_cond_.notify_one();
+    } else if (fh1_dlss_ && fh1_dlss_->UsesMetalFx()) {
+      if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) return false;
+      DeferredCommandBuffer::Streams streams;
+      deferred_command_buffer_.TakeStreams(streams);
+      const VkResult result = ReplayAndSubmit(command_buffer, streams, fence,
+          current_submission_wait_semaphores_, current_submission_wait_stage_masks_);
+      if (result != VK_SUCCESS) {
+        REXGPU_ERROR("MetalFX: submission failed ({})", int(result));
+        device_lost_ = true; return false;
+      }
     } else {
       if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
         REXGPU_ERROR("Failed to reset a Vulkan command pool");

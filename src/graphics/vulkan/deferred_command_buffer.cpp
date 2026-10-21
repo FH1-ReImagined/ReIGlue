@@ -32,6 +32,7 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
 void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
   hoisted_stream_.clear();
+  native_upscale_ = false;
   write_stream_ = &command_stream_;
 }
 
@@ -60,9 +61,10 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 hoisted_stream_.data());
 }
 
-void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
+VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
                                           size_t stream_remaining,
-                                          const uintmax_t* hoisted_stream) const {
+                                          const uintmax_t* hoisted_stream,
+                                          const Fh1Dlss::SplitSubmission& split) const {
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
   while (stream_remaining) {
@@ -73,7 +75,12 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
     switch (header.command) {
       case Command::kFh1Dlss: {
         const auto& args = *reinterpret_cast<const ArgsFh1Dlss*>(stream);
-        args.effect->Execute(command_buffer, args.src, args.dst, args.input);
+        if (args.effect->UsesMetalFx()) {
+          if (!args.effect->ExecuteMetalFx(command_buffer, args.src, args.dst, args.input, split))
+            return VK_NULL_HANDLE;
+        } else {
+          args.effect->Execute(command_buffer, args.src, args.dst, args.input);
+        }
       } break;
       case Command::kVkBlitImage: {
         const auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
@@ -362,8 +369,9 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
       case Command::kHoistedCommands: {
         auto& args = *reinterpret_cast<const ArgsHoistedCommands*>(stream);
         if (args.end > args.begin) {
-          ExecuteStream(command_buffer, hoisted_stream + args.begin, args.end - args.begin,
-                        hoisted_stream);
+          command_buffer = ExecuteStream(command_buffer, hoisted_stream + args.begin, args.end - args.begin,
+                        hoisted_stream, split);
+          if (!command_buffer) return VK_NULL_HANDLE;
         }
       } break;
 
@@ -375,6 +383,7 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
   }
+  return command_buffer;
 }
 
 void DeferredCommandBuffer::CmdVkPipelineBarrier(

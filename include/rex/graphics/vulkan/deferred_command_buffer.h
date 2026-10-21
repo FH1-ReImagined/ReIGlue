@@ -35,6 +35,7 @@ class DeferredCommandBuffer {
     auto& args = *reinterpret_cast<ArgsFh1Dlss*>(
         WriteCommand(Command::kFh1Dlss, sizeof(ArgsFh1Dlss)));
     args.effect = effect; args.src = src; args.dst = dst; args.input = effect->input();
+    native_upscale_ |= effect->UsesMetalFx();
   }
   mutable PFN_vkCmdBlitImage blit_image_ = nullptr;
   void CmdVkBlitImage(VkImage src, VkImage dst, const VkImageBlit& region) {
@@ -56,19 +57,22 @@ class DeferredCommandBuffer {
   struct Streams {
     std::vector<uintmax_t> main;
     std::vector<uintmax_t> hoisted;
+    bool native_upscale = false;
   };
   // Swaps the recorded commands with `streams` (normally empty ones, whose allocations are
   // reused) and starts recording anew.
   void TakeStreams(Streams& streams) {
     command_stream_.swap(streams.main);
     hoisted_stream_.swap(streams.hoisted);
+    streams.native_upscale = native_upscale_;
     Reset();
   }
   // Executes commands taken with TakeStreams. Touches nothing else in the deferred command
   // buffer, so it may run on another thread while new commands are recorded.
-  void ExecuteStreams(VkCommandBuffer command_buffer, const Streams& streams) const {
-    ExecuteStream(command_buffer, streams.main.data(), streams.main.size(),
-                  streams.hoisted.data());
+  VkCommandBuffer ExecuteStreams(VkCommandBuffer command_buffer, const Streams& streams,
+                                 const Fh1Dlss::SplitSubmission& split = {}) const {
+    return ExecuteStream(command_buffer, streams.main.data(), streams.main.size(),
+                         streams.hoisted.data(), split);
   }
 
   // Hoisting: commands recorded later but executed earlier, at a hoist point written into the
@@ -661,8 +665,9 @@ class DeferredCommandBuffer {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
-  void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
-                     size_t stream_remaining, const uintmax_t* hoisted_stream) const;
+  VkCommandBuffer ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                     size_t stream_remaining, const uintmax_t* hoisted_stream,
+                     const Fh1Dlss::SplitSubmission& split = {}) const;
 
   const VulkanCommandProcessor& command_processor_;
 
@@ -670,6 +675,7 @@ class DeferredCommandBuffer {
   std::vector<uintmax_t> command_stream_;
   std::vector<uintmax_t> hoisted_stream_;
   std::vector<uintmax_t>* write_stream_ = &command_stream_;
+  bool native_upscale_ = false;
 };
 
 }  // namespace rex::graphics::vulkan

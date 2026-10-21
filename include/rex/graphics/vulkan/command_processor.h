@@ -164,6 +164,14 @@ class VulkanCommandProcessor : public CommandProcessor {
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
     current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+    if (fh1_dlss_ && fh1_dlss_->UsesMetalFx()) {
+      // The native pass starts a new Vulkan command buffer; dynamic state is not inherited.
+      dynamic_viewport_update_needed_ = dynamic_scissor_update_needed_ = true;
+      dynamic_depth_bias_update_needed_ = dynamic_blend_constants_update_needed_ = true;
+      dynamic_stencil_compare_mask_front_update_needed_ = dynamic_stencil_compare_mask_back_update_needed_ = true;
+      dynamic_stencil_write_mask_front_update_needed_ = dynamic_stencil_write_mask_back_update_needed_ = true;
+      dynamic_stencil_reference_front_update_needed_ = dynamic_stencil_reference_back_update_needed_ = true;
+    }
   }
   uint64_t GetCurrentSubmission() const {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
@@ -305,6 +313,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct CommandBuffer {
     VkCommandPool pool;
     VkCommandBuffer buffer;
+    VkCommandBuffer continuation = VK_NULL_HANDLE;
   };
 
   struct SparseBufferBind {
@@ -326,6 +335,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkPipelineStageFlags> wait_stage_masks;
   };
   void SubmissionThread();
+  VkResult ReplayAndSubmit(const CommandBuffer& buffer, const DeferredCommandBuffer::Streams& streams,
+                           VkFence fence, const std::vector<VkSemaphore>& waits,
+                           const std::vector<VkPipelineStageFlags>& stages);
   // Waits until the submission thread has submitted everything up to `submission` (or
   // failed to).
   void AwaitSubmissionThread(uint64_t submission);

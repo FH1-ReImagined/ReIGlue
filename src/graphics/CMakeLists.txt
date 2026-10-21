@@ -106,6 +106,14 @@ if(REXGLUE_USE_VULKAN)
     include(${REXGLUE_ROOT}/cmake/ForzaSmaa.cmake)
 endif()
 
+if(APPLE AND REXGLUE_USE_VULKAN)
+    target_sources(rexgpu-xenos PRIVATE vulkan/fh1_metalfx.mm)
+    # Vulkan-Hpp uses constexpr Metal pointer members that are incompatible with ARC.
+    set_source_files_properties(vulkan/fh1_metalfx.mm PROPERTIES
+        SKIP_PRECOMPILE_HEADERS ON COMPILE_OPTIONS "-fno-objc-arc")
+    target_link_libraries(rexgpu-xenos PRIVATE "-framework Metal" "-framework MetalFX" "-framework Foundation")
+endif()
+
 option(REXGLUE_USE_FSR3 "Build the FH1 AMD FidelityFX FSR 3 upscaler (fetches pinned MIT sources)" ON)
 set(REXGLUE_FSR3_SDK "" CACHE PATH "Optional local FidelityFX SDK v1.1.4; otherwise fetch the pinned FSR 3 sources")
 if(REXGLUE_USE_VULKAN AND REXGLUE_USE_FSR3)

@@ -11,6 +11,9 @@
 #include <cmath>
 #include <rex/graphics/vulkan/fh1_fsr3.h>
 #include <rex/graphics/vulkan/fh1_smaa.h>
+#if REX_PLATFORM_MAC
+#include <rex/graphics/vulkan/fh1_metalfx.h>
+#endif
 #if defined(REX_FH1_NGX)
 #include <nvsdk_ngx_helpers_vk.h>
 #include <nvsdk_ngx_helpers.h>
@@ -51,6 +54,11 @@ struct Fh1Dlss::State {
   std::unique_ptr<Fh1Smaa> smaa;
   bool InitializeSmaa();
   void EvaluateSmaa(VkCommandBuffer command, VkImage scene, VkImage destination);
+  bool metalfx_mode = false;
+#if REX_PLATFORM_MAC
+  std::unique_ptr<Fh1MetalFx> metalfx;
+  bool InitializeMetalFx();
+#endif
   bool fsr_mode = false;
   std::unique_ptr<Fh1Fsr3> fsr;
   std::chrono::steady_clock::time_point last_frame{};
@@ -254,6 +262,11 @@ void main() {
     info.imageType = VK_IMAGE_TYPE_2D; info.format = format; info.extent = {w, h, 1};
     info.mipLevels = info.arrayLayers = 1; info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
+#if REX_PLATFORM_MAC
+    VkExportMetalObjectCreateInfoEXT export_metal{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT};
+    export_metal.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
+    if (metalfx_mode) info.pNext = &export_metal;
+#endif
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!ui::vulkan::util::CreateDedicatedAllocationImage(device, info,
@@ -289,6 +302,7 @@ Fh1Dlss::Fh1Dlss(const ui::vulkan::VulkanDevice* device, uint32_t output_width,
   state_->dlaa = mode == "dlaa";
   state_->smaa_mode = mode == "smaa";
   state_->fsr_mode = mode.rfind("fsr3_", 0) == 0;
+  state_->metalfx_mode = mode.rfind("metalfx", 0) == 0;
   state_->output_width = output_width;
   state_->output_height = output_height;
 }
@@ -301,6 +315,9 @@ Fh1Dlss::~Fh1Dlss() {
   auto& s = *state_;
   s.smaa.reset();
   s.fsr.reset();
+#if REX_PLATFORM_MAC
+  s.metalfx.reset();
+#endif
 #if defined(REX_FH1_NGX)
   if (s.feature) NVSDK_NGX_VULKAN_ReleaseFeature(s.feature);
   if (s.parameters) NVSDK_NGX_VULKAN_DestroyParameters(s.parameters);
@@ -333,6 +350,7 @@ void Fh1Dlss::ReportStatus(std::string_view message) {
 }
 void Fh1Dlss::BeginFrame(uint64_t frame) {
     input_ = {};
+    if (state_->mode == "metalfx_spatial") return;
     if (!Evaluating()) {
       if (jitter_was_active_) REXGPU_INFO("DLSS: jitter disabled; offsets={},{}", input_.jitter_x, input_.jitter_y);
       jitter_was_active_ = false;
@@ -346,7 +364,7 @@ void Fh1Dlss::BeginFrame(uint64_t frame) {
     };
     // DLSS: 16 Halton(2,3) phases. FSR 3: the same sequence over its recommended
     // phase count (ffxFsr3UpscalerGetJitterPhaseCount, 32 for 2x per axis).
-    const uint64_t phases = state_->fsr_mode ?
+    const uint64_t phases = (state_->fsr_mode || state_->metalfx_mode) ?
         Fh1Fsr3::JitterPhases(state_->width, state_->output_width) : 16;
     input_.jitter_x = halton(frame % phases + 1, 2) - 0.5f;
     input_.jitter_y = halton(frame % phases + 1, 3) - 0.5f;
@@ -356,6 +374,9 @@ bool Fh1Dlss::Initialize() {
   auto& s = *state_;
   if (s.smaa_mode) return s.InitializeSmaa();
   if (s.fsr_mode) return s.InitializeFsr3();
+#if REX_PLATFORM_MAC
+  if (s.metalfx_mode) return s.InitializeMetalFx();
+#endif
 #if defined(REX_FH1_NGX)
 #if defined(_WIN32)
   const wchar_t* root = _wgetenv(L"FORZA_DLSS_RUNTIME");
@@ -644,4 +665,84 @@ void Fh1Dlss::State::EvaluateFsr3(VkCommandBuffer command, VkImage scene, VkImag
   Blit(command, images[1].image, VK_IMAGE_LAYOUT_GENERAL, destination,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, output_width, output_height, output_width, output_height);
 }
+bool Fh1Dlss::UsesMetalFx() const {
+#if REX_PLATFORM_MAC
+  return bool(state_->metalfx);
+#else
+  return false;
+#endif
+}
+#if REX_PLATFORM_MAC
+bool Fh1Dlss::State::InitializeMetalFx() {
+  if (mode != "metalfx_temporal" && mode != "metalfx_spatial") {
+    REXGPU_ERROR("MetalFX: unknown mode {}", mode); return false;
+  }
+  width = 1280; height = 720;
+  const auto get = device->vulkan_instance()->functions().vkGetDeviceProcAddr;
+  blit = reinterpret_cast<PFN_vkCmdBlitImage>(get(device->device(), "vkCmdBlitImage"));
+  update_buffer = reinterpret_cast<PFN_vkCmdUpdateBuffer>(get(device->device(), "vkCmdUpdateBuffer"));
+  if (!blit || !update_buffer ||
+      !Create(images[0], width, height, VK_FORMAT_R16G16B16A16_SFLOAT) ||
+      !Create(images[1], output_width, output_height, VK_FORMAT_R16G16B16A16_SFLOAT) ||
+      !Create(images[2], width, height, VK_FORMAT_R32_SFLOAT) ||
+      !Create(images[3], width, height, VK_FORMAT_R16G16_SFLOAT) || !CreateTemporalPipeline()) return false;
+  metalfx = std::make_unique<Fh1MetalFx>(device);
+  if (!metalfx->Initialize(width, height, output_width, output_height, images[0].image,
+                           images[1].image, images[2].image, images[3].image,
+                           mode == "metalfx_temporal")) {
+    metalfx.reset(); REXGPU_ERROR("MetalFX: initialization failed; native rendering retained");
+    ReportStatus("error: MetalFX unavailable; native rendering retained"); return false;
+  }
+  return true;
+}
+#endif
+bool Fh1Dlss::ExecuteMetalFx(VkCommandBuffer& command, VkImage scene, VkImage destination,
+                            const FrameInput& input, const SplitSubmission& split) {
+#if REX_PLATFORM_MAC
+  auto& s = *state_;
+  if (!s.metalfx || !split) return false;
+  ++s.submissions;  // Rotate descriptor sets while earlier frames are on the GPU.
+  const auto& f = s.device->functions();
+  if (!s.images_ready) {
+    for (auto& image : s.images) {
+      s.Barrier(command, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT);
+      VkClearColorValue clear{};
+      const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      f.vkCmdClearColorImage(command, image.image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+    }
+    s.images_ready = true;
+  }
+  s.Barrier(command, s.images[0].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+  s.Blit(command, scene, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.images[0].image,
+          VK_IMAGE_LAYOUT_GENERAL, 1280*s.backing_scale, 720*s.backing_scale, s.width, s.height);
+  const bool temporal = input.depth_view != VK_NULL_HANDLE && s.mode == "metalfx_temporal";
+  if (temporal) s.Temporal(command, input);
+  for (auto& image : s.images)
+    s.Barrier(command, image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+  Fh1MetalFx::Frame frame;
+  frame.jitter_x = -input.jitter_x; frame.jitter_y = -input.jitter_y;
+  frame.reset = !temporal || !s.previous_temporal;
+  const auto native = s.metalfx->Schedule(frame);
+  if (!split(command, native)) return false;
+  s.Barrier(command, s.images[1].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  s.Blit(command, s.images[1].image, VK_IMAGE_LAYOUT_GENERAL, destination,
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, s.output_width, s.output_height,
+          s.output_width, s.output_height);
+  s.previous_temporal = temporal;
+  evaluating_.store(true, std::memory_order_release);
+  if (++s.frames == 1) {
+    REXGPU_INFO("MetalFX: active with native HUD; source {}x{}, output {}x{}", s.width, s.height, s.output_width, s.output_height);
+    ReportStatus("ready: " + s.mode + " active with native HUD");
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
 }

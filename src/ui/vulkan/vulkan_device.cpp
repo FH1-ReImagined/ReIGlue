@@ -172,6 +172,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_KHR_portability_subset = false;
   // A session may enable DLSS later from the graphics menu.
   const bool dlss_requested = with_gpu_emulation && properties.vendorID == 0x10DE;
+  // A session may enable MetalFX later from the graphics menu.
+  const bool metalfx_requested = with_gpu_emulation && properties.vendorID == 0x106B;
+  bool ext_EXT_metal_objects = false;
+  if (metalfx_requested) requested_extensions.emplace("VK_EXT_metal_objects", &ext_EXT_metal_objects);
   bool ext_KHR_push_descriptor = false;
   bool ext_KHR_buffer_device_address = false;
   if (dlss_requested) {
@@ -679,6 +683,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         features_1_2.enabled.shaderFloat16 = features_1_2.supported.shaderFloat16;
         features_1_2.enabled.bufferDeviceAddress = features_1_2.supported.bufferDeviceAddress;
       }
+      if (metalfx_requested) features_1_2.enabled.timelineSemaphore = features_1_2.supported.timelineSemaphore;
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
