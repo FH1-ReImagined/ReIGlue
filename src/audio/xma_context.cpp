@@ -40,6 +40,63 @@ namespace rex::audio {
 
 using stream::BitStream;
 
+namespace {
+
+// Guest physical memory; TranslatePhysical wraps every address into it.
+constexpr uint32_t kPhysicalMemorySize = 0x20000000;
+
+// Input the decoder must not read. Each kind is logged the first time only: a stream that
+// has one usually has it on every kick.
+enum InputProblem : uint32_t {
+  kInputNoAddress,
+  kInputNoPackets,
+  kInputPastPhysicalMemory,
+  kInputReadOffsetPastEnd,
+  kInputBadFrameSize,
+};
+std::atomic<uint32_t> input_problems_logged{0};
+
+bool FirstInputProblem(InputProblem problem) {
+  const uint32_t bit = 1u << problem;
+  return !(input_problems_logged.fetch_or(bit, std::memory_order_relaxed) & bit);
+}
+
+// Whether input buffer `index` can be read: it has an address and packets, all of them in
+// guest physical memory. A buffer marked valid that fails is dropped as consumed.
+bool CheckInputBuffer(uint32_t context_id, const XMA_CONTEXT_DATA& data, uint8_t index) {
+  const uint32_t address = data.GetInputBufferAddress(index);
+  const uint32_t packets = data.GetInputBufferPacketCount(index);
+  InputProblem problem;
+  if (!address) {
+    problem = kInputNoAddress;
+  } else if (!packets) {
+    problem = kInputNoPackets;
+  } else if (uint64_t(address & (kPhysicalMemorySize - 1)) +
+                 uint64_t(packets) * XmaContext::kBytesPerPacket >
+             kPhysicalMemorySize) {
+    problem = kInputPastPhysicalMemory;
+  } else {
+    return true;
+  }
+  if (FirstInputProblem(problem)) {
+    REXAPU_WARN(
+        "XmaContext {}: input buffer {} is marked valid but cannot be read (address {:08X}, "
+        "{} packets); dropped as consumed (logged once)",
+        context_id, index, address, packets);
+  }
+  return false;
+}
+
+void DropInputBuffer(XMA_CONTEXT_DATA* data, uint8_t index) {
+  if (index == 0) {
+    data->input_buffer_0_valid = 0;
+  } else {
+    data->input_buffer_1_valid = 0;
+  }
+}
+
+}  // namespace
+
 const uint32_t XmaContext::kBitsPerPacketHeader;
 const uint32_t XmaContext::kOutputMaxSizeBytes;
 
@@ -98,6 +155,13 @@ bool XmaContext::Work() {
   }
 
   std::lock_guard<std::mutex> lock(lock_);
+  // Again under the lock: Disable() (the guest's context lock, which then waits in Block()
+  // only until the lock is free) or Release() may have run while this thread waited for it.
+  // The context is the game's to rewrite after either, and decoding it anyway read it
+  // half-written and merged stale offsets back over the game's.
+  if (!is_allocated() || !is_enabled()) {
+    return false;
+  }
   set_is_enabled(false);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
@@ -133,10 +197,21 @@ bool XmaContext::Work() {
   }
 
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+    uint8_t before[sizeof(XMA_CONTEXT_DATA)];
+    std::memcpy(before, &data, sizeof(before));
+    const int32_t blocks_before = remaining_subframe_blocks_in_output_buffer_;
+    const uint8_t subframes_before = current_frame_remaining_subframes_;
     Decode(&data);
     Consume(&output_rb, &data);
 
     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+      break;
+    }
+    // A pass that read no input and wrote no output would be repeated forever, on the guest
+    // thread that kicked the context.
+    if (remaining_subframe_blocks_in_output_buffer_ == blocks_before &&
+        current_frame_remaining_subframes_ == subframes_before &&
+        std::memcmp(before, &data, sizeof(before)) == 0) {
       break;
     }
   }
@@ -221,6 +296,9 @@ void XmaContext::Release() {
   assert_true(is_allocated());
 
   set_is_allocated(false);
+  // A kick not yet worked must not carry over to the context's next allocation, which the
+  // game sets up before kicking it.
+  set_is_enabled(false);
   ResetDecoderState();
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
@@ -279,6 +357,9 @@ uint32_t XmaContext::GetCurrentInputBufferSize(XMA_CONTEXT_DATA* data) {
 }
 
 uint8_t* XmaContext::GetCurrentInputBuffer(XMA_CONTEXT_DATA* data) {
+  if (!CheckInputBuffer(id(), *data, data->current_buffer)) {
+    return nullptr;
+  }
   return memory()->TranslatePhysical(data->GetCurrentInputBufferAddress());
 }
 
@@ -298,13 +379,12 @@ const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_p
     return nullptr;
   }
 
-  const uint32_t next_buffer_address = data->GetInputBufferAddress(next_buffer_index);
-  if (!next_buffer_address) {
-    REXAPU_ERROR("XmaContext {}: Buffer marked valid but has null pointer!", id());
+  if (!CheckInputBuffer(id(), *data, next_buffer_index)) {
+    DropInputBuffer(data, next_buffer_index);
     return nullptr;
   }
 
-  return memory()->TranslatePhysical(next_buffer_address);
+  return memory()->TranslatePhysical(data->GetInputBufferAddress(next_buffer_index));
 }
 
 uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
@@ -544,6 +624,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   }
 
   uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
+  if (!current_input_buffer) {
+    // Nothing in it the decoder can read: consumed, and the other buffer is next.
+    SwapInputBuffer(data);
+    return;
+  }
 
   input_buffer_.fill(0);
 
@@ -566,6 +651,20 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   const uint32_t current_input_size = GetCurrentInputBufferSize(data);
   const uint32_t current_input_packet_count = current_input_size / kBytesPerPacket;
+
+  if (data->input_buffer_read_offset >= current_input_size * 8) {
+    // Past the buffer's last packet: nothing is left to read in it. (Returning with nothing
+    // changed, as for an invalid packet index, made Work() call Decode() again forever.)
+    if (FirstInputProblem(kInputReadOffsetPastEnd)) {
+      REXAPU_WARN(
+          "XmaContext {}: input read offset {} is past the end of buffer {} ({} packets); "
+          "dropped as consumed (logged once)",
+          id(), static_cast<uint32_t>(data->input_buffer_read_offset),
+          static_cast<uint32_t>(data->current_buffer), current_input_packet_count);
+    }
+    SwapInputBuffer(data);
+    return;
+  }
 
   const int16_t packet_index = GetPacketNumber(current_input_size, data->input_buffer_read_offset);
 
@@ -621,6 +720,35 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       return;
     }
     packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
+  }
+
+  // A frame starts in this packet, is at least its 15-bit header long and lies in the two
+  // packets copied below. Anything else means the read offset is not at a frame or the data
+  // is not XMA (#228: FFmpeg rejected the frame before, then a size under 8 bits reached
+  // BitStream::Copy, which handed memcpy about 2^61 bytes). Decoding picks up again at the
+  // first frame of the next packet.
+  const bool frame_in_reach =
+      relative_offset < kBitsPerPacket && packet_info.current_frame_size_ >= kBitsPerFrameHeader &&
+      packet_info.current_frame_size_ <=
+          (kBitsPerPacket - kBitsPerPacketHeader) * 2 - (relative_offset - kBitsPerPacketHeader);
+  if (!frame_in_reach) {
+    if (FirstInputProblem(kInputBadFrameSize)) {
+      REXAPU_WARN(
+          "XmaContext {}: frame size {} bits at input read offset {} (packet {} of {}) is not "
+          "a frame; skipped to the next packet (logged once)",
+          id(), packet_info.current_frame_size_,
+          static_cast<uint32_t>(data->input_buffer_read_offset), packet_index,
+          current_input_packet_count);
+    }
+    const uint32_t next_input_offset =
+        GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
+    if (next_input_offset == kBitsPerPacketHeader) {
+      SwapInputBuffer(data);
+    }
+    data->input_buffer_read_offset = next_input_offset;
+    // Frames were dropped, so the carried tail no longer adjoins the next decoded block.
+    carry_valid_ = false;
+    return;
   }
 
   BitStream stream(current_input_buffer, (packet_index + 1) * kBitsPerPacket);
@@ -727,9 +855,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   if (next_input_offset == kBitsPerPacketHeader) {
     SwapInputBuffer(data);
-    if (data->IsAnyInputBufferValid()) {
-      next_input_offset = xma::GetPacketFrameOffset(
-          memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
+    // One the decoder cannot read is dropped by the next Decode().
+    const uint8_t* next_buffer =
+        data->IsAnyInputBufferValid() ? GetCurrentInputBuffer(data) : nullptr;
+    if (next_buffer) {
+      next_input_offset = xma::GetPacketFrameOffset(next_buffer);
 
       if (next_input_offset > kMaxFrameSizeinBits) {
         SwapInputBuffer(data);

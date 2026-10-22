@@ -108,18 +108,22 @@ bool BitStream::Write(uint64_t val, size_t num_bits) {
 size_t BitStream::Copy(uint8_t* dest_buffer, size_t num_bits) {
   size_t offset_bytes = offset_bits_ >> 3;
   size_t rel_offset_bits = offset_bits_ - (offset_bytes << 3);
-  size_t bits_left = num_bits;
+  // Never past the end of the stream.
+  size_t bits_left = std::min(num_bits, BitsRemaining());
   size_t out_offset_bytes = 0;
 
   // First: Copy the first few bits up to a byte boundary.
-  if (rel_offset_bits) {
-    uint64_t bits = Peek(8 - rel_offset_bits);
+  if (rel_offset_bits && bits_left) {
+    // A copy shorter than the rest of this byte ends inside it. Taking the whole rest made
+    // bits_left wrap around, and the memcpy below was handed about 2^61 bytes.
+    const size_t head_bits = std::min(8 - rel_offset_bits, bits_left);
+    uint64_t bits = Peek(head_bits) << (8 - rel_offset_bits - head_bits);
     uint8_t clear_mask = ~((uint8_t(1) << rel_offset_bits) - 1);
     dest_buffer[out_offset_bytes] &= clear_mask;
     dest_buffer[out_offset_bytes] |= (uint8_t)bits;
 
-    bits_left -= 8 - rel_offset_bits;
-    Advance(8 - rel_offset_bits);
+    bits_left -= head_bits;
+    Advance(head_bits);
     out_offset_bytes++;
   }
 
