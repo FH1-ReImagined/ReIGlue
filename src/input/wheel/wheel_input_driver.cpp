@@ -912,9 +912,9 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
   // Buttons: SDL numbers to the pad (wheel_buttons.h); the shifter's own press none.
   const std::string shifter = REXCVAR_GET(wheel_shifter);
   const ShifterMap shifter_map = shifter != "off" ? ShifterFor(w.vid, w.pid) : ShifterMap{};
-  std::map<std::string, int> map =
-      WheelButtons(ButtonLayoutOf(w.vid, w.pid), ParseKv(REXCVAR_GET(wheel_buttons)),
-                   ShifterButtons(shifter_map, shifter));
+  const std::map<std::string, int> button_overrides = ParseKv(REXCVAR_GET(wheel_buttons));
+  std::map<std::string, int> map = WheelButtons(ButtonLayoutOf(w.vid, w.pid), button_overrides,
+                                                ShifterButtons(shifter_map, shifter));
   static const std::pair<const char*, uint16_t> kBits[] = {
       {"a", 0x1000},  {"b", 0x2000},   {"x", 0x4000},    {"y", 0x8000},
       {"lb", 0x0100}, {"rb", 0x0200},  {"back", 0x0020}, {"start", 0x0010},
@@ -928,11 +928,8 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
     }
   }
   if (w.num_hats > 0) {
-    const Uint8 h = SDL_GetJoystickHat(w.joy, 0);
-    if (h & SDL_HAT_UP) buttons |= 0x0001;
-    if (h & SDL_HAT_DOWN) buttons |= 0x0002;
-    if (h & SDL_HAT_LEFT) buttons |= 0x0004;
-    if (h & SDL_HAT_RIGHT) buttons |= 0x0008;
+    // The hat is the d-pad, except for directions wheel_buttons sets (HatDpad).
+    buttons |= HatDpad(SDL_GetJoystickHat(w.joy, 0), button_overrides);
   }
 
   // Shifter. H-pattern: the lever's gear on the right stick X (-1 reverse, 0 neutral), which

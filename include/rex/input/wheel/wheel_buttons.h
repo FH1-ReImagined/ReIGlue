@@ -84,4 +84,23 @@ inline std::map<std::string, int> WheelButtons(ButtonLayout layout,
   return map;
 }
 
+// The d-pad bits from the wheel's first hat (SDL hat bits: up 1, right 2, down 4, left 8) for the
+// directions wheel_buttons leaves out. A d-pad direction it sets replaces the hat's (#279): a
+// button number presses it instead, -1 turns it off (the launcher's Clear on a d-pad row).
+inline uint16_t HatDpad(uint8_t hat, const std::map<std::string, int>& overrides) {
+  static constexpr struct {
+    uint8_t hat;
+    const char* key;
+    uint16_t bit;
+  } kDirs[] = {{0x01, "up", 0x0001}, {0x04, "down", 0x0002}, {0x08, "left", 0x0004},
+               {0x02, "right", 0x0008}};
+  uint16_t out = 0;
+  for (const auto& d : kDirs) {
+    if ((hat & d.hat) && !overrides.count(d.key)) {
+      out |= d.bit;
+    }
+  }
+  return out;
+}
+
 }  // namespace rex::input::wheel
