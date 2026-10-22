@@ -36,6 +36,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/util/fh1_hud.h>
+#include "fh1_render_target_trim.h"
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
 REXCVAR_DECLARE(bool, forza_present_16_9);
@@ -116,6 +117,13 @@ REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
                     "Record shared memory uploads (vertex and index data the CPU rewrote) "
                     "before the current render pass when no draw in it has read the uploaded "
                     "pages, instead of ending the render pass for every upload")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_UINT32(vulkan_render_target_trim_percent, 90, "GPU/Vulkan",
+                      "Free the cached render targets that hold no EDRAM data when device-local "
+                      "memory use reaches this percentage of the driver's budget "
+                      "(VK_EXT_memory_budget), or after a device-local allocation failed; 0 "
+                      "keeps every render target for the session")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
@@ -768,6 +776,68 @@ void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
+}
+
+void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
+  namespace trim = fh1_render_target_trim;
+  const uint32_t percent = REXCVAR_GET(vulkan_render_target_trim_percent);
+  if (!render_target_cache_ || !percent) {
+    render_target_trim_requested_ = false;
+    return;
+  }
+  if (render_target_cache_->TakeRenderTargetAllocationFailure() ||
+      (fh1_other_render_targets_ && fh1_other_render_targets_->TakeRenderTargetAllocationFailure())) {
+    render_target_trim_requested_ = true;
+  }
+  const bool failed = render_target_trim_requested_;
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const bool have_budget = vulkan_device->extensions().ext_EXT_memory_budget;
+  if (!trim::ShouldQuery(frame_current_, render_target_trim_next_check_frame_,
+                         render_target_trim_next_allowed_frame_, percent, failed, have_budget)) {
+    return;
+  }
+  uint64_t usage = 0, budget = 0;
+  if (have_budget) {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_properties = {};
+    budget_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 memory_properties = {};
+    memory_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    memory_properties.pNext = &budget_properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties2(
+        vulkan_device->physical_device(), &memory_properties);
+    const VkPhysicalDeviceMemoryProperties& properties = memory_properties.memoryProperties;
+    for (uint32_t i = 0; i < properties.memoryHeapCount; ++i) {
+      if (properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+        usage += budget_properties.heapUsage[i];
+        budget += budget_properties.heapBudget[i];
+      }
+    }
+  }
+  if (!failed && !trim::OverBudget(usage, budget, percent)) {
+    return;
+  }
+  if (!AwaitAllQueueOperationsCompletion()) {
+    return;
+  }
+  render_target_trim_requested_ = false;
+  uint64_t before = render_target_cache_->render_target_memory_bytes();
+  uint32_t count_before = render_target_cache_->render_target_count();
+  render_target_cache_->TrimRenderTargets();
+  uint64_t after = render_target_cache_->render_target_memory_bytes();
+  uint32_t count_after = render_target_cache_->render_target_count();
+  if (fh1_other_render_targets_) {
+    before += fh1_other_render_targets_->render_target_memory_bytes();
+    count_before += fh1_other_render_targets_->render_target_count();
+    fh1_other_render_targets_->TrimRenderTargets();
+    after += fh1_other_render_targets_->render_target_memory_bytes();
+    count_after += fh1_other_render_targets_->render_target_count();
+  }
+  render_target_trim_next_allowed_frame_ =
+      trim::NextAllowedFrame(frame_current_, failed, before - after);
+  REXGPU_INFO(
+      "Render targets trimmed ({}): {} -> {} ({} -> {} MB); device-local memory {} of {} MB",
+      failed ? "an allocation failed" : "memory nearly full", count_before, count_after,
+      before >> 20, after >> 20, usage >> 20, budget >> 20);
 }
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
@@ -7003,6 +7073,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
 
+    if (!cache_clear_requested_) {
+      TrimRenderTargetsIfNeeded();
+    }
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
 

@@ -94,6 +94,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool Initialize(uint32_t shared_memory_binding_count);
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
+  // FH1 (#241): frees the cached render targets that hold no EDRAM data, as ClearCache does,
+  // but keeps the render passes (pipelines being created may reference them). Only between
+  // frames, after the GPU has finished all submitted work.
+  void TrimRenderTargets();
+  uint64_t render_target_memory_bytes() const { return render_target_memory_bytes_; }
+  uint32_t render_target_count() const { return render_target_count_; }
+  // Whether creating a render target image failed since the last call.
+  bool TakeRenderTargetAllocationFailure() {
+    bool failed = render_target_allocation_failed_;
+    render_target_allocation_failed_ = false;
+    return failed;
+  }
 
   void CompletedSubmissionUpdated();
   void EndSubmission();
@@ -383,6 +395,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     VkImage image_;
     VkDeviceMemory memory_;
+   public:
+    // Device memory of the image, counted in the cache's render_target_memory_bytes_.
+    VkDeviceSize memory_size_ = 0;
+   private:
 
     // TODO(Triang3l): Per-format drawing views for mutable formats with EDRAM
     // aliasing without transfers.
@@ -845,6 +861,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::unordered_map<RenderPassKey, VkRenderPass, RenderPassKey::Hasher> render_passes_;
 
   std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher> framebuffers_;
+
+  uint64_t render_target_memory_bytes_ = 0;
+  uint32_t render_target_count_ = 0;
+  bool render_target_allocation_failed_ = false;
 
   // Set 0 - EDRAM storage buffer, set 1 - source depth sampled image (and
   // unused stencil from the transfer descriptor set), HostDepthStoreConstants

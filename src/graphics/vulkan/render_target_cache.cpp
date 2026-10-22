@@ -1116,6 +1116,22 @@ void VulkanRenderTargetCache::ClearCache() {
   }
   render_passes_.clear();
 
+  // The accumulated bindings may point to render targets the common ClearCache deletes.
+  ResetAccumulatedRenderTargets();
+  RenderTargetCache::ClearCache();
+}
+
+void VulkanRenderTargetCache::TrimRenderTargets() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // Framebuffers reference views of the images that may be deleted.
+  last_update_framebuffer_ = VK_NULL_HANDLE;
+  for (const auto& framebuffer_pair : framebuffers_) {
+    dfn.vkDestroyFramebuffer(device, framebuffer_pair.second.framebuffer, nullptr);
+  }
+  framebuffers_.clear();
+  ResetAccumulatedRenderTargets();
   RenderTargetCache::ClearCache();
 }
 
@@ -1856,6 +1872,8 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
   dfn.vkDestroyImageView(device, view_depth_color_, nullptr);
   dfn.vkDestroyImage(device, image_, nullptr);
   dfn.vkFreeMemory(device, memory_, nullptr);
+  render_target_cache_.render_target_memory_bytes_ -= memory_size_;
+  --render_target_cache_.render_target_count_;
 }
 
 uint32_t VulkanRenderTargetCache::GetMaxRenderTargetWidth() const {
@@ -1930,9 +1948,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   }
   VkImage image;
   VkDeviceMemory memory;
+  VkDeviceSize memory_size = 0;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(
           vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
-          memory)) {
+          memory, nullptr, &memory_size)) {
+    render_target_allocation_failed_ = true;
     REXGPU_ERROR(
         "VulkanRenderTarget: Failed to create a {}x{} {}xMSAA {} render target "
         "image",
@@ -2094,9 +2114,13 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   }
   dfn.vkUpdateDescriptorSets(device, key.is_depth ? 2 : 1, descriptor_set_write, 0, nullptr);
 
-  return new VulkanRenderTarget(key, *this, image, memory, view_depth_color, view_depth_stencil,
-                                view_stencil, view_srgb, view_color_transfer_separate,
-                                descriptor_set_index_transfer_source);
+  auto* render_target = new VulkanRenderTarget(
+      key, *this, image, memory, view_depth_color, view_depth_stencil, view_stencil, view_srgb,
+      view_color_transfer_separate, descriptor_set_index_transfer_source);
+  render_target->memory_size_ = memory_size;
+  render_target_memory_bytes_ += memory_size;
+  ++render_target_count_;
+  return render_target;
 }
 
 bool VulkanRenderTargetCache::IsHostDepthEncodingDifferent(

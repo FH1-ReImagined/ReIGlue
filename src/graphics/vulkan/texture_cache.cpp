@@ -2454,6 +2454,7 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
       REXGPU_ERROR(
           "VulkanTextureCache: Failed to allocate sparse memory for the "
           "scaled resolve buffer");
+      command_processor_.RequestRenderTargetTrim();
       return false;
     }
     scaled_resolve_buffer_memory_.push_back(allocation_memory);

@@ -137,6 +137,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   ~VulkanCommandProcessor();
 
   void ClearCaches() override;
+  // FH1 (#241): a device-local allocation failed; free unused render targets at the frame end.
+  void RequestRenderTargetTrim() { render_target_trim_requested_ = true; }
   void InvalidateGpuMemory() override;
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
@@ -575,6 +577,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool device_lost_ = false;
 
   bool cache_clear_requested_ = false;
+
+  // FH1 (#241): render targets are cached for the whole session, one per EDRAM layout, and
+  // at a high resolution scale they fill the device memory. TrimRenderTargetsIfNeeded frees
+  // those holding no EDRAM data at a frame end when the memory is nearly full.
+  void TrimRenderTargetsIfNeeded();
+  bool render_target_trim_requested_ = false;
+  uint64_t render_target_trim_next_check_frame_ = 0;
+  uint64_t render_target_trim_next_allowed_frame_ = 0;
 
   // Host shader types that guest shaders can be translated into - they can
   // access the shared memory (via vertex fetch, memory export, or manual index
