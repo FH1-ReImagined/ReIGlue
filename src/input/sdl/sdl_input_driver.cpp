@@ -14,6 +14,7 @@
 #include <cctype>
 #include <filesystem>
 #include <string_view>
+#include <unordered_map>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -24,8 +25,14 @@
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
+#include "gamepad_remap.h"
+
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+REXCVAR_DEFINE_STRING(controller_remap, "", "Input",
+                      "Controller remapping, profiles separated by ';': GUID:target=source,... "
+                      "('*' for every controller without its own), e.g. *:rt=a,a=none "
+                      "(src/input/sdl/gamepad_remap.h)");
 
 namespace rex::input::sdl {
 
@@ -33,6 +40,26 @@ namespace {
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
+// Pads that have a controller_remap profile (#279), by SDL joystick id: their rules and their
+// raw SDL state, from which the XInput state is rebuilt on every event. Guarded by
+// controllers_mutex_ (only the *Locked handlers touch it); there is one SDL driver.
+struct Remapped {
+  remap::Rules rules;
+  remap::PadInput input;
+};
+std::unordered_map<SDL_JoystickID, Remapped> g_remapped;
+
+void StoreRemapped(const Remapped& r, X_INPUT_GAMEPAD& pad) {
+  const remap::PadOutput out = remap::Apply(r.rules, r.input, REXCVAR_GET(guide_button));
+  pad.buttons = out.buttons;
+  pad.left_trigger = out.left_trigger;
+  pad.right_trigger = out.right_trigger;
+  pad.thumb_lx = out.thumb_lx;
+  pad.thumb_ly = out.thumb_ly;
+  pad.thumb_rx = out.thumb_rx;
+  pad.thumb_ry = out.thumb_ry;
+}
 
 const char* JoystickTypeName(SDL_JoystickType t) {
   switch (t) {
@@ -638,6 +665,33 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   state.id = AllocateDeviceId();
   state.state_changed = true;  // XInput starts with packet_number = 1
   UpdateXCapabilities(state);
+
+  // Remapping: the profile for this pad's GUID (or its model, or '*'), if it binds anything.
+  const SDL_JoystickID jid = SDL_GetJoystickID(SDL_GetGamepadJoystick(controller));
+  g_remapped.erase(jid);
+  if (const auto profile = remap::FindProfile(REXCVAR_GET(controller_remap), guid_text)) {
+    int ignored = 0;
+    Remapped r;
+    r.rules = remap::ParseRules(profile->rules, &ignored);
+    if (ignored) {
+      REXLOG_WARN("SDL Controller remap: {} rule(s) of profile {} ignored (unknown or unsupported)",
+                  ignored, profile->key);
+    }
+    if (remap::HasRules(r.rules)) {
+      // Inputs already held send no event until they change: start from the current state.
+      for (int b = 0; b < static_cast<int>(remap::kButtonNames.size()); b++) {
+        if (SDL_GetGamepadButton(controller, static_cast<SDL_GamepadButton>(b))) {
+          r.input.buttons |= 1u << b;
+        }
+      }
+      for (int a = 0; a < static_cast<int>(remap::kAxisNames.size()); a++) {
+        r.input.axis[a] = SDL_GetGamepadAxis(controller, static_cast<SDL_GamepadAxis>(a));
+      }
+      StoreRemapped(r, state.state.gamepad);
+      g_remapped[jid] = r;
+      REXLOG_INFO("SDL Controller remap (profile {}): {}", profile->key, remap::Describe(r.rules));
+    }
+  }
   controllers_.push_back(state);
 
   const int ordinal = static_cast<int>(controllers_.size()) - 1;
@@ -666,6 +720,7 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
               removed_guid);
   SDL_CloseGamepad(removed);
   controllers_.erase(controllers_.begin() + static_cast<ptrdiff_t>(*idx));
+  g_remapped.erase(event.gdevice.which);
 
   // LEDs only. Guest user assignment does not shift, because InputSystem holds
   // each device's ordinal.
@@ -682,6 +737,14 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
     return;
   }
   auto& pad = controllers_.at(*idx).state.gamepad;
+  if (auto it = g_remapped.find(event.gaxis.which); it != g_remapped.end()) {
+    if (event.gaxis.axis < it->second.input.axis.size()) {
+      it->second.input.axis[event.gaxis.axis] = event.gaxis.value;
+      StoreRemapped(it->second, pad);
+      controllers_.at(*idx).state_changed = true;
+    }
+    return;
+  }
   switch (event.gaxis.axis) {
     case SDL_GAMEPAD_AXIS_LEFTX:
       pad.thumb_lx = event.gaxis.value;
@@ -750,6 +813,17 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     return;
   }
   auto& controller = controllers_.at(*idx);
+
+  if (auto it = g_remapped.find(event.gbutton.which); it != g_remapped.end()) {
+    if (event.gbutton.button < remap::kButtonNames.size()) {
+      const uint32_t bit = 1u << event.gbutton.button;
+      it->second.input.buttons =
+          event.gbutton.down ? (it->second.input.buttons | bit) : (it->second.input.buttons & ~bit);
+      StoreRemapped(it->second, controller.state.gamepad);
+      controller.state_changed = true;
+    }
+    return;
+  }
 
   uint16_t xbuttons = controller.state.gamepad.buttons;
   // Lookup the XInput button code.
