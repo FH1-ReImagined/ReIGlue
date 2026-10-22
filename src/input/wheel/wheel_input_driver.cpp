@@ -9,7 +9,8 @@
  * the game reads the 360 wheel's clutch and shifter (wheel_shifter.h). A game that knows the wheel
  * sends its force feedback through the kernel's XInputdFF* calls (wheel_ff.h), played here on SDL
  * haptics; one that takes it for a gamepad only sets the vibration motors, which give an
- * approximate spring and a vibration.
+ * approximate spring and a vibration. Pedals and a shifter on their own USB devices are read
+ * with the first wheel (wheel_devices.h); steering, buttons and force feedback stay on the wheel.
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -31,6 +32,8 @@
 #include <rex/input/wheel/wheel_shifter.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
+
+#include "wheel_devices.h"
 
 REXCVAR_DEFINE_STRING(wheel_mode, "auto", "Input",
                       "Racing wheel support: auto (SDL says it is a wheel), on (every joystick "
@@ -118,6 +121,21 @@ REXCVAR_DEFINE_INT32(wheel_rumble_road_strength, 100, "Input",
 REXCVAR_DEFINE_BOOL(wheel_ffb_reverse, false, "Input",
                     "Reverse the game's steering force: for a wheel that pulls away from the centre "
                     "in corners instead of towards it");
+REXCVAR_DEFINE_STRING(wheel_pedal_device, "", "Input",
+                      "Pedals on their own USB device: empty finds a known pedal set (or one named "
+                      "like pedals), a device name, SDL GUID or vid:pid picks one, none reads the "
+                      "pedals from the wheel");
+REXCVAR_DEFINE_STRING(wheel_pedal_axes, "", "Input",
+                      "Axis numbers on the pedal device, e.g. throttle=0,brake=1,clutch=2 (empty: "
+                      "a known pedal set's layout, else detected from where each axis rests). A "
+                      "pedal set here reads the pedal device, one set in wheel_axes the wheel");
+REXCVAR_DEFINE_STRING(wheel_shifter_device, "", "Input",
+                      "Shifter on its own USB device: empty finds a known shifter (or one named "
+                      "like a shifter), a device name, SDL GUID or vid:pid picks one, none reads "
+                      "it from the wheel's buttons");
+REXCVAR_DEFINE_STRING(wheel_shifter_device_buttons, "", "Input",
+                      "Shifter buttons on the shifter device, e.g. 1=0,2=1,3=2,4=3,5=4,6=5,r=6 or "
+                      "up=..,down=.. (empty: a known shifter's layout)");
 
 namespace rex::input::wheel {
 
@@ -237,6 +255,108 @@ float Norm(int16_t v) {
   return v < 0 ? v / 32768.0f : v / 32767.0f;
 }
 
+// A pedal set or shifter on its own USB device, read with the first wheel (wheel_devices.h).
+struct AuxDevice {
+  explicit AuxDevice(AuxRole r = AuxRole::kNone) : role(r) {}
+  AuxRole role;
+  SDL_JoystickID jid = 0;
+  SDL_Joystick* joy = nullptr;
+  std::string name;
+  int num_axes = 0, num_buttons = 0;
+  const AuxModel* model = nullptr;
+  std::vector<int16_t> rest;   // where each axis sat when the device was opened
+  std::vector<uint8_t> armed;  // pedal axes seen at their resting end since then
+};
+
+const char* AuxWhat(AuxRole role) {
+  return role == AuxRole::kPedals ? "pedal device" : "shifter device";
+}
+
+void CloseAux(AuxDevice& d, const char* why) {
+  if (!d.joy) {
+    return;
+  }
+  REXLOG_INFO("Wheel: {} \"{}\" {}", AuxWhat(d.role), d.name, why);
+  SDL_CloseJoystick(d.joy);
+  d = AuxDevice(d.role);
+}
+
+bool OpenAux(AuxDevice& d, SDL_JoystickID jid) {
+  SDL_Joystick* joy = SDL_OpenJoystick(jid);
+  if (!joy) {
+    REXLOG_WARN("Wheel: could not open the {} {}: {}", AuxWhat(d.role), jid, SDL_GetError());
+    return false;
+  }
+  d.jid = jid;
+  d.joy = joy;
+  const char* name = SDL_GetJoystickName(joy);
+  d.name = name ? name : "Joystick";
+  d.num_axes = std::max(SDL_GetNumJoystickAxes(joy), 0);
+  d.num_buttons = std::max(SDL_GetNumJoystickButtons(joy), 0);
+  const uint16_t vid = SDL_GetJoystickVendor(joy), pid = SDL_GetJoystickProduct(joy);
+  d.model = FindAuxModel(vid, pid);
+  d.rest.assign(static_cast<size_t>(d.num_axes), 0);
+  d.armed.assign(static_cast<size_t>(d.num_axes), 0);
+  // Where the axes are now, read once SDL has polled the device: SDL takes a device with two axes
+  // (a two-pedal set) for a stick and reports 0 as its initial state, wherever the pedals rest.
+  SDL_UpdateJoysticks();
+  for (int a = 0; a < d.num_axes; a++) {
+    d.rest[a] = SDL_GetJoystickAxis(joy, a);
+  }
+  char guid[33] = {};
+  SDL_GUIDToString(SDL_GetJoystickGUID(joy), guid, sizeof(guid));
+  REXLOG_INFO("Wheel: {} \"{}\" GUID({}) VID(0x{:04X}) PID(0x{:04X}) axes({}) buttons({}){}{}",
+              AuxWhat(d.role), d.name, guid, vid, pid, d.num_axes, d.num_buttons,
+              d.model ? ", known: " : "", d.model ? d.model->name : "");
+  for (int a = 0; a < d.num_axes; a++) {
+    REXLOG_INFO("Wheel:   axis {} rests at {}", a, d.rest[a]);
+  }
+  return true;
+}
+
+// The SDL joysticks as wheel_devices.h sees them, in SDL's order.
+std::vector<JoyInfo> JoyInfos(const SDL_JoystickID* ids, int count) {
+  std::vector<JoyInfo> out;
+  for (int i = 0; ids && i < count; i++) {
+    JoyInfo j;
+    const char* name = SDL_GetJoystickNameForID(ids[i]);
+    j.name = name ? name : "";
+    char guid[33] = {};
+    SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, sizeof(guid));
+    j.guid = guid;
+    j.vid = SDL_GetJoystickVendorForID(ids[i]);
+    j.pid = SDL_GetJoystickProductForID(ids[i]);
+    j.sdl_wheel = SDL_GetJoystickTypeForID(ids[i]) == SDL_JOYSTICK_TYPE_WHEEL;
+    out.push_back(std::move(j));
+  }
+  return out;
+}
+
+// The shifter's gear buttons: on a shifter device its own (known model, then
+// wheel_shifter_device_buttons), else the wheel's.
+ShifterMap EffectiveShifter(uint16_t vid, uint16_t pid, const AuxDevice& shifter_device) {
+  if (shifter_device.joy) {
+    return AuxShifterMap(shifter_device.model, ParseKv(REXCVAR_GET(wheel_shifter_device_buttons)));
+  }
+  return ShifterFor(vid, pid);
+}
+
+void LogShifter(const ShifterMap& m, const std::string& mode, const char* where) {
+  if (mode == "h" && TopGear(m) == 0) {
+    REXLOG_WARN("Wheel: wheel_shifter = h, but no gear buttons are known for the {}: set {}", where,
+                std::string_view(where) == "wheel"
+                    ? "wheel_shifter_buttons (e.g. 1=12,2=13,3=14,4=15,5=16,6=17,r=18)"
+                    : "wheel_shifter_device_buttons (e.g. 1=0,2=1,3=2,4=3,5=4,6=5,r=6)");
+  } else if (mode == "h") {
+    REXLOG_INFO("Wheel: H-pattern shifter on the {}, buttons r={} 1={} 2={} 3={} 4={} 5={} 6={} "
+                "7={} (they press no pad button)",
+                where, m.gear[0], m.gear[1], m.gear[2], m.gear[3], m.gear[4], m.gear[5], m.gear[6],
+                m.gear[7]);
+  } else if (mode == "sequential") {
+    REXLOG_INFO("Wheel: sequential shifter on the {}, buttons up={} down={}", where, m.up, m.down);
+  }
+}
+
 const rex::ui::VirtualKey kVk[16] = {
     rex::ui::VirtualKey::kXInputPadDpadUp,     rex::ui::VirtualKey::kXInputPadDpadDown,
     rex::ui::VirtualKey::kXInputPadDpadLeft,   rex::ui::VirtualKey::kXInputPadDpadRight,
@@ -254,9 +374,17 @@ bool IsWheelDevice(SDL_JoystickID jid) {
   if (mode == "off" || SDL_GetJoystickVendorForID(jid) == 0x045E) {
     return false;
   }
-  return SDL_GetJoystickTypeForID(jid) == SDL_JOYSTICK_TYPE_WHEEL ||
-         NameLooksLikeWheel(SDL_GetJoystickNameForID(jid)) ||
-         (mode == "on" && !SDL_IsGamepad(jid));
+  if (SDL_GetJoystickTypeForID(jid) == SDL_JOYSTICK_TYPE_WHEEL ||
+      NameLooksLikeWheel(SDL_GetJoystickNameForID(jid)) || (mode == "on" && !SDL_IsGamepad(jid))) {
+    return true;
+  }
+  // A pedal set, shifter or handbrake read with the wheel (#272): not a gamepad either.
+  JoyInfo j = JoyInfos(&jid, 1)[0];
+  return DetectAuxRole(j.vid, j.pid, j.name) != AuxRole::kNone ||
+         (ParseDeviceChoice(REXCVAR_GET(wheel_pedal_device)) == DeviceChoice::kNamed &&
+          DeviceMatch(REXCVAR_GET(wheel_pedal_device), j)) ||
+         (ParseDeviceChoice(REXCVAR_GET(wheel_shifter_device)) == DeviceChoice::kNamed &&
+          DeviceMatch(REXCVAR_GET(wheel_shifter_device), j));
 }
 
 struct WheelInputDriver::Wheel {
@@ -267,6 +395,9 @@ struct WheelInputDriver::Wheel {
   int spring_fx = -1;
   int sine_fx = -1;
   bool sine_running = false;
+  // Pedals and shifter on their own USB devices (the first wheel only, wheel_devices.h).
+  AuxDevice pedals{AuxRole::kPedals};
+  AuxDevice shifter_device{AuxRole::kShifter};
   // The game's effect blocks (wheel_ff.h) as SDL effects, and the self-centring used for its
   // spring on a wheel without a spring effect.
   int game_fx[kFfMaxBlocks];
@@ -282,6 +413,7 @@ struct WheelInputDriver::Wheel {
   std::vector<int16_t> rest;  // where each axis sat when the wheel was opened
   std::vector<uint8_t> armed;  // pedal axes seen at their resting end since the wheel was opened
   int gear = kGearNeutral;  // the H-pattern gear reported to the game
+  bool shifter_logged = false;  // where the shifter is read was logged
   bool title_caps = false;  // the game read the capabilities, so it takes this for a wheel
   X_INPUT_STATE last_state{};
   uint32_t packet = 0;
@@ -335,15 +467,35 @@ void WheelInputDriver::RescanLocked() {
   PumpLocked();
   int count = 0;
   SDL_JoystickID* ids = mode == "off" ? nullptr : SDL_GetJoysticks(&count);
+  // Pedal sets, shifters and handbrakes on their own USB devices are read with the first wheel,
+  // never as wheels of their own (#272).
+  const AuxPick pick = PickAuxDevices(JoyInfos(ids, ids ? count : 0),
+                                      REXCVAR_GET(wheel_pedal_device),
+                                      REXCVAR_GET(wheel_shifter_device));
+  const SDL_JoystickID pedal_jid = pick.pedals >= 0 ? ids[pick.pedals] : 0;
+  const SDL_JoystickID shifter_jid = pick.shifter >= 0 ? ids[pick.shifter] : 0;
   std::vector<SDL_JoystickID> wanted;
   for (int i = 0; ids && i < count; i++) {
     const SDL_JoystickID jid = ids[i];
-    const bool take = IsWheelDevice(jid);
+    const bool take = !pick.IsAux(i) && IsWheelDevice(jid);
     if (take) {
       wanted.push_back(jid);
     }
   }
   SDL_free(ids);
+  // A device named in the settings that is not there: said once until it comes.
+  static std::string logged_missing[2];
+  auto note_missing = [](int k, const char* key, const std::string& setting, bool found) {
+    if (ParseDeviceChoice(setting) == DeviceChoice::kNamed && !found &&
+        logged_missing[k] != setting) {
+      logged_missing[k] = setting;
+      REXLOG_INFO("Wheel: {} \"{}\" is not connected", key, setting);
+    } else if (found) {
+      logged_missing[k].clear();
+    }
+  };
+  note_missing(0, "wheel_pedal_device", REXCVAR_GET(wheel_pedal_device), pedal_jid != 0);
+  note_missing(1, "wheel_shifter_device", REXCVAR_GET(wheel_shifter_device), shifter_jid != 0);
   if (wheels_.empty() && wanted.empty() && !logged_none_) {
     logged_none_ = true;
     REXLOG_INFO("Wheel: no wheel among {} SDL joystick(s)", count);
@@ -363,6 +515,34 @@ void WheelInputDriver::RescanLocked() {
     if (!have) {
       OpenLocked(jid);
     }
+  }
+  // The pedal device and the shifter device go with the first wheel; unplugged, the wheel's own
+  // pedals and shifter buttons count again until they are back.
+  for (size_t i = 0; i < wheels_.size(); i++) {
+    Wheel& w = *wheels_[i];
+    for (AuxDevice* d : {&w.pedals, &w.shifter_device}) {
+      const SDL_JoystickID want =
+          i != 0 ? 0 : d->role == AuxRole::kPedals ? pedal_jid : shifter_jid;
+      if (d->joy && d->jid != want) {
+        CloseAux(*d, want ? "replaced" : "removed: read from the wheel until it is back");
+      }
+      if (want && !d->joy && OpenAux(*d, want)) {
+        REXLOG_INFO("Wheel: {} \"{}\" is read with \"{}\"", AuxWhat(d->role), d->name, w.name);
+        if (d->role == AuxRole::kShifter) {
+          w.shifter_logged = false;
+          if (REXCVAR_GET(wheel_shifter) == "off") {
+            REXLOG_INFO("Wheel: wheel_shifter is off: set it to h or sequential to use the shifter");
+          }
+        }
+      }
+    }
+    // Where the shifter is read, once its device (if any) is attached.
+    const std::string mode = REXCVAR_GET(wheel_shifter);
+    if (!w.shifter_logged && mode != "off") {
+      LogShifter(EffectiveShifter(w.vid, w.pid, w.shifter_device), mode,
+                 w.shifter_device.joy ? "shifter device" : "wheel");
+    }
+    w.shifter_logged = true;
   }
 }
 
@@ -417,26 +597,13 @@ void WheelInputDriver::OpenLocked(SDL_JoystickID jid) {
   for (int a = 0; a < w->num_axes; a++) {
     REXLOG_INFO("Wheel:   axis {} rests at {}", a, w->rest[a]);
   }
-  const std::string shifter = REXCVAR_GET(wheel_shifter);
-  if (shifter != "off") {
-    const ShifterMap m = ShifterFor(w->vid, w->pid);
-    if (shifter == "h" && TopGear(m) == 0) {
-      REXLOG_WARN("Wheel: wheel_shifter = h, but no gear buttons are known for this wheel: set "
-                  "wheel_shifter_buttons (e.g. 1=12,2=13,3=14,4=15,5=16,6=17,r=18)");
-    } else if (shifter == "h") {
-      REXLOG_INFO("Wheel: H-pattern shifter, buttons r={} 1={} 2={} 3={} 4={} 5={} 6={} 7={} (they "
-                  "press no pad button)",
-                  m.gear[0], m.gear[1], m.gear[2], m.gear[3], m.gear[4], m.gear[5], m.gear[6],
-                  m.gear[7]);
-    } else {
-      REXLOG_INFO("Wheel: sequential shifter, buttons up={} down={}", m.up, m.down);
-    }
-  }
   SetupForceFeedbackLocked(*w);
   wheels_.push_back(std::move(w));
 }
 
 void WheelInputDriver::CloseLocked(Wheel& w) {
+  CloseAux(w.pedals, "closed with the wheel");
+  CloseAux(w.shifter_device, "closed with the wheel");
   if (w.haptic) {
     SDL_StopHapticEffects(w.haptic);
     SDL_CloseHaptic(w.haptic);
@@ -807,14 +974,22 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
     return it == axes.end() ? -1 : it->second;
   };
 
+  // Which pedals a pedal device on its own USB device gives (wheel_devices.h, #272); the others
+  // come from the wheel as without one.
+  const auto pedal_axes = ParseKv(REXCVAR_GET(wheel_pedal_axes));
+  const PedalSources src = PlanPedals(axes, pedal_axes, w.pedals.joy != nullptr);
+  const bool from_wheel[3] = {!src.from_aux[0], !src.from_aux[1], !src.from_aux[2]};
+
   // Detect: the steering axis rests near the middle, the pedals at an end.
   int steer = axis_override("steer");
-  int pedal[3] = {axis_override("throttle"), axis_override("brake"), axis_override("clutch")};
+  int pedal[3] = {from_wheel[0] ? axis_override("throttle") : -1,
+                  from_wheel[1] ? axis_override("brake") : -1,
+                  from_wheel[2] ? axis_override("clutch") : -1};
   if (w.prof) {
     if (steer < 0) steer = kProfSteer;
-    if (pedal[0] < 0) pedal[0] = kProfThrottle;
-    if (pedal[1] < 0) pedal[1] = kProfBrake;
-    if (pedal[2] < 0 && kProfClutch < w.num_axes) pedal[2] = kProfClutch;
+    if (pedal[0] < 0 && from_wheel[0]) pedal[0] = kProfThrottle;
+    if (pedal[1] < 0 && from_wheel[1]) pedal[1] = kProfBrake;
+    if (pedal[2] < 0 && from_wheel[2] && kProfClutch < w.num_axes) pedal[2] = kProfClutch;
   }
   if (steer < 0) {
     for (int a = 0; a < w.num_axes; a++) {
@@ -829,64 +1004,73 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
   }
   const bool combined = REXCVAR_GET(wheel_pedals) == "combined";
   if (!w.prof) {
-    int next = 0;
-    for (int a = 0; a < w.num_axes; a++) {
-      if (a == steer || a == pedal[0] || a == pedal[1] || a == pedal[2]) {
-        continue;
-      }
-      if (std::abs(w.rest[a]) >= 12000 || (combined && next == 0 && pedal[0] < 0)) {
-        while (next < 3 && pedal[next] >= 0) {
-          next++;
-        }
-        if (next < 3) {
-          pedal[next++] = a;
-        }
-      }
-    }
+    DetectPedalAxes(pedal, from_wheel, steer, w.rest, combined);
+  }
+  int aux_pedal[3] = {-1, -1, -1};
+  if (src.Any() && w.pedals.joy) {
+    PedalDeviceAxes(aux_pedal, src.from_aux, pedal_axes, w.pedals.model, w.pedals.rest, combined);
   }
 
-  auto pressed = [&](int a, bool invert) -> float {
-    if (a < 0 || a >= w.num_axes) {
+  // A pedal's axis on the device it reads: the wheel (whose known profile's pedals rest at the
+  // maximum) or the pedal device.
+  struct Axis {
+    SDL_Joystick* joy;
+    int axis, count;
+    const std::vector<int16_t>& rest;
+    std::vector<uint8_t>& armed;
+    bool known;
+  };
+  auto pedal_axis = [&](int p) -> Axis {
+    if (src.from_aux[p]) {
+      return {w.pedals.joy, aux_pedal[p], w.pedals.num_axes, w.pedals.rest, w.pedals.armed, false};
+    }
+    return {w.joy, pedal[p], w.num_axes, w.rest, w.armed, w.prof != nullptr};
+  };
+  auto pressed = [&](const Axis& d, bool invert) -> float {
+    const int a = d.axis;
+    if (!d.joy || a < 0 || a >= d.count) {
       return 0.0f;
     }
-    const float v = Norm(SDL_GetJoystickAxis(w.joy, a));
+    const float v = Norm(SDL_GetJoystickAxis(d.joy, a));
     // A known wheel's pedal rests at the maximum; otherwise where the axis sat when it was opened.
-    const float r = w.prof ? 1.0f : Norm(w.rest[a]);
+    const float r = d.known ? 1.0f : Norm(d.rest[a]);
     bool high_rest = r > 0.0f;
     if (invert) {
       high_rest = !high_rest;
     }
-    const float rest = (invert || w.prof) ? (high_rest ? 1.0f : -1.0f) : r;
+    const float rest = (invert || d.known) ? (high_rest ? 1.0f : -1.0f) : r;
     // Nothing from a pedal until it has been seen at rest: a first reading of 0 (not reported yet)
     // or a pedal held down while the game starts must not count as a press.
-    if (!w.armed[a]) {
+    if (!d.armed[a]) {
       if (std::fabs(v - rest) < 0.2f) {
-        w.armed[a] = 1;
+        d.armed[a] = 1;
       } else {
         return 0.0f;
       }
     }
     const float p = high_rest ? (rest - v) / (rest + 1.0f) : (v - rest) / (1.0f - rest);
-    const float d = 0.02f;
-    return std::clamp((p - d) / (1.0f - d), 0.0f, 1.0f);
+    const float d0 = 0.02f;
+    return std::clamp((p - d0) / (1.0f - d0), 0.0f, 1.0f);
   };
 
   float thr, brk;
   if (combined) {
-    const float v = pedal[0] >= 0 && pedal[0] < w.num_axes ? Norm(SDL_GetJoystickAxis(w.joy, pedal[0])) : 0.0f;
+    const Axis t = pedal_axis(0);
+    const float v =
+        t.joy && t.axis >= 0 && t.axis < t.count ? Norm(SDL_GetJoystickAxis(t.joy, t.axis)) : 0.0f;
     const float flip = REXCVAR_GET(wheel_invert_throttle) ? -1.0f : 1.0f;
     thr = std::clamp(-v * flip, 0.0f, 1.0f);
     brk = std::clamp(v * flip, 0.0f, 1.0f);
   } else {
-    thr = pressed(pedal[0], REXCVAR_GET(wheel_invert_throttle));
-    brk = pressed(pedal[1], REXCVAR_GET(wheel_invert_brake));
+    thr = pressed(pedal_axis(0), REXCVAR_GET(wheel_invert_throttle));
+    brk = pressed(pedal_axis(1), REXCVAR_GET(wheel_invert_brake));
   }
   thr = std::pow(thr, static_cast<float>(REXCVAR_GET(wheel_throttle_curve)));
   brk = std::pow(brk, static_cast<float>(REXCVAR_GET(wheel_brake_curve)));
   // The 360 wheel's analog clutch is the right stick Y: the wheel layouts bind both of its
   // directions to Clutch, and the game applies its own clutch deadzones.
   const float clutch =
-      REXCVAR_GET(wheel_clutch) ? pressed(pedal[2], REXCVAR_GET(wheel_invert_clutch)) : 0.0f;
+      REXCVAR_GET(wheel_clutch) ? pressed(pedal_axis(2), REXCVAR_GET(wheel_invert_clutch)) : 0.0f;
 
   float s = 0.0f;
   if (steer >= 0 && steer < w.num_axes) {
@@ -910,11 +1094,15 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
   }
 
   // Buttons: SDL numbers to the pad (wheel_buttons.h); the shifter's own press none.
+  // A shifter on its own USB device reads its own buttons, and the wheel's are all free.
   const std::string shifter = REXCVAR_GET(wheel_shifter);
-  const ShifterMap shifter_map = shifter != "off" ? ShifterFor(w.vid, w.pid) : ShifterMap{};
+  const bool aux_shifter = shifter != "off" && w.shifter_device.joy != nullptr;
+  const ShifterMap shifter_map =
+      shifter != "off" ? EffectiveShifter(w.vid, w.pid, w.shifter_device) : ShifterMap{};
   const std::map<std::string, int> button_overrides = ParseKv(REXCVAR_GET(wheel_buttons));
-  std::map<std::string, int> map = WheelButtons(ButtonLayoutOf(w.vid, w.pid), button_overrides,
-                                                ShifterButtons(shifter_map, shifter));
+  std::map<std::string, int> map =
+      WheelButtons(ButtonLayoutOf(w.vid, w.pid), button_overrides,
+                   aux_shifter ? std::set<int>{} : ShifterButtons(shifter_map, shifter));
   static const std::pair<const char*, uint16_t> kBits[] = {
       {"a", 0x1000},  {"b", 0x2000},   {"x", 0x4000},    {"y", 0x8000},
       {"lb", 0x0100}, {"rb", 0x0200},  {"back", 0x0020}, {"start", 0x0010},
@@ -938,7 +1126,9 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
   int gear = kGearNeutral;
   if (shifter != "off") {
     const ShifterMap& m = shifter_map;
-    auto held = [&](int n) { return n >= 0 && n < w.num_buttons && SDL_GetJoystickButton(w.joy, n); };
+    SDL_Joystick* sj = aux_shifter ? w.shifter_device.joy : w.joy;
+    const int buttons_n = aux_shifter ? w.shifter_device.num_buttons : w.num_buttons;
+    auto held = [&](int n) { return n >= 0 && n < buttons_n && SDL_GetJoystickButton(sj, n); };
     if (shifter == "h") {
       w.gear = EngageGear(LeverGear(m, held), w.gear, REXCVAR_GET(wheel_shifter_clutch), clutch,
                           static_cast<float>(REXCVAR_GET(wheel_clutch_threshold)));
@@ -1029,7 +1219,9 @@ X_RESULT WheelInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
   caps->gamepad.thumb_lx = REXCVAR_GET(wheel_900_steering) ? int16_t(900) : static_cast<int16_t>(0x7FFF);
   // An H-pattern shifter: thumb_rx other than 0 and 1, its high byte the number of forward gears.
   // The game then reads the gear from the state's thumb_rx (wheel_shifter.h).
-  const int top_gear = REXCVAR_GET(wheel_shifter) == "h" ? TopGear(ShifterFor(w->vid, w->pid)) : 0;
+  const int top_gear = REXCVAR_GET(wheel_shifter) == "h"
+                           ? TopGear(EffectiveShifter(w->vid, w->pid, w->shifter_device))
+                           : 0;
   caps->gamepad.thumb_rx = static_cast<int16_t>(top_gear << 8);
   caps->vibration.left_motor_speed = 0xFFFFu;
   caps->vibration.right_motor_speed = 0xFFFFu;
