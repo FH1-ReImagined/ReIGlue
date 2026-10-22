@@ -13,6 +13,8 @@
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 
+#include "fallback_audio_driver.h"
+
 namespace rex::audio::sdl {
 
 std::unique_ptr<AudioSystem> SDLAudioSystem::Create(
@@ -32,12 +34,10 @@ void SDLAudioSystem::Initialize() {
 X_STATUS SDLAudioSystem::CreateDriver([[maybe_unused]] size_t index,
                                       rex::thread::Semaphore* semaphore, AudioDriver** out_driver) {
   assert_not_null(out_driver);
-  auto driver = new SDLAudioDriver(memory_, semaphore);
-  if (!driver->Initialize()) {
-    driver->Shutdown();
-    delete driver;
-    return X_STATUS_UNSUCCESSFUL;
-  }
+  // Never fails: a failure here fails XAudioRegisterRenderDriverClient and the game stops
+  // (KeBugCheckEx). Without a device the driver plays into a silent output.
+  auto driver = new FallbackAudioDriver(memory_, semaphore);
+  driver->Start();
 
   *out_driver = driver;
   return X_STATUS_SUCCESS;
@@ -45,9 +45,9 @@ X_STATUS SDLAudioSystem::CreateDriver([[maybe_unused]] size_t index,
 
 void SDLAudioSystem::DestroyDriver(AudioDriver* driver) {
   assert_not_null(driver);
-  auto sdldriver = dynamic_cast<SDLAudioDriver*>(driver);
+  auto sdldriver = dynamic_cast<FallbackAudioDriver*>(driver);
   assert_not_null(sdldriver);
-  sdldriver->Shutdown();
+  sdldriver->Stop();
   delete sdldriver;
 }
 
