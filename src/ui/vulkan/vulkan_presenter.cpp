@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -179,6 +180,18 @@ struct HdrOutputConstants {
   float size[2];
 };
 static_assert(sizeof(HdrOutputConstants) == 48);
+
+// vkAcquireNextImageKHR waits without a timeout, and vkQueuePresentKHR runs while holding the
+// queue the command processor submits to: either blocking this long stalls the game, so log it.
+void LogBlockingPresentationCall(const char* call, std::chrono::steady_clock::time_point start,
+                                 VkResult result) {
+  const int64_t ms = int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count());
+  if (ms >= 1000) {
+    REXLOG_WARN("VulkanPresenter: {} blocked for {} ms (VkResult {})", call, ms, int(result));
+  }
+}
 
 }  // namespace
 
@@ -1778,9 +1791,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
+  const auto acquire_start = std::chrono::steady_clock::now();
   VkResult acquire_result =
       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
                                 VK_NULL_HANDLE, &swapchain_image_index);
+  LogBlockingPresentationCall("vkAcquireNextImageKHR", acquire_start, acquire_result);
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -2654,7 +2669,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+    const auto present_start = std::chrono::steady_clock::now();
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+    LogBlockingPresentationCall("vkQueuePresentKHR", present_start, present_result);
   }
   switch (present_result) {
     case VK_SUCCESS:

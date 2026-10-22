@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <fstream>
@@ -620,6 +621,20 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
     return false;
   }
   return true;
+}
+
+// A host wait for the GPU longer than this is logged: the queue made no progress for that
+// long (presentation holding it, for instance).
+constexpr int64_t kSlowSubmissionWaitMs = 2000;
+
+// Test hook: FORZA_TEST_GPU_LOSS_AT_FRAME=<n> makes the submission fence check report
+// VK_ERROR_DEVICE_LOST from frame n on, to exercise the device-loss reporting path.
+uint64_t TestGpuLossFrame() {
+  static const uint64_t frame = [] {
+    const char* value = std::getenv("FORZA_TEST_GPU_LOSS_AT_FRAME");
+    return value && *value ? uint64_t(std::strtoull(value, nullptr, 10)) : uint64_t(0);
+  }();
+  return frame;
 }
 
 }  // namespace
@@ -6388,6 +6403,12 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
 
   size_t fences_total = submissions_in_flight_fences_.size();
   size_t fences_awaited = 0;
+  const auto wait_start = std::chrono::steady_clock::now();
+  auto waited_ms = [&wait_start] {
+    return int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - wait_start)
+                       .count());
+  };
   if (submission_thread_) {
     // Only the fences of submissions the thread has submitted can be waited for.
     if (await_submission > submission_completed_) {
@@ -6419,8 +6440,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
+      if (int64_t ms = waited_ms(); ms >= kSlowSubmissionWaitMs) {
+        REXGPU_WARN("Vulkan: waited {} ms for submission {} to finish on the GPU", ms,
+                    await_submission);
+      }
     } else {
-      REXGPU_ERROR("Failed to await submission completion Vulkan fences");
+      REXGPU_ERROR("Failed to await submission completion Vulkan fences (VkResult {}, after {} ms)",
+                   int(wait_result), waited_ms());
       if (wait_result == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
       }
@@ -6432,8 +6458,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   while (fences_awaited < fences_total) {
     VkResult fence_status =
         dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
+    if (TestGpuLossFrame() && frame_current_ >= TestGpuLossFrame()) {
+      fence_status = VK_ERROR_DEVICE_LOST;
+    }
     if (fence_status != VK_SUCCESS) {
       if (fence_status == VK_ERROR_DEVICE_LOST) {
+        // The driver lost the device (a GPU reset, or the driver gave up on it); without this
+        // line the abort that follows leaves nothing in the log.
+        REXGPU_ERROR(
+            "Vulkan device lost: the driver returned VK_ERROR_DEVICE_LOST checking submission {} "
+            "(frame {}, {} submission(s) in flight)",
+            submission_completed_ + fences_awaited + 1, frame_current_,
+            fences_total - fences_awaited);
         device_lost_ = true;
       }
       break;

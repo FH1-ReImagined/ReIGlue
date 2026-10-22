@@ -225,6 +225,10 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
   }
+  // FatalError writes only to stderr, which a windowed game has nowhere to show.
+  REXGPU_CRITICAL(
+      "Graphics device lost: the GPU driver reset or removed the device, which can't be "
+      "recovered from; stopping");
   rex::FatalError("Graphics device lost (probably due to an internal error)");
 }
 

@@ -625,6 +625,8 @@ void Window::OnFocusUpdate(bool new_has_focus, WindowDestructionReceiver& destru
     return;
   }
   has_focus_ = new_has_focus;
+  // Logged to line graphics stalls and errors up with switching away from the game.
+  REXLOG_INFO("Window {} focus", has_focus_ ? "gained" : "lost");
   UISetupEvent e(this);
   if (has_focus_) {
     SendEventToListeners([&e](auto listener) { listener->OnGotFocus(e); }, destruction_receiver);
@@ -660,6 +662,7 @@ void Window::OnMinimized(WindowDestructionReceiver& destruction_receiver) {
   if (!CanSendEventsToListeners()) {
     return;
   }
+  REXLOG_INFO("Window minimized");
   UIEvent e(this);
   SendEventToListeners([&e](auto listener) { listener->OnMinimized(e); }, destruction_receiver);
 }
@@ -668,6 +671,7 @@ void Window::OnRestored(WindowDestructionReceiver& destruction_receiver) {
   if (!CanSendEventsToListeners()) {
     return;
   }
+  REXLOG_INFO("Window restored");
   UIEvent e(this);
   SendEventToListeners([&e](auto listener) { listener->OnRestored(e); }, destruction_receiver);
 }
