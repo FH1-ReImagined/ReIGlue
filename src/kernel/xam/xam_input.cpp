@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
+#include <rex/input/flags.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
@@ -183,6 +185,17 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
   return result;
 }
 
+// The profile's vibration setting: 0 is off. The XInputFF library of Forza Horizon asks before
+// each XInputdFFSetRumble on a wheel and sends no rumble for 0; the stub returned with whatever
+// the stack held.
+u32 XamInputGetUserVibrationLevel_entry(u32 user_index, mapped_u32 level_ptr) {
+  if (!level_ptr) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+  *level_ptr = REXCVAR_GET(vibration) ? 1 : 0;
+  return X_ERROR_SUCCESS;
+}
+
 i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   // Games check the result - usually with some masking.
   // If this function fails they assume zero, so let's fail AND
@@ -209,6 +222,8 @@ REX_EXPORT(__imp__XamInputSetState, rex::kernel::xam::XamInputSetState_entry)
 REX_EXPORT(__imp__XamInputGetKeystroke, rex::kernel::xam::XamInputGetKeystroke_entry)
 REX_EXPORT(__imp__XamInputGetKeystrokeEx, rex::kernel::xam::XamInputGetKeystrokeEx_entry)
 REX_EXPORT(__imp__XamUserGetDeviceContext, rex::kernel::xam::XamUserGetDeviceContext_entry)
+REX_EXPORT(__imp__XamInputGetUserVibrationLevel,
+           rex::kernel::xam::XamInputGetUserVibrationLevel_entry)
 
 REX_EXPORT_STUB(__imp__XamInputControl);
 REX_EXPORT_STUB(__imp__XamInputEnableAutobind);
@@ -217,7 +232,6 @@ REX_EXPORT_STUB(__imp__XamInputGetFailedConnectionOrBind);
 REX_EXPORT_STUB(__imp__XamInputGetKeyLocks);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHud);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHudEx);
-REX_EXPORT_STUB(__imp__XamInputGetUserVibrationLevel);
 REX_EXPORT_STUB(__imp__XamInputNonControllerGetRaw);
 REX_EXPORT_STUB(__imp__XamInputNonControllerGetRawEx);
 REX_EXPORT_STUB(__imp__XamInputNonControllerSetRaw);

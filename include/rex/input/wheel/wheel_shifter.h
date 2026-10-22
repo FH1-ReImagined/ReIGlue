@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 
 namespace rex::input::wheel {
@@ -84,6 +85,27 @@ inline ShifterMap ApplyShifterOverrides(ShifterMap m, const std::map<std::string
     }
   }
   return m;
+}
+
+// The SDL buttons the shifter reads in this mode ("h": its gears and reverse; "sequential": up and
+// down; "off": none). They press no pad button (wheel_buttons.h): a G923 for Xbox has reverse on
+// 11, the default left stick press, so engaging reverse opened the friends overlay (#256).
+inline std::set<int> ShifterButtons(const ShifterMap& m, const std::string& mode) {
+  std::set<int> used;
+  if (mode == "h") {
+    for (int g = 0; g <= kMaxGear; g++) {
+      if (m.gear[g] >= 0) {
+        used.insert(m.gear[g]);
+      }
+    }
+  } else if (mode == "sequential") {
+    for (int n : {m.up, m.down}) {
+      if (n >= 0) {
+        used.insert(n);
+      }
+    }
+  }
+  return used;
 }
 
 // The highest forward gear the map has (what the shifter reports to the game), 0 if none.
