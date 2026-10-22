@@ -38,6 +38,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline_store_file.h>
+#include <rex/graphics/pipeline_prebuild_file.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/register_file.h>
@@ -932,6 +933,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
            shader_storage_file_);
   }
 
+  // The shader prebuild: the listed pipelines this device and partition can use, with the
+  // shaders the launcher rebuilt from the player's game files. They are created with the stored
+  // ones (and their driver data kept), but never written to the store: it keeps what this player
+  // met in play.
+  ImportShaderPrebuild(title_id, pipeline_storage_magic_api, pipeline_storage_versions,
+                       pipeline_stored_descriptions, shader_translations_needed);
+
   // Translate shader modifications needed for stored pipelines.
   for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
     auto shader_it = shaders_.find(translation_needed.first);
@@ -1075,6 +1083,114 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
   assert_not_null(storage_write_thread_);
   storage_write_thread_->set_name("Vulkan Storage writer");
+}
+
+void VulkanPipelineCache::ImportShaderPrebuild(
+    uint32_t title_id, uint32_t api, pipeline_store_file::Versions versions,
+    std::vector<PipelineStoredDescription>& descriptions,
+    std::set<std::pair<uint64_t, uint64_t>>& translations_needed) {
+  namespace prebuild = pipeline_prebuild_file;
+  if (shader_prebuild_root_.empty()) return;
+  const auto directory = shader_prebuild_root_ / "shaders" / "prebuild";
+  const auto list_path =
+      directory / fmt::format("{:08X}.{}.vk.xpl", title_id, api ? "fsi" : "fbo");
+  std::vector<uint8_t> bytes;
+  if (FILE* file = rex::filesystem::OpenFile(list_path, "rb")) {
+    uint8_t buffer[65536];
+    size_t read;
+    while ((read = fread(buffer, 1, sizeof(buffer), file)) != 0) {
+      bytes.insert(bytes.end(), buffer, buffer + read);
+    }
+    fclose(file);
+  } else {
+    return;
+  }
+  const prebuild::ParseResult list = prebuild::Parse(
+      bytes.data(), bytes.size(), api, {versions.description, versions.modification});
+  if (list.status != prebuild::Status::kOk) {
+    REXGPU_WARN("Vulkan shader prebuild: {} is {} (list versions {:08X}/{:08X}, this build "
+                "{:08X}/{:08X}); not used. Prebuild the shaders again in the launcher.",
+                rex::path_to_utf8(list_path.filename()), prebuild::StatusText(list.status),
+                list.versions.description, list.versions.modification, versions.description,
+                versions.modification);
+    return;
+  }
+
+  // The rebuilt shaders, in the shader storage format. Shaders already loaded keep their own
+  // storage; the others are written to it when a pipeline met in play uses them.
+  size_t shader_count = 0;
+  if (FILE* file = rex::filesystem::OpenFile(directory / fmt::format("{:08X}.xsh", title_id), "rb")) {
+    struct {
+      uint32_t magic;
+      uint32_t version_swapped;
+    } header;
+    if (fread(&header, sizeof(header), 1, file) && header.magic == 0x48534558 &&
+        rex::byte_swap(header.version_swapped) == ShaderStoredHeader::kVersion) {
+      ShaderStoredHeader shader_header;
+      std::vector<uint32_t> ucode_dwords;
+      while (fread(&shader_header, sizeof(shader_header), 1, file)) {
+        const size_t ucode_byte_count = shader_header.ucode_dword_count * sizeof(uint32_t);
+        ucode_dwords.resize(shader_header.ucode_dword_count);
+        if (shader_header.ucode_dword_count &&
+            !fread(ucode_dwords.data(), ucode_byte_count, 1, file)) {
+          break;
+        }
+        if (XXH3_64bits(ucode_dwords.data(), ucode_byte_count) != shader_header.ucode_data_hash) {
+          break;
+        }
+        LoadShader(shader_header.type, ucode_dwords.data(), shader_header.ucode_dword_count,
+                   shader_header.ucode_data_hash);
+        ++shader_count;
+      }
+    }
+    fclose(file);
+  }
+
+  prebuild::Target target;
+  target.partition = shader_prebuild_partition_;
+  if (render_target_cache_.raster_scale_x() == 1.0f &&
+      render_target_cache_.raster_scale_y() == 1.0f) {
+    // GetCurrent*ShaderModification: the FH1 fractional raster variant.
+    target.unused_modification_bits = UINT64_C(1) << 63;
+  }
+  const prebuild::SelectResult selected = prebuild::Select(list.entries, target);
+
+  std::unordered_set<PipelineDescription, PipelineDescription::Hasher> known;
+  known.reserve(descriptions.size());
+  for (const PipelineStoredDescription& stored : descriptions) known.insert(stored.description);
+  size_t added = 0, stored_already = 0, unsupported = 0, without_shaders = 0;
+  for (const prebuild::Entry& entry : selected.entries) {
+    PipelineStoredDescription stored;
+    stored.description.Reset();
+    prebuild::ToDescription(entry, stored.description);
+    if (!ArePipelineRequirementsMet(stored.description)) {
+      ++unsupported;
+      continue;
+    }
+    if (shaders_.find(entry.vertex_shader_hash) == shaders_.end() ||
+        (entry.pixel_shader_hash && shaders_.find(entry.pixel_shader_hash) == shaders_.end())) {
+      ++without_shaders;
+      continue;
+    }
+    if (!known.insert(stored.description).second) {
+      ++stored_already;
+      continue;
+    }
+    stored.description_hash = stored.description.GetHash();
+    descriptions.push_back(stored);
+    translations_needed.emplace(entry.vertex_shader_hash, entry.vertex_shader_modification);
+    if (entry.pixel_shader_hash) {
+      translations_needed.emplace(entry.pixel_shader_hash, entry.pixel_shader_modification);
+    }
+    ++added;
+  }
+  REXGPU_INFO(
+      "Vulkan shader prebuild: {} of {} listed pipelines added ({} shaders read; for this "
+      "partition {}, already stored {}, other partitions {}, unused variants {}, unsupported by "
+      "this device {}, without their shaders {}, invalid {})",
+      added, list.entries.size() + list.invalid, shader_count, selected.entries.size(),
+      stored_already, selected.other_partition, selected.unused_variant, unsupported,
+      without_shaders, list.invalid);
 }
 
 void VulkanPipelineCache::ShutdownShaderStorage() {

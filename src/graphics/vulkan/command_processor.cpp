@@ -57,6 +57,7 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/graphics/util/fh1_jitter.h>
 #include <rex/graphics/vulkan/fh1_dlss.h>
 #include <rex/graphics/vulkan/fh1_fsr3.h>
+#include <rex/graphics/pipeline_prebuild_file.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -70,6 +71,10 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(shader_prebuild_only, false, "GPU/Vulkan",
+                    "Create the stored and prebuild-listed pipelines, save the driver's cache "
+                    "and exit before the game starts (the launcher's Prebuild shaders step)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_fast_resolve_copy, true, "GPU/Vulkan",
     "Use bit-exact whole-word FH1 cross-scale resolve copies")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -885,9 +890,23 @@ void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path
       std::to_string(REXCVAR_GET(fh1_output_width)) + "x" + std::to_string(REXCVAR_GET(fh1_output_height)) +
       "-" + std::to_string(fh1_other_render_targets_->draw_resolution_scale_x()) + "x" +
       std::to_string(fh1_other_render_targets_->draw_resolution_scale_y())) : cache_root;
+  namespace prebuild = pipeline_prebuild_file;
+  pipeline_cache_->SetShaderPrebuildSource(
+      cache_root, fh1_split_enabled_ ? prebuild::kPartitionUi : prebuild::kPartitionMain);
   pipeline_cache_->InitializeShaderStorage(fh1_split_enabled_ ? storage_root / "ui" : storage_root, title_id, blocking);
-  if (fh1_other_pipelines_) fh1_other_pipelines_->InitializeShaderStorage(
-      storage_root / "scene", title_id, blocking);
+  if (fh1_other_pipelines_) {
+    fh1_other_pipelines_->SetShaderPrebuildSource(cache_root, prebuild::kPartitionScene);
+    fh1_other_pipelines_->InitializeShaderStorage(storage_root / "scene", title_id, blocking);
+  }
+  if (REXCVAR_GET(shader_prebuild_only)) {
+    // The launcher's "Prebuild shaders": every stored and listed pipeline is now created and its
+    // driver data saved (InitializeShaderStorage). The guest has not started; nothing else is
+    // needed from this run.
+    REXGPU_INFO("SHADER_PREBUILD: complete, exiting");
+    rex::FlushLogging();
+    std::fflush(nullptr);
+    std::_Exit(0);
+  }
 }
 
 // Occlusion queries (EVENT_WRITE_ZPD), as Xenia's default "fast" mode does them.

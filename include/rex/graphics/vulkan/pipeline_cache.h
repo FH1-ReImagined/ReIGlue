@@ -23,6 +23,7 @@
 #include <queue>
 #include <set>
 #include <rex/graphics/vulkan/driver_cache_file.h>
+#include <rex/graphics/pipeline_store_file.h>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -68,6 +69,13 @@ class VulkanPipelineCache {
   void Shutdown();
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking);
+  // The shader prebuild (pipeline_prebuild_file.h): the list in <cache_root>/shaders/prebuild/
+  // and the render partition (kPartitionMain, kPartitionUi, kPartitionScene) this cache serves.
+  // Read by the next InitializeShaderStorage.
+  void SetShaderPrebuildSource(const std::filesystem::path& cache_root, uint32_t partition) {
+    shader_prebuild_root_ = cache_root;
+    shader_prebuild_partition_ = partition;
+  }
   void ShutdownShaderStorage();
   void EndSubmission();
 
@@ -234,6 +242,13 @@ class VulkanPipelineCache {
     uint64_t description_hash;
     PipelineDescription description;
   });
+
+  // Adds the shader prebuild's pipelines for this device and partition to `descriptions`, and
+  // their shader modifications to `translations_needed`.
+  void ImportShaderPrebuild(uint32_t title_id, uint32_t api,
+                            pipeline_store_file::Versions versions,
+                            std::vector<PipelineStoredDescription>& descriptions,
+                            std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
 
   struct Pipeline {
     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};
@@ -459,6 +474,10 @@ class VulkanPipelineCache {
   // <Submission index, pipeline>.
   std::deque<std::pair<uint64_t, VkPipeline>> deferred_destroy_pipelines_;
   std::mutex deferred_destroy_lock_;
+
+  // Where the shader prebuild's list is read from (empty: none), and for which partition.
+  std::filesystem::path shader_prebuild_root_;
+  uint32_t shader_prebuild_partition_ = 1;
 
   // Currently open shader storage path.
   std::filesystem::path shader_storage_cache_root_;
