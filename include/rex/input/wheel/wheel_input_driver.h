@@ -2,7 +2,8 @@
  * @file        rex/input/wheel/wheel_input_driver.h
  * @brief       Racing wheel input driver - presents any SDL joystick that is a wheel as an
  *              Xbox 360 Wireless Racing Wheel (XINPUT_DEVSUBTYPE_WHEEL), with approximate
- *              force feedback from the vibration motors.
+ *              force feedback from the vibration motors, the clutch pedal and an H-pattern
+ *              shifter (wheel_shifter.h).
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -49,7 +50,8 @@ class WheelInputDriver final : public InputDriver {
   Wheel* FindLocked(DeviceId id);
   void OpenLocked(SDL_JoystickID jid);
   void CloseLocked(Wheel& w);
-  void ComputeStateLocked(Wheel& w, uint16_t* buttons, uint8_t* lt, uint8_t* rt, int16_t* lx);
+  // Steering, pedals, clutch (thumb_ry), shifter gear (thumb_rx) and buttons.
+  void ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out);
   void SetupForceFeedbackLocked(Wheel& w);
   void ApplyForceLocked(Wheel& w, float motor);
 
@@ -57,7 +59,6 @@ class WheelInputDriver final : public InputDriver {
   std::vector<std::unique_ptr<Wheel>> wheels_;
   bool sdl_ready_ = false;
   bool logged_none_ = false;
-  bool logged_caps_ = false;
   uint64_t next_id_ = 1;
   std::chrono::steady_clock::time_point last_scan_{};
   std::chrono::steady_clock::time_point last_pump_{};
