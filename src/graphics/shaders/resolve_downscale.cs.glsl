@@ -151,11 +151,19 @@ void main() {
       if ((xe_downscale_half_pixel_offset & 2u) != 0u) {
         // Opt-in RGBA8 box filter (FH1 thumbnail capture only). Other 32-bit
         // formats, depth and ordinary resolves keep point sampling.
-        uint block_base = (xe_downscale_source_offset_bytes +
-            tile_index * tile_size_scaled + pixel_index * pixel_size * scale_xy) >> 2u;
+        // Scaled resolves replicate 16-byte quads, not individual pixels.
+        // A quad contains four RGBA8 pixels; its scaled rows are Y-major.
+        uint quad_base = (dst_byte_offset >> 4u) * scale_xy;
+        uint pixel_in_quad = (dst_byte_offset & 15u) >> 2u;
         uvec4 sum = uvec4(0u);
         for (uint sample_index = 0u; sample_index < scale_xy; ++sample_index) {
-          uint value = xe_resolve_source.data[block_base + sample_index];
+          uint x = pixel_in_quad * xe_downscale_scale_x +
+              sample_index % xe_downscale_scale_x;
+          uint y = sample_index / xe_downscale_scale_x;
+          uint source_quad = quad_base + (x >> 2u) * xe_downscale_scale_y + y;
+          uint source_word = (xe_downscale_source_offset_bytes >> 2u) +
+              source_quad * 4u + (x & 3u);
+          uint value = xe_resolve_source.data[source_word];
           sum += uvec4(value & 255u, (value >> 8u) & 255u,
                        (value >> 16u) & 255u, value >> 24u);
         }
