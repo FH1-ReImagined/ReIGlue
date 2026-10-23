@@ -42,6 +42,7 @@
 #include "fh1_render_target_trim.h"
 #include <rex/platform.h>
 #include "../fh1_frame_cost.h"
+#include "fh1_readback_history.h"
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
 REXCVAR_DECLARE(bool, forza_present_16_9);
@@ -128,6 +129,12 @@ REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
                     "before the current render pass when no draw in it has read the uploaded "
                     "pages, instead of ending the render pass for every upload")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_readback_skip_render_targets, true, "GPU/Vulkan",
+                    "readback_resolve = some: do not copy back again a resolve that was made in "
+                    "150 frames in a row (a scene render target) when it comes back after its "
+                    "readback buffer was dropped (after the map or a menu)")
+    .debug_only();
 
 REXCVAR_DEFINE_STRING(fh1_frame_cost_csv, "", "GPU/Vulkan",
                       "Testing: write what the command processor did in every frame (draws, "
@@ -809,6 +816,13 @@ struct FrameCostState {
 FrameCostState& GetFrameCostState() {
   static FrameCostState state;
   return state;
+}
+
+// FH1 (#45): the resolves made every frame (fh1_readback_history.h). The game has one command
+// processor.
+fh1_readback_history::History& GetReadbackHistory() {
+  static fh1_readback_history::History history;
+  return history;
 }
 
 // FH1 (#45): closes the frame's cost counters (fh1_frame_cost.h); a line in the log when
@@ -6117,6 +6131,18 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
   readback.last_used_frame = frame_current_;
   fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
+  if (readback_mode == ReadbackResolveMode::kSome) {
+    // FH1 (#45): a scene render target back after its buffer was dropped (the map, a long
+    // menu) was copied back before and is not read by the CPU: no GPU wait and copy again.
+    fh1_readback_history::History& history = GetReadbackHistory();
+    if (!readback.resolve_cpu_copy_valid && history.IsHot(resolve_key) &&
+        REXCVAR_GET(vulkan_readback_skip_render_targets)) {
+      readback.resolve_cpu_copy_valid = true;
+      ++cost.readbacks_skipped;
+    }
+    history.Resolved(resolve_key, frame_current_);
+    if (frame_current_ % 600 == 0) history.Forget(frame_current_);
+  }
   // "some" only needs the first CPU copy of this address/size/format key.
   // Keep the normal GPU resolve above, but avoid downscaling and transferring
   // every subsequent result to a host buffer that the CPU will never read.
