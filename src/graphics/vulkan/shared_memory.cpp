@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "../fh1_frame_cost.h"
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -278,6 +279,12 @@ bool VulkanSharedMemory::UploadRanges(
     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   if (upload_page_ranges.empty()) {
     return true;
+  }
+  // FH1 (#45): guest memory the CPU wrote, copied for the GPU (fh1_frame_cost.h).
+  fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
+  fh1_frame_cost::Timer cost_timer(cost.upload_ms);
+  for (const auto& range : upload_page_ranges) {
+    cost.upload_bytes += uint64_t(range.second) << page_size_log2();
   }
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   // In a render pass whose draws have not read these pages, copy before the render pass

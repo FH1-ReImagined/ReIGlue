@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "fh1_frame_cost.h"
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -1111,6 +1112,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  // FH1 (#45): the time spent waiting for the game (fh1_frame_cost.h), from the first miss.
+  std::chrono::steady_clock::time_point wait_start{};
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1151,6 +1154,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (wait_start == std::chrono::steady_clock::time_point{}) {
+        wait_start = std::chrono::steady_clock::now();
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1175,6 +1181,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (wait_start != std::chrono::steady_clock::time_point{}) {
+    fh1_frame_cost::Current().guest_wait_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start)
+            .count();
+  }
 
   return true;
 }

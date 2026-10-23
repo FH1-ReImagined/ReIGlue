@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "../../fh1_frame_cost.h"
 #include <algorithm>
 #include <bit>
 #include <cstdint>
@@ -300,6 +301,12 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       ResetTextureBindings();
     }
     // Remove the texture from the map and destroy it via its unique_ptr.
+    {
+      // FH1 (#45): textures evicted in a frame (fh1_frame_cost.h).
+      fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
+      ++cost.textures_evicted;
+      cost.texture_evicted_bytes += texture->GetHostMemoryUsage();
+    }
     auto found_texture_it = textures_.find(texture->key());
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
@@ -589,8 +596,16 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
   }
 
-  if (batched_shared_memory_request_succeeded) {
+  if (batched_shared_memory_request_succeeded && !pending_texture_loads.empty()) {
+    // FH1 (#45): textures (re)loaded in a frame (fh1_frame_cost.h).
+    fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
+    fh1_frame_cost::Timer timer(cost.texture_load_ms);
     for (const PendingTextureLoad& pending_load : pending_texture_loads) {
+      if (pending_load.texture) {
+        ++cost.texture_loads;
+        if (pending_load.load_base) cost.texture_load_bytes += pending_load.texture->GetGuestBaseSize();
+        if (pending_load.load_mips) cost.texture_load_bytes += pending_load.texture->GetGuestMipsSize();
+      }
       CommitPreparedTextureLoad(pending_load);
     }
   } else {
@@ -897,7 +912,15 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Create the texture and add it to the map.
   Texture* texture;
   {
+    // FH1 (#45): textures created in a frame (fh1_frame_cost.h).
+    fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
+    fh1_frame_cost::Timer timer(cost.texture_create_ms);
+    const uint64_t host_memory_before = textures_total_host_memory_usage_;
     std::unique_ptr<Texture> new_texture = CreateTexture(key);
+    ++cost.textures_created;
+    if (textures_total_host_memory_usage_ > host_memory_before) {
+      cost.texture_created_bytes += textures_total_host_memory_usage_ - host_memory_before;
+    }
     if (!new_texture) {
       key.LogAction("Failed to create");
       return nullptr;
@@ -1039,6 +1062,8 @@ void TextureCache::ResetTextureBindings(bool from_destructor) {
 
 void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract) {
   textures_total_host_memory_usage_ = textures_total_host_memory_usage_ - subtract + add;
+  fh1_frame_cost::TextureBytes() += add;
+  fh1_frame_cost::TextureBytes() -= subtract;
   COUNT_profile_set(
       "gpu/texture_cache/total_host_memory_usage_mb",
       uint32_t((textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20));

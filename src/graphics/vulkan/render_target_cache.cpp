@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "../fh1_frame_cost.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -1892,6 +1893,10 @@ uint32_t VulkanRenderTargetCache::GetMaxRenderTargetHeight() const {
 }
 
 RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
+  // FH1 (#45): render targets made in a frame (fh1_frame_cost.h).
+  fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
+  fh1_frame_cost::Timer cost_timer(cost.render_target_ms);
+  ++cost.render_targets;
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -2129,6 +2134,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       view_color_transfer_separate, descriptor_set_index_transfer_source);
   render_target->memory_size_ = memory_size;
   render_target_memory_bytes_ += memory_size;
+  cost.render_target_bytes += memory_size;
   ++render_target_count_;
   return render_target;
 }

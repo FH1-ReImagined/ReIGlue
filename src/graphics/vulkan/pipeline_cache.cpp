@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "../fh1_frame_cost.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1530,6 +1531,9 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
   if (!vertex_shader->is_translated()) {
+    // FH1 (#45): shaders translated in a frame (fh1_frame_cost.h).
+    fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().shader_ms);
+    ++fh1_frame_cost::Current().shaders;
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
     if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader)) {
       REXGPU_ERROR("Failed to translate the vertex shader!");
@@ -1542,6 +1546,8 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
   }
   if (pixel_shader != nullptr) {
     if (!pixel_shader->is_translated()) {
+      fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().shader_ms);
+      ++fh1_frame_cost::Current().shaders;
       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
       if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
         REXGPU_ERROR("Failed to translate the pixel shader!");
@@ -1641,6 +1647,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
     if (found_pipeline == VK_NULL_HANDLE) {
+      fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().pipeline_ms);
+      ++fh1_frame_cost::Current().pipelines;
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
           !EnsurePipelineCreated(creation_arguments)) {
@@ -1660,6 +1668,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   // Create the pipeline if not already existing.
+  // FH1 (#45): pipelines made on the command processor thread in a frame (async: the
+  // placeholder), fh1_frame_cost.h.
+  fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().pipeline_ms);
+  ++fh1_frame_cost::Current().pipelines;
   auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
   PipelineCreationArguments creation_arguments_real;
   if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,

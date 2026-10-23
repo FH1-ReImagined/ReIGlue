@@ -13,6 +13,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +40,8 @@
 #include <rex/graphics/util/fh1_hud.h>
 #include "fh1_device_memory.h"
 #include "fh1_render_target_trim.h"
+#include <rex/platform.h>
+#include "../fh1_frame_cost.h"
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
 REXCVAR_DECLARE(bool, forza_present_16_9);
@@ -124,6 +128,11 @@ REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
                     "before the current render pass when no draw in it has read the uploaded "
                     "pages, instead of ending the render pass for every upload")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(fh1_frame_cost_csv, "", "GPU/Vulkan",
+                      "Testing: write what the command processor did in every frame (draws, "
+                      "textures, uploads, pipelines, render targets, waits) to this CSV file")
+    .debug_only();
 
 REXCVAR_DEFINE_UINT32(vulkan_render_target_trim_percent, 90, "GPU/Vulkan",
                       "Free the cached render targets that hold no EDRAM data when device-local "
@@ -774,6 +783,101 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
 
 VulkanCommandProcessor::~VulkanCommandProcessor() = default;
 
+namespace {
+
+// FH1 (#45): the command processor thread's CPU time, in ms (0 where not known: Windows,
+// whose thread times advance in scheduler ticks).
+double ThreadCpuMs() {
+#if REX_PLATFORM_WIN32
+  return 0;
+#else
+  timespec ts;
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+  return double(ts.tv_sec) * 1000.0 + double(ts.tv_nsec) / 1.0e6;
+#endif
+}
+
+struct FrameCostState {
+  bool started = false;
+  std::chrono::steady_clock::time_point start, last;
+  double last_cpu_ms = 0;
+  fh1_frame_cost::Report report;
+  std::FILE* csv = nullptr;
+  bool csv_tried = false;
+};
+
+FrameCostState& GetFrameCostState() {
+  static FrameCostState state;
+  return state;
+}
+
+// FH1 (#45): closes the frame's cost counters (fh1_frame_cost.h); a line in the log when
+// frames were much slower than usual, every frame to fh1_frame_cost_csv.
+void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
+                     uint32_t render_target_count) {
+  FrameCostState& state = GetFrameCostState();
+  fh1_frame_cost::Frame& frame = fh1_frame_cost::Current();
+  const auto now = std::chrono::steady_clock::now();
+  const double cpu_ms = ThreadCpuMs();
+  if (!state.started) {
+    state.started = true;
+    state.start = state.last = now;
+    state.last_cpu_ms = cpu_ms;
+    frame = fh1_frame_cost::Frame();
+    return;
+  }
+  frame.ms = std::chrono::duration<double, std::milli>(now - state.last).count();
+  frame.cpu_ms = cpu_ms > state.last_cpu_ms ? cpu_ms - state.last_cpu_ms : 0;
+  state.last = now;
+  state.last_cpu_ms = cpu_ms;
+  const double t = std::chrono::duration<double>(now - state.start).count();
+  if (!state.csv_tried) {
+    state.csv_tried = true;
+    const std::string path = REXCVAR_GET(fh1_frame_cost_csv);
+    if (!path.empty()) {
+      state.csv = std::fopen(path.c_str(), "w");
+      if (state.csv) {
+        std::fputs(
+            "epoch,t,ms,cpu_ms,gpu_wait_ms,guest_wait_ms,draws,textures_created,texture_created_bytes,"
+            "texture_create_ms,texture_loads,texture_load_bytes,texture_load_ms,textures_evicted,"
+            "texture_evicted_bytes,upload_bytes,upload_ms,shaders,shader_ms,pipelines,pipeline_ms,"
+            "render_targets,render_target_bytes,render_target_ms,render_target_trims,"
+            "texture_total_mb,render_target_total_mb,render_target_count,readbacks,readback_bytes,"
+            "readback_ms,readback_wait_ms,readbacks_skipped\n",
+            state.csv);
+      }
+    }
+  }
+  if (state.csv) {
+    std::fprintf(state.csv,
+                 "%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%u,%u,%llu,%.3f,%u,%llu,%.3f,%u,%llu,%llu,%.3f,%u,"
+                 "%.3f,%u,%.3f,%u,%llu,%.3f,%u,%.1f,%.1f,%u,%u,%llu,%.3f,%.3f,%u\n",
+                 std::chrono::duration<double>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count(),
+                 t, frame.ms, frame.cpu_ms, frame.gpu_wait_ms, frame.guest_wait_ms, frame.draws,
+                 frame.textures_created, (unsigned long long)frame.texture_created_bytes,
+                 frame.texture_create_ms, frame.texture_loads,
+                 (unsigned long long)frame.texture_load_bytes, frame.texture_load_ms,
+                 frame.textures_evicted, (unsigned long long)frame.texture_evicted_bytes,
+                 (unsigned long long)frame.upload_bytes, frame.upload_ms, frame.shaders,
+                 frame.shader_ms, frame.pipelines, frame.pipeline_ms, frame.render_targets,
+                 (unsigned long long)frame.render_target_bytes, frame.render_target_ms,
+                 frame.render_target_trims, double(fh1_frame_cost::TextureBytes()) / 1048576.0,
+                 double(render_target_bytes) / 1048576.0, render_target_count, frame.readbacks,
+                 (unsigned long long)frame.readback_bytes, frame.readback_ms,
+                 frame.readback_wait_ms, frame.readbacks_skipped);
+    if (frame_index % 300 == 0) std::fflush(state.csv);
+  }
+  if (state.report.OnFrame(frame, t)) {
+    REXGPU_WARN("{}", state.report.Line(t));
+    state.report.Taken();
+  }
+  frame = fh1_frame_cost::Frame();
+}
+
+}  // namespace
+
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   InvalidateAllVertexBufferResidency();
@@ -823,6 +927,7 @@ void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
     return;
   }
   render_target_trim_requested_ = false;
+  ++fh1_frame_cost::Current().render_target_trims;
   uint64_t before = render_target_cache_->render_target_memory_bytes();
   uint32_t count_before = render_target_cache_->render_target_count();
   render_target_cache_->TrimRenderTargets();
@@ -4789,6 +4894,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  ++fh1_frame_cost::Current().draws;
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
@@ -6010,6 +6116,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint64_t resolve_key = GetReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
   readback.last_used_frame = frame_current_;
+  fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
   // "some" only needs the first CPU copy of this address/size/format key.
   // Keep the normal GPU resolve above, but avoid downscaling and transferring
   // every subsequent result to a host buffer that the CPU will never read.
@@ -6019,7 +6126,12 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
   uint32_t write_index = readback.current_index;
   uint32_t readback_size = AlignReadbackBufferSize(written_length);
-  if (!ensure_readback_slot(readback, write_index, readback_size)) {
+  bool slot_ready;
+  {
+    fh1_frame_cost::Timer cost_timer(cost.readback_ms);
+    slot_ready = ensure_readback_slot(readback, write_index, readback_size);
+  }
+  if (!slot_ready) {
     return true;
   }
 
@@ -6227,8 +6339,11 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
-    return true;
+  } else {
+    fh1_frame_cost::Timer cost_timer(cost.readback_wait_ms);
+    if (!AwaitAllQueueOperationsCompletion()) {
+      return true;
+    }
   }
 
   bool is_cache_miss = false;
@@ -6237,6 +6352,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                            readback.mapped_data[read_index] == nullptr)) {
     is_cache_miss = true;
     read_index = write_index;
+    fh1_frame_cost::Timer cost_timer(cost.readback_wait_ms);
     if (!AwaitAllQueueOperationsCompletion()) {
       return true;
     }
@@ -6245,6 +6361,9 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
   if (should_copy && readback.buffers[read_index] != VK_NULL_HANDLE &&
       written_length <= readback.sizes[read_index] && readback.mapped_data[read_index] != nullptr) {
+    fh1_frame_cost::Timer cost_timer(cost.readback_ms);
+    ++cost.readbacks;
+    cost.readback_bytes += written_length;
     VkMappedMemoryRange readback_memory_range = {};
     readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     readback_memory_range.memory = readback.memories[read_index];
@@ -6548,6 +6667,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   if (submission_thread_) {
     // Only the fences of submissions the thread has submitted can be waited for.
     if (await_submission > submission_completed_) {
+      fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().gpu_wait_ms);
       AwaitSubmissionThread(await_submission);
     }
     if (submission_thread_failed_.load(std::memory_order_acquire)) {
@@ -6571,9 +6691,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    VkResult wait_result;
+    {
+      fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().gpu_wait_ms);
+      wait_result =
+          dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                              submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    }
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
       if (int64_t ms = waited_ms(); ms >= kSlowSubmissionWaitMs) {
@@ -7142,6 +7266,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     if (!cache_clear_requested_) {
       TrimRenderTargetsIfNeeded();
     }
+    Fh1EndFrameCost(frame_current_,
+                    render_target_cache_ ? render_target_cache_->render_target_memory_bytes() : 0,
+                    render_target_cache_ ? render_target_cache_->render_target_count() : 0);
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
 
