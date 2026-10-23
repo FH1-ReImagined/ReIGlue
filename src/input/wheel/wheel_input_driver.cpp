@@ -35,6 +35,7 @@
 #include <rex/ui/virtual_key.h>
 
 #include "wheel_devices.h"
+#include "wheel_gear_request.h"
 #include "wheel_min_force.h"
 #include "wheel_rumble.h"
 
@@ -152,6 +153,10 @@ REXCVAR_DEFINE_INT32(wheel_ffb_min_strength, 0, "Input",
                      "centre), stronger ones play as they are, so a light car still has weight "
                      "(0: off; before wheel_ffb_strength; not the spring, damper or rumble)")
     .range(0, 100);
+REXCVAR_DEFINE_BOOL(wheel_shifter_follow_slot, true, "Input",
+                    "H-pattern: the game takes the lever's slot whenever it sets the gear itself "
+                    "(race and event starts and finishes), as on the Xbox; false: a gear engages "
+                    "only when the lever moves, so the paddles keep the gear they chose");
 
 namespace rex::input::wheel {
 
@@ -267,6 +272,32 @@ FfStrengths Strengths() {
   return s;
 }
 
+// The H-pattern gear to report on thumb_rx (wheel_gear_request.h): on lever moves only, or the
+// engaged gear all the time with wheel_shifter_follow_slot. A new request is logged.
+int GearRequestOf(GearRequest& r, int engaged, bool game_read) {
+  const double now_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+  const int before = r.request;
+  const int out =
+      GearToReport(r, engaged, now_ms, game_read, REXCVAR_GET(wheel_shifter_follow_slot));
+  if (r.request != before && r.request != kGearNoRequest) {
+    REXLOG_INFO("Wheel: the lever moved: gear {} asked of the game",
+                engaged == kGearReverse   ? std::string("R")
+                : engaged == kGearNeutral ? std::string("N")
+                                          : std::to_string(engaged));
+  }
+  return out;
+}
+
+// thumb_rx while the game window is out of focus (no input): with the H-pattern on lever moves,
+// no request, so the gear stays; otherwise 0 (neutral), as before.
+int IdleGearRequest() {
+  return REXCVAR_GET(wheel_shifter) == "h" && !REXCVAR_GET(wheel_shifter_follow_slot)
+             ? kGearNoRequest
+             : kGearNeutral;
+}
+
 // The game's steering force with wheel_ffb_min_strength (wheel_min_force.h).
 float MinForceLevelOf(const FfEffect& e, uint32_t device_gain, float level) {
   const float min = std::clamp(REXCVAR_GET(wheel_ffb_min_strength), 0, 100) / 100.0f;
@@ -374,6 +405,9 @@ void LogShifter(const ShifterMap& m, const std::string& mode, const char* where)
                 "7={} (they press no pad button)",
                 where, m.gear[0], m.gear[1], m.gear[2], m.gear[3], m.gear[4], m.gear[5], m.gear[6],
                 m.gear[7]);
+    REXLOG_INFO("Wheel: {}", REXCVAR_GET(wheel_shifter_follow_slot)
+                                 ? "the game takes the lever's slot whenever it sets the gear"
+                                 : "a gear engages when the lever moves");
   } else if (mode == "sequential") {
     REXLOG_INFO("Wheel: sequential shifter on the {}, buttons up={} down={}", where, m.up, m.down);
   }
@@ -491,7 +525,9 @@ struct WheelInputDriver::Wheel {
   const Profile* prof = nullptr;  // known wheel: fixed axes and pedal direction
   std::vector<int16_t> rest;  // where each axis sat when the wheel was opened
   std::vector<uint8_t> armed;  // pedal axes seen at their resting end since the wheel was opened
-  int gear = kGearNeutral;  // the H-pattern gear reported to the game
+  int gear = kGearNeutral;  // the H-pattern gear engaged (EngageGear)
+  GearRequest gear_request;  // what thumb_rx asks of the game (wheel_gear_request.h)
+  bool keystroke_poll = false;  // ComputeStateLocked for a keystroke: not a state the game reads
   bool shifter_logged = false;  // where the shifter is read was logged
   bool title_caps = false;  // the game read the capabilities, so it takes this for a wheel
   X_INPUT_STATE last_state{};
@@ -1227,7 +1263,7 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
     if (shifter == "h") {
       w.gear = EngageGear(LeverGear(m, held), w.gear, REXCVAR_GET(wheel_shifter_clutch), clutch,
                           static_cast<float>(REXCVAR_GET(wheel_clutch_threshold)));
-      gear = w.gear;
+      gear = GearRequestOf(w.gear_request, w.gear, !w.keystroke_poll);
     } else {
       if (held(m.up)) buttons |= 0x0200;
       if (held(m.down)) buttons |= 0x0100;
@@ -1273,6 +1309,9 @@ X_RESULT WheelInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state)
   X_INPUT_STATE s{};
   if (is_active()) {
     ComputeStateLocked(*w, &s.gamepad);
+  } else if (w->title_caps) {
+    // Out of focus: nothing pressed, and an H-pattern shifter asks for no gear (not neutral).
+    s.gamepad.thumb_rx = static_cast<int16_t>(IdleGearRequest());
   }
   if (std::memcmp(&s.gamepad, &w->last_state.gamepad, sizeof(s.gamepad)) != 0) {
     w->packet++;
@@ -1343,7 +1382,9 @@ X_RESULT WheelInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t, X_INPUT_KEY
   uint16_t cur = 0;
   if (is_active()) {
     X_INPUT_GAMEPAD pad{};
+    w->keystroke_poll = true;
     ComputeStateLocked(*w, &pad);
+    w->keystroke_poll = false;
     cur = pad.buttons;
   }
   const uint16_t changed = cur ^ w->keystroke_buttons;
