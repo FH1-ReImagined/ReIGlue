@@ -35,6 +35,7 @@
 #include <rex/ui/virtual_key.h>
 
 #include "wheel_devices.h"
+#include "wheel_ff_keep_playing.h"
 #include "wheel_ff_log.h"
 #include "wheel_ff_reject.h"
 #include "wheel_gear_request.h"
@@ -173,6 +174,11 @@ REXCVAR_DEFINE_INT32(wheel_handbrake_axis, 0, "Input",
     .range(0, 99);
 REXCVAR_DEFINE_BOOL(wheel_invert_handbrake, false, "Input",
                     "Flip the handbrake axis detected as released/pulled");
+REXCVAR_DEFINE_INT32(wheel_ffb_keep_playing, 0, "Input",
+                     "For a wheel that ends force feedback effects by itself: start every effect "
+                     "that plays again every this many seconds (0: never; an effect the wheel says "
+                     "has stopped is still started again; -1: not even that)")
+    .range(-1, 60);
 REXCVAR_DEFINE_STRING(wheel_device, "", "Input",
                       "The wheel the first player drives with and the pedal, shifter and handbrake "
                       "devices are read with: empty picks one with force feedback first; a device "
@@ -547,6 +553,46 @@ void NoteFfFailure(int& failures, const char* what, uint32_t block) {
   }
 }
 
+// Starts every effect the wheel plays again every wheel_ffb_keep_playing seconds, for a wheel that
+// ends effects by itself (wheel_ff_keep_playing.h, #304). Starting a playing effect restarts it as
+// it is.
+template <typename W>
+void KeepPlaying(W& w, bool game_ff, double now) {
+  const int seconds = FfKeepPlayingSeconds(REXCVAR_GET(wheel_ffb_keep_playing));
+  if (!w.haptic || seconds <= 0) {
+    return;
+  }
+  if (w.kept_playing_at < 0) {
+    w.kept_playing_at = now;
+  }
+  if (!FfKeepPlayingDue(w.kept_playing_at, now, seconds)) {
+    return;
+  }
+  w.kept_playing_at = now;
+  for (uint32_t b = 1; b <= kFfMaxBlocks; b++) {
+    const int id = w.game_fx[b - 1];
+    if (id < 0 || !w.game_fx_running[b - 1]) {
+      continue;
+    }
+    if (SDL_RunHapticEffect(w.haptic, id, SDL_HAPTIC_INFINITY)) {
+      g_ff_log.Sdl(b, FfSdlCall::kKeepPlaying);
+    } else {
+      g_ff_log.Sdl(b, FfSdlCall::kFailure);
+      NoteFfFailure(w.ff_failures, "keeping playing", b);
+    }
+  }
+  const std::pair<int, bool> waves[] = {
+      {w.road_fx, w.road_running}, {w.engine_fx, w.engine_running}, {w.sine_fx, w.sine_running}};
+  for (const auto& [fx, running] : waves) {
+    if (fx >= 0 && running && SDL_RunHapticEffect(w.haptic, fx, SDL_HAPTIC_INFINITY)) {
+      g_ff_log.RumbleKept();
+    }
+  }
+  if (!game_ff && w.spring_fx >= 0) {  // the approximate spring, started when the wheel opened
+    SDL_RunHapticEffect(w.haptic, w.spring_fx, SDL_HAPTIC_INFINITY);
+  }
+}
+
 int CreateSine(SDL_Haptic* haptic, uint16_t period_ms) {
   SDL_HapticEffect e{};
   e.type = SDL_HAPTIC_SINE;
@@ -615,6 +661,7 @@ struct WheelInputDriver::Wheel {
   // Set while the game's forces come back to full strength: every effect that should play is
   // started again, running or not (#304).
   bool restart_effects = false;
+  double kept_playing_at = -1;  // when its effects were last started again (KeepPlaying), seconds
   int ff_failures = 0;  // failed SDL calls on the game's effects (NoteFfFailure)
   int ff_ended = 0;     // the game's effects the wheel says have stopped by themselves (#304)
   int autocenter = -1;
@@ -1586,6 +1633,9 @@ X_RESULT WheelInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state)
   }
   PumpLocked();
   UpdateFadeLocked();
+  for (auto& wheel : wheels_) {
+    KeepPlaying(*wheel, game_ff_active_, FfNow());
+  }
   if (game_ff_active_ && g_ff_log.SummaryDue(FfNow())) {
     // Every 10 s, what the game sent and what the wheel got (wheel_ff_log.h, #304), and whether the
     // wheel still plays what it was told to (where SDL can ask: DirectInput, macOS, SDL's HIDAPI
@@ -1598,18 +1648,34 @@ X_RESULT WheelInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state)
         continue;
       }
       running |= 1u << i;
+      if (!status) {
+        continue;
+      }
+      // 1 playing, 0 stopped by itself, -1 the wheel could not tell (SDL sets an error).
       SDL_ClearError();
-      if (status && !SDL_GetHapticEffectStatus(first.haptic, first.game_fx[i]) &&
-          !*SDL_GetError()) {
+      const int playing = SDL_GetHapticEffectStatus(first.haptic, first.game_fx[i]) ? 1
+                          : *SDL_GetError()                                          ? -1
+                                                                                     : 0;
+      // A stopped effect plays again unless wheel_ffb_keep_playing is -1 (wheel_ff_keep_playing.h).
+      const FfStoppedCheck check =
+          FfCheckStopped(playing, REXCVAR_GET(wheel_ffb_keep_playing), [&] {
+            return SDL_RunHapticEffect(first.haptic, first.game_fx[i], SDL_HAPTIC_INFINITY);
+          });
+      FfNoteCheck(g_ff_log, i + 1, check);
+      if (check.failed) {
+        NoteFfFailure(first.ff_failures, "starting again", i + 1);
+      }
+      if (check.stopped) {
         ended |= 1u << i;
         // The 1st, 10th, 100th... time: a wheel that ends effects by itself (#304).
-        const int n = ++first.ff_ended;
-        for (int k = 1; k <= n; k *= 10) {
-          if (k == n) {
-            REXLOG_WARN("Wheel: \"{}\" says the game's effect block {} ({}) has stopped, though it "
-                        "was started and not stopped ({} so far)",
-                        first.name, i + 1, FfBlockTypeName(game_ff_.effect(i + 1).type), n);
-          }
+        if (FfLogThisCount(++first.ff_ended)) {
+          REXLOG_WARN("Wheel: \"{}\" says the game's effect block {} ({}) has stopped, though it "
+                      "was started and not stopped ({} so far){}",
+                      first.name, i + 1, FfBlockTypeName(game_ff_.effect(i + 1).type),
+                      first.ff_ended,
+                      check.restarted ? "; started again"
+                      : check.failed  ? "; starting it again failed"
+                                      : "");
         }
       }
     }
