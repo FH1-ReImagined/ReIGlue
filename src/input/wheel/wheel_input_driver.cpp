@@ -35,6 +35,7 @@
 #include <rex/ui/virtual_key.h>
 
 #include "wheel_devices.h"
+#include "wheel_ff_log.h"
 #include "wheel_ff_reject.h"
 #include "wheel_gear_request.h"
 #include "wheel_handbrake.h"
@@ -186,6 +187,13 @@ constexpr uint8_t kSubTypeWheel = 2;  // XINPUT_DEVSUBTYPE_WHEEL
 std::atomic<WheelInputDriver*> g_ff_driver{nullptr};
 // Whether the player drives, from the game (ForzaWheelPlayerDriving): -1 never said, 0, 1.
 std::atomic<int> g_player_driving{-1};
+// What the game sends and the wheels get, for the log (wheel_ff_log.h, #304); under the driver's
+// mutex.
+FfLog g_ff_log;
+
+double FfNow() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 // FH1's constant force pushes the wheel right when positive (in a right-hand corner it is negative:
 // the tyres pull the wheel back to the centre). An SDL level on the steering axis comes from the
 // east (SDL_haptic.h: where the force comes from; Linux direction 0x4000, which pulls left), so it
@@ -608,6 +616,7 @@ struct WheelInputDriver::Wheel {
   // started again, running or not (#304).
   bool restart_effects = false;
   int ff_failures = 0;  // failed SDL calls on the game's effects (NoteFfFailure)
+  int ff_ended = 0;     // the game's effects the wheel says have stopped by themselves (#304)
   int autocenter = -1;
   int sine_magnitude = -1;
   std::string name;
@@ -1073,10 +1082,14 @@ void WheelInputDriver::ApplyGameBlockLocked(Wheel& w, uint32_t block) {
   }
   SetEffectDirection(fx, w.ff_direction);  // the direction its effects work in (#308)
   int& id = w.game_fx[i];
+  // What the log's summary shows of it: the constant force's level, a condition's coefficient.
+  const int32_t sent_value =
+      fx.type == SDL_HAPTIC_CONSTANT ? fx.constant.level : fx.condition.right_coeff[0];
   if (!play) {
     if (id >= 0 && w.game_fx_running[i]) {
       SDL_StopHapticEffect(w.haptic, id);
       w.game_fx_running[i] = false;
+      g_ff_log.Sdl(block, FfSdlCall::kStop);
     }
     return;
   }
@@ -1092,6 +1105,7 @@ void WheelInputDriver::ApplyGameBlockLocked(Wheel& w, uint32_t block) {
       return;
     }
     id = CreateEffectAnyDirection(w.haptic, fx, w.ff_direction);
+    g_ff_log.Sdl(block, id < 0 ? FfSdlCall::kFailure : FfSdlCall::kCreate, sent_value);
     if (id < 0) {
       if (w.ff_rejected.Reject(fx.type)) {
         REXLOG_WARN("Wheel: \"{}\" refuses the game's {} (effect block {}, SDL type {}) in every "
@@ -1111,12 +1125,15 @@ void WheelInputDriver::ApplyGameBlockLocked(Wheel& w, uint32_t block) {
     // FH1 updates its constant force every frame, mostly with the same value.
     if (SDL_UpdateHapticEffect(w.haptic, id, &fx)) {
       w.game_fx_sent[i] = fx;
+      g_ff_log.Sdl(block, FfSdlCall::kUpdate, sent_value);
     } else {
+      g_ff_log.Sdl(block, FfSdlCall::kFailure);
       NoteFfFailure(w.ff_failures, "an update", block);
     }
   }
   if (!w.game_fx_running[i] || w.restart_effects) {
     w.game_fx_running[i] = SDL_RunHapticEffect(w.haptic, id, SDL_HAPTIC_INFINITY);
+    g_ff_log.Sdl(block, w.game_fx_running[i] ? FfSdlCall::kStart : FfSdlCall::kFailure);
     if (!w.game_fx_running[i]) {
       NoteFfFailure(w.ff_failures, "starting", block);
     }
@@ -1175,6 +1192,7 @@ bool WheelInputDriver::GameRumble(uint16_t left_motor, uint16_t right_motor) {
   }
   game_rumble_[0] = left_motor;
   game_rumble_[1] = right_motor;
+  g_ff_log.Rumbled();
   UpdateFadeLocked();
   for (auto& w : wheels_) {
     ApplyRumbleLocked(*w, left_motor, right_motor, true);
@@ -1236,8 +1254,23 @@ bool GameFfDeviceInfo() {
 bool GameFfSetEffect(const FfEffect& effect) {
   WheelInputDriver* d = g_ff_driver;
   bool ok = true;
-  const bool wheel =
-      d && d->GameForceFeedback([&](FfState& s) { return ok = s.Define(effect); }, effect.block);
+  const bool wheel = d && d->GameForceFeedback(
+                              [&](FfState& s) {
+                                ok = s.Define(effect);
+                                // A change of the block after its first definition (logged once,
+                                // below): its type, coefficients, gain to or from 0 (#304).
+                                if (ok && g_ff_log.Defined(effect, FfNow())) {
+                                  REXLOG_INFO("Wheel: the game's effect block {} is now {} (type "
+                                              "{}) gain {}, word 11 {}, coefficients {}/{}, "
+                                              "saturations {}/{}, dead band {}",
+                                              effect.block, FfBlockTypeName(effect.type),
+                                              effect.type, effect.gain, effect.magnitude,
+                                              effect.pos_coeff, effect.neg_coeff, effect.pos_sat,
+                                              effect.neg_sat, effect.deadband);
+                                }
+                                return ok;
+                              },
+                              effect.block);
   return wheel && ok;
 }
 
@@ -1250,8 +1283,17 @@ bool GameFfUpdateEffect(const FfEffect& effect, uint32_t flags) {
 bool GameFfOperate(uint32_t block, uint32_t op) {
   WheelInputDriver* d = g_ff_driver;
   bool ok = true;
-  const bool wheel =
-      d && d->GameForceFeedback([&](FfState& s) { return ok = s.Operate(block, op); }, block);
+  const bool wheel = d && d->GameForceFeedback(
+                              [&](FfState& s) {
+                                ok = s.Operate(block, op);
+                                if (g_ff_log.Operated(block, op)) {
+                                  REXLOG_INFO("Wheel: the game {} effect block {} (operation {}){}",
+                                              op == kFfOpStop ? "stops" : "starts", block, op,
+                                              ok ? "" : ", which is not defined");
+                                }
+                                return ok;
+                              },
+                              block);
   return wheel && ok;
 }
 
@@ -1260,6 +1302,10 @@ bool GameFfControl(uint32_t command) {
   return d && d->GameForceFeedback(
                   [&](FfState& s) {
                     s.Control(command);
+                    if (g_ff_log.Controlled()) {
+                      REXLOG_INFO("Wheel: the game's device control {} ({})", command,
+                                  FfControlName(command));
+                    }
                     return true;
                   },
                   0);
@@ -1269,6 +1315,9 @@ bool GameFfSetGain(uint32_t gain) {
   WheelInputDriver* d = g_ff_driver;
   return d && d->GameForceFeedback(
                   [&](FfState& s) {
+                    if (std::min<uint32_t>(gain, 255) != s.device_gain() && g_ff_log.Controlled()) {
+                      REXLOG_INFO("Wheel: the game sets the device gain to {}", gain);
+                    }
                     s.SetDeviceGain(gain);
                     return true;
                   },
@@ -1537,6 +1586,38 @@ X_RESULT WheelInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state)
   }
   PumpLocked();
   UpdateFadeLocked();
+  if (game_ff_active_ && g_ff_log.SummaryDue(FfNow())) {
+    // Every 10 s, what the game sent and what the wheel got (wheel_ff_log.h, #304), and whether the
+    // wheel still plays what it was told to (where SDL can ask: DirectInput, macOS, SDL's HIDAPI
+    // Logitech driver).
+    Wheel& first = *wheels_[0];
+    const bool status = first.haptic && (SDL_GetHapticFeatures(first.haptic) & SDL_HAPTIC_STATUS);
+    uint32_t running = 0, ended = 0;
+    for (uint32_t i = 0; i < kFfMaxBlocks; i++) {
+      if (!first.game_fx_running[i] || first.game_fx[i] < 0) {
+        continue;
+      }
+      running |= 1u << i;
+      SDL_ClearError();
+      if (status && !SDL_GetHapticEffectStatus(first.haptic, first.game_fx[i]) &&
+          !*SDL_GetError()) {
+        ended |= 1u << i;
+        // The 1st, 10th, 100th... time: a wheel that ends effects by itself (#304).
+        const int n = ++first.ff_ended;
+        for (int k = 1; k <= n; k *= 10) {
+          if (k == n) {
+            REXLOG_WARN("Wheel: \"{}\" says the game's effect block {} ({}) has stopped, though it "
+                        "was started and not stopped ({} so far)",
+                        first.name, i + 1, FfBlockTypeName(game_ff_.effect(i + 1).type), n);
+          }
+        }
+      }
+    }
+    const std::string summary = g_ff_log.Summary(game_ff_, running, ended, fade_.level, FfNow());
+    if (!summary.empty()) {
+      REXLOG_INFO("Wheel: {}", summary);
+    }
+  }
   X_INPUT_STATE s{};
   if (is_active()) {
     ComputeStateLocked(*w, &s.gamepad);
