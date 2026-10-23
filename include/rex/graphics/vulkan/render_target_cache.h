@@ -1,4 +1,5 @@
 #pragma once
+#include <rex/graphics/vulkan/fh1_screen_raster.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -111,8 +112,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void EndSubmission();
   bool UsesFractionalRaster() const {
     const auto pitch = register_file().Get<reg::RB_SURFACE_INFO>().surface_pitch;
-    return (pitch == 1280 || pitch == 640 || pitch == 320 || pitch == 160 || pitch == 80) &&
-        (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f);
+    if (!(pitch == 1280 || pitch == 640 || pitch == 320 || pitch == 160 || pitch == 80) ||
+        (raster_scale_x_ == 1.0f && raster_scale_y_ == 1.0f)) return false;
+    const auto& regs = register_file();
+    const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+    const auto tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    const auto br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+    return fh1::IsDisplayViewport(vte.vport_x_scale_ena, vte.vport_y_scale_ena,
+        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
+        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+        br.br_x - tl.tl_x, br.br_y - tl.tl_y);
   }
   void SetRasterSize(uint32_t width, uint32_t height) {
     raster_scale_x_ = float(width) / float(1280 * draw_resolution_scale_x());
