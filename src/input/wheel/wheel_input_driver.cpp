@@ -40,6 +40,7 @@
 #include "wheel_min_force.h"
 #include "wheel_primary.h"
 #include "wheel_rumble.h"
+#include "wheel_thrustmaster.h"
 
 REXCVAR_DEFINE_STRING(wheel_mode, "auto", "Input",
                       "Racing wheel support: auto (SDL says it is a wheel), on (every joystick "
@@ -499,7 +500,8 @@ bool IsWheelDevice(SDL_JoystickID jid) {
     return false;
   }
   if (SDL_GetJoystickTypeForID(jid) == SDL_JOYSTICK_TYPE_WHEEL ||
-      NameLooksLikeWheel(SDL_GetJoystickNameForID(jid)) || (mode == "on" && !SDL_IsGamepad(jid))) {
+      NameLooksLikeWheel(SDL_GetJoystickNameForID(jid)) || (mode == "on" && !SDL_IsGamepad(jid)) ||
+      FindThrustmaster(SDL_GetJoystickVendorForID(jid), SDL_GetJoystickProductForID(jid))) {
     return true;
   }
   // A pedal set, shifter or handbrake read with the wheel (#272): not a gamepad either.
@@ -546,6 +548,8 @@ struct WheelInputDriver::Wheel {
   int num_axes = 0, num_buttons = 0, num_hats = 0;
   uint16_t vid = 0, pid = 0;
   const Profile* prof = nullptr;  // known wheel: fixed axes and pedal direction
+  const ThrustmasterModel* tm = nullptr;  // a Thrustmaster by id: axes and buttons (#308)
+  bool rest_pending = false;  // every axis read 0 when opened: rest read at the first report
   std::vector<int16_t> rest;  // where each axis sat when the wheel was opened
   std::vector<uint8_t> armed;  // pedal axes seen at their resting end since the wheel was opened
   bool ffb = false;  // force feedback (wheel_primary.h: such a wheel comes first)
@@ -772,6 +776,22 @@ void WheelInputDriver::OpenLocked(SDL_JoystickID jid) {
       v = SDL_GetJoystickAxis(joy, a);
     }
     w->rest[a] = v;
+  }
+  w->tm = FindThrustmaster(w->vid, w->pid);
+  if (w->tm) {
+    REXLOG_INFO("Wheel: known wheel {}: {}, its buttons built in (the paddles shift)", w->tm->name,
+                ThrustmasterAxes(w->tm, w->num_axes)
+                    ? fmt::format("axes steer {}, throttle {}, brake {}, clutch {}", w->tm->steer,
+                                  w->tm->throttle, w->tm->brake, w->tm->clutch)
+                    : fmt::format("{} axes, not the {} its map has: detected", w->num_axes,
+                                  w->tm->axes));
+  }
+  // An axis that has not reported yet reads 0; a pedal rests at an end (#308).
+  w->rest_pending = !w->prof && RestPending(w->rest);
+  if (w->rest_pending) {
+    REXLOG_INFO("Wheel: every axis of \"{}\" reads 0 (no report yet): where they rest is read "
+                "when the first report comes in",
+                w->name);
   }
   if (w->prof) {
     REXLOG_INFO("Wheel: known wheel {}: fixed axes (steer {}, throttle {}, brake {}, clutch {}), "
@@ -1179,6 +1199,21 @@ WheelInputDriver::Wheel* WheelInputDriver::FindLocked(DeviceId id) {
 }
 
 void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
+  if (w.rest_pending) {
+    // The first report: where each axis is now is its rest (wheel_thrustmaster.h).
+    std::vector<int16_t> now(w.rest.size());
+    for (size_t a = 0; a < now.size(); a++) {
+      now[a] = SDL_GetJoystickAxis(w.joy, static_cast<int>(a));
+    }
+    if (RestArrived(now)) {
+      w.rest = now;
+      w.armed.assign(w.armed.size(), 0);
+      w.rest_pending = false;
+      for (size_t a = 0; a < now.size(); a++) {
+        REXLOG_INFO("Wheel:   axis {} rests at {} (first report)", a, now[a]);
+      }
+    }
+  }
   const auto axes = ParseKv(REXCVAR_GET(wheel_axes));
   auto axis_override = [&](const char* key) {
     auto it = axes.find(key);
@@ -1201,6 +1236,11 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
     if (pedal[0] < 0 && from_wheel[0]) pedal[0] = kProfThrottle;
     if (pedal[1] < 0 && from_wheel[1]) pedal[1] = kProfBrake;
     if (pedal[2] < 0 && from_wheel[2] && kProfClutch < w.num_axes) pedal[2] = kProfClutch;
+  } else if (const ThrustmasterModel* tm = ThrustmasterAxes(w.tm, w.num_axes)) {
+    if (steer < 0) steer = tm->steer;
+    if (pedal[0] < 0 && from_wheel[0]) pedal[0] = tm->throttle;
+    if (pedal[1] < 0 && from_wheel[1]) pedal[1] = tm->brake;
+    if (pedal[2] < 0 && from_wheel[2]) pedal[2] = tm->clutch;
   }
   if (steer < 0) {
     for (int a = 0; a < w.num_axes; a++) {
@@ -1328,7 +1368,8 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
   const bool aux_shifter = shifter != "off" && w.shifter_device.joy != nullptr;
   const ShifterMap shifter_map =
       shifter != "off" ? EffectiveShifter(w.vid, w.pid, w.shifter_device) : ShifterMap{};
-  const std::map<std::string, int> button_overrides = ParseKv(REXCVAR_GET(wheel_buttons));
+  const std::map<std::string, int> button_overrides =
+      ThrustmasterButtons(w.tm, ParseKv(REXCVAR_GET(wheel_buttons)));
   std::map<std::string, int> map =
       WheelButtons(ButtonLayoutOf(w.vid, w.pid), button_overrides,
                    aux_shifter ? std::set<int>{} : ShifterButtons(shifter_map, shifter));
