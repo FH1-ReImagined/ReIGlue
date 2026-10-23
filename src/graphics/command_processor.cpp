@@ -446,6 +446,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
+  // The Vulkan backend stores the other registers of a range itself, without this
+  // function (PlainRegisters, FH1 patch 0140): a register that gets handling here must
+  // be added to its list.
   // Scratch register writeback.
   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
     uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
@@ -591,6 +594,17 @@ void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* bas
 void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                                   uint32_t num_registers) {
   if (!num_registers) {
+    return;
+  }
+  // Nearly every range is contiguous in the ring: write it and advance the read
+  // offset here, as BeginRead and EndRead would (their no-wrap case), without two
+  // calls into the runtime for each of the hundred thousand ranges of a frame.
+  const size_t range_bytes = size_t(num_registers) * sizeof(uint32_t);
+  const size_t read_offset = ring->read_offset();
+  if (read_offset + range_bytes < ring->capacity()) {
+    WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(ring->buffer() + read_offset),
+                          num_registers);
+    ring->set_read_offset(read_offset + range_bytes);
     return;
   }
   memory::RingBuffer::ReadRange range = ring->BeginRead(size_t(num_registers) * sizeof(uint32_t));
@@ -751,29 +765,41 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   } while (reader.read_count());
 }
 
+namespace {
+// Out of line, so the packet loop below needs no stack frame for the log call.
+#if defined(_MSC_VER) && !defined(__clang__)
+__declspec(noinline) void WarnUninitializedPacket() {
+#else
+__attribute__((noinline, cold)) void WarnUninitializedPacket() {
+#endif
+  REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+}
+}  // namespace
+
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
-  const uint32_t packet = reader->ReadAndSwap<uint32_t>();
-  const uint32_t packet_type = packet >> 30;
-  if (packet == 0) {
-    return true;
+  uint32_t packet = reader->ReadAndSwap<uint32_t>();
+  // Zero words and type-2 packets do nothing. The D3D library pads its command
+  // buffers with type-2 packets (about two million a second in a race, more than
+  // the draws and constant writes together): skip a whole run of them here
+  // instead of returning to the caller's loop for each one.
+  while (packet == 0 || (packet >> 30) == 0x02) {
+    if (!reader->read_count()) {
+      return true;
+    }
+    packet = reader->ReadAndSwap<uint32_t>();
   }
 
-  if (packet == 0xCDCDCDCD) {
-    REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+  if (packet == 0xCDCDCDCD) [[unlikely]] {
+    WarnUninitializedPacket();
   }
 
-  switch (packet_type) {
-    case 0x00:
-      return ExecutePacketType0(reader, packet);
-    case 0x01:
-      return ExecutePacketType1(reader, packet);
-    case 0x02:
-      return ExecutePacketType2(reader, packet);
+  switch (packet >> 30) {
     case 0x03:
       return ExecutePacketType3(reader, packet);
+    case 0x00:
+      return ExecutePacketType0(reader, packet);
     default:
-      assert_unhandled_case(packet_type);
-      return false;
+      return ExecutePacketType1(reader, packet);
   }
 }
 

@@ -19,6 +19,7 @@
 #include <chrono>
 #include <unordered_set>
 #include <rex/graphics/shader_warmup.h>
+#include "fh1_shader_load_memo.h"
 #include <string>
 #include <string_view>
 #include <utility>
@@ -69,6 +70,15 @@ REXCVAR_DEFINE_BOOL(vulkan_store_pipeline_cache, true, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
+
+namespace {
+// The shaders last loaded from guest memory by address (FH1 patch 0140). Only the
+// command processor thread loads shaders from guest memory (PM4_IM_LOAD), so the
+// memo has no lock.
+fh1_shader_load_memo::ShaderLoadMemo<VulkanShader> loaded_shader_memo;
+// Raised when a pipeline cache deletes its shaders.
+std::atomic<uint64_t> loaded_shader_generation{1};
+}  // namespace
 
 namespace {
 
@@ -1352,6 +1362,7 @@ void VulkanPipelineCache::Shutdown() {
     delete it.second;
   }
   shaders_.clear();
+  loaded_shader_generation.fetch_add(1, std::memory_order_relaxed);
   shader_storage_index_ = 0;
   texture_binding_layout_map_.clear();
   texture_binding_layouts_.clear();
@@ -1362,9 +1373,14 @@ void VulkanPipelineCache::Shutdown() {
 
 VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
                                               const uint32_t* host_address, uint32_t dword_count) {
-  // Hash the input memory and lookup the shader.
-  return LoadShader(shader_type, host_address, dword_count,
-                    XXH3_64bits(host_address, dword_count * sizeof(uint32_t)));
+  const uint64_t generation = loaded_shader_generation.load(std::memory_order_relaxed);
+  // Hash the memo's copy of the input memory and lookup the shader: the hash and the
+  // shader's microcode come from the same words the memo remembers.
+  return loaded_shader_memo.FindOrLoad(
+      this, generation, host_address, dword_count, [&](const uint32_t* words) {
+        return LoadShader(shader_type, words, dword_count,
+                          XXH3_64bits(words, dword_count * sizeof(uint32_t)));
+      });
 }
 
 VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,

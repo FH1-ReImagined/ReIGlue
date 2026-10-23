@@ -2707,6 +2707,34 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
+namespace {
+// Registers outside the shader constant blocks whose write only stores the value:
+// known to the register table, and none of those CommandProcessor::WriteRegister
+// acts on (scratch write-back, coherency status, gamma ramp; keep in sync with it).
+// Unknown and out-of-range registers still take that function, which logs them.
+class PlainRegisters {
+ public:
+  PlainRegisters() {
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      bool side_effect = (i >= XE_GPU_REG_SCRATCH_REG0 && i <= XE_GPU_REG_SCRATCH_REG7) ||
+                         i == XE_GPU_REG_COHER_STATUS_HOST || i == XE_GPU_REG_DC_LUT_RW_INDEX ||
+                         i == XE_GPU_REG_DC_LUT_SEQ_COLOR || i == XE_GPU_REG_DC_LUT_PWL_DATA ||
+                         i == XE_GPU_REG_DC_LUT_30_COLOR;
+      if (!side_effect && RegisterFile::GetRegisterInfo(i)) {
+        bits_[i >> 6] |= uint64_t(1) << (i & 63);
+      }
+    }
+  }
+  bool IsPlain(uint32_t index) const {
+    return index < RegisterFile::kRegisterCount && ((bits_[index >> 6] >> (index & 63)) & 1);
+  }
+
+ private:
+  uint64_t bits_[(RegisterFile::kRegisterCount + 63) / 64] = {};
+};
+const PlainRegisters plain_registers;
+}  // namespace
+
 void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                                    uint32_t num_registers) {
   if (!num_registers) {
@@ -2845,8 +2873,16 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     if (constant_block) {
       VulkanCommandProcessor::WriteRegistersFromMem(index, part_base, part_end - index);
     } else {
+      // Most of these (render state, about 3 million a second in a race) only store
+      // the value: do that here, as CommandProcessor::WriteRegister would.
       for (uint32_t i = index; i < part_end; ++i) {
-        CommandProcessor::WriteRegister(i, memory::load_and_swap<uint32_t>(part_base + (i - index)));
+        uint32_t value = memory::load_and_swap<uint32_t>(part_base + (i - index));
+        if (plain_registers.IsPlain(i)) {
+          // Volatile like CommandProcessor::WriteRegister's store (WAIT_REG_MEM polls).
+          const_cast<volatile uint32_t&>(register_file_->values[i]) = value;
+        } else {
+          CommandProcessor::WriteRegister(i, value);
+        }
       }
     }
     index = part_end;
