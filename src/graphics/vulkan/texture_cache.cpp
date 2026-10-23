@@ -33,6 +33,8 @@
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "fh1_device_memory.h"
+
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
 REXCVAR_DEFINE_BOOL(
@@ -111,6 +113,44 @@ namespace {
 // descriptors, which force all sampled channels to 0.
 constexpr VkFormat kInvalidTextureFetchFallbackFormat = VK_FORMAT_R8G8B8A8_UNORM;
 const VkClearColorValue kInvalidTextureFetchFallbackColor = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+namespace device_memory = fh1_device_memory;
+
+// FH1 (#268): a texture's image and memory. On integrated GPUs (fh1_device_memory.h) the
+// free room of the allocator's device-local blocks first, then a device-local heap while its
+// use stays under 80% of its budget, else system memory; elsewhere as before (VMA prefers
+// device-local memory and tries the other types when that fails).
+VkResult CreateTextureImage(VmaAllocator allocator, const VkImageCreateInfo& info, VkImage& image,
+                            VmaAllocation& allocation) {
+  VmaAllocationCreateInfo create_info = {};
+  create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  device_memory::State& state = device_memory::Get();
+  if (!state.active()) {
+    return vmaCreateImage(allocator, &info, &create_info, &image, &allocation, nullptr);
+  }
+  const uint32_t device_local_types = state.layout().device_local_types;
+  create_info.flags = VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+  create_info.memoryTypeBits = device_local_types;
+  if (vmaCreateImage(allocator, &info, &create_info, &image, &allocation, nullptr) == VK_SUCCESS) {
+    return VK_SUCCESS;
+  }
+  create_info.flags = 0;
+  // About the size: 4 bytes per texel (more than the compressed formats take), a third more
+  // for the mips.
+  uint64_t size = uint64_t(info.extent.width) * info.extent.height * info.extent.depth *
+                  info.arrayLayers * 4;
+  if (info.mipLevels > 1) size += size / 3;
+  const auto order = state.Choose(device_memory::Use::kTexture, ~uint32_t(0), size, true);
+  VkResult result = VK_ERROR_FEATURE_NOT_PRESENT;
+  for (uint32_t i = 0; i < order.count; ++i) {
+    create_info.memoryTypeBits = order.masks[i];
+    create_info.usage = (order.masks[i] & device_local_types) ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+                                                              : VMA_MEMORY_USAGE_UNKNOWN;
+    result = vmaCreateImage(allocator, &info, &create_info, &image, &allocation, nullptr);
+    if (result == VK_SUCCESS) break;
+  }
+  return result;
+}
 
 }  // namespace
 
@@ -1255,17 +1295,16 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     image_format_list_create_info.pViewFormats = formats;
   }
 
-  VmaAllocationCreateInfo allocation_create_info = {};
-  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-
   VkImage image;
   VmaAllocation allocation;
-  if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
-                     &allocation, nullptr)) {
+  if (VkResult result = CreateTextureImage(vma_allocator_, image_create_info, image, allocation)) {
     // Storage usage or format reinterpretation may impose extra device limits.
     // A failed fast-path allocation must not prevent the original upload path.
-    if (!direct_upload)
+    if (!direct_upload) {
+      device_memory::ReportImageFailure(vulkan_device, device_memory::Use::kTexture,
+                                        image_create_info, result);
       return nullptr;
+    }
     direct_upload = false;
     image_create_info.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
     if (!separate_view_format) {
@@ -1274,9 +1313,12 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     } else if (image_create_info.pNext) {
       image_format_list_create_info.viewFormatCount = 2;
     }
-    if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
-                       &allocation, nullptr))
+    if (VkResult result =
+            CreateTextureImage(vma_allocator_, image_create_info, image, allocation)) {
+      device_memory::ReportImageFailure(vulkan_device, device_memory::Use::kTexture,
+                                        image_create_info, result);
       return nullptr;
+    }
   }
 
   auto result = std::make_unique<VulkanTexture>(*this, key, image, allocation);
@@ -1299,9 +1341,12 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     VkImage upload_image;
     VmaAllocation upload_allocation;
-    if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &upload_image,
-                       &upload_allocation, nullptr) != VK_SUCCESS)
+    if (VkResult result =
+            CreateTextureImage(vma_allocator_, image_create_info, upload_image, upload_allocation)) {
+      device_memory::ReportImageFailure(vulkan_device, device_memory::Use::kTexture,
+                                        image_create_info, result);
       return nullptr;
+    }
     auto upload_key = key;
     upload_key.dimension = xenos::DataDimension::k2DOrStacked;
     result->SetCubeUpload(
@@ -2066,6 +2111,8 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(VulkanTextureCache& texture_cac
   VmaAllocationInfo allocation_info;
   vmaGetAllocationInfo(texture_cache.vma_allocator_, allocation_, &allocation_info);
   SetHostMemoryUsage(uint64_t(allocation_info.size));
+  device_memory::Get().Allocated(device_memory::Use::kTexture, allocation_info.memoryType,
+                                 allocation_info.size);
 }
 
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
@@ -2086,6 +2133,10 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
   }
+  VmaAllocationInfo allocation_info;
+  vmaGetAllocationInfo(vulkan_texture_cache.vma_allocator_, allocation_, &allocation_info);
+  device_memory::Get().Freed(device_memory::Use::kTexture, allocation_info.memoryType,
+                             allocation_info.size);
   vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
 }
 
@@ -2216,13 +2267,12 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
     image_create_info.pQueueFamilyIndices = nullptr;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    VmaAllocationCreateInfo allocation_create_info = {};
-    allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-
     VkImage image_2d;
     VmaAllocation allocation_2d;
-    if (vmaCreateImage(vulkan_texture_cache.vma_allocator_, &image_create_info,
-                       &allocation_create_info, &image_2d, &allocation_2d, nullptr) != VK_SUCCESS) {
+    if (VkResult result = CreateTextureImage(vulkan_texture_cache.vma_allocator_,
+                                             image_create_info, image_2d, allocation_2d)) {
+      device_memory::ReportImageFailure(vulkan_texture_cache.command_processor_.GetVulkanDevice(),
+                                        device_memory::Use::kTexture, image_create_info, result);
       REXGPU_ERROR("VulkanTextureCache: Failed to create 3D-as-2D wrapper image");
       return VK_NULL_HANDLE;
     }
@@ -2377,6 +2427,7 @@ void VulkanTextureCache::ShutdownScaledResolveBuffer() {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, scaled_resolve_buffer_);
   for (VkDeviceMemory memory : scaled_resolve_buffer_memory_) {
+    device_memory::Get().Forget(memory);
     dfn.vkFreeMemory(device, memory, nullptr);
   }
   scaled_resolve_buffer_memory_.clear();
@@ -2442,14 +2493,17 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
     const VkDevice device = vulkan_device->device();
 
-    VkMemoryAllocateInfo memory_allocate_info;
-    memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    memory_allocate_info.pNext = nullptr;
-    memory_allocate_info.allocationSize = VkDeviceSize(allocation_range.second)
-                                          << scaled_resolve_sparse_granularity_log2_;
-    memory_allocate_info.memoryTypeIndex = scaled_resolve_buffer_memory_type_;
+    const VkDeviceSize allocation_size = VkDeviceSize(allocation_range.second)
+                                         << scaled_resolve_sparse_granularity_log2_;
+    // FH1 (#268): on integrated GPUs, system memory once device-local memory is nearly full.
+    VkMemoryRequirements buffer_memory_requirements;
+    dfn.vkGetBufferMemoryRequirements(device, scaled_resolve_buffer_, &buffer_memory_requirements);
     VkDeviceMemory allocation_memory;
-    if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &allocation_memory) !=
+    uint32_t allocation_memory_type;
+    if (device_memory::AllocateSparseMemory(vulkan_device, device_memory::Use::kScaledResolve,
+                                            buffer_memory_requirements.memoryTypeBits,
+                                            scaled_resolve_buffer_memory_type_, allocation_size,
+                                            allocation_memory, allocation_memory_type) !=
         VK_SUCCESS) {
       REXGPU_ERROR(
           "VulkanTextureCache: Failed to allocate sparse memory for the "
@@ -2462,7 +2516,7 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
     VkSparseMemoryBind bind;
     bind.resourceOffset = VkDeviceSize(allocation_range.first)
                           << scaled_resolve_sparse_granularity_log2_;
-    bind.size = memory_allocate_info.allocationSize;
+    bind.size = allocation_size;
     bind.memory = allocation_memory;
     bind.memoryOffset = 0;
     bind.flags = 0;

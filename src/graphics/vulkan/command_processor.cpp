@@ -36,6 +36,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/util/fh1_hud.h>
+#include "fh1_device_memory.h"
 #include "fh1_render_target_trim.h"
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
@@ -785,6 +786,8 @@ void VulkanCommandProcessor::ClearCaches() {
 
 void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
   namespace trim = fh1_render_target_trim;
+  fh1_device_memory::State& device_memory = fh1_device_memory::Get();
+  device_memory.EndFrame();
   const uint32_t percent = REXCVAR_GET(vulkan_render_target_trim_percent);
   if (!render_target_cache_ || !percent) {
     render_target_trim_requested_ = false;
@@ -801,24 +804,23 @@ void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
                          render_target_trim_next_allowed_frame_, percent, failed, have_budget)) {
     return;
   }
-  uint64_t usage = 0, budget = 0;
-  if (have_budget) {
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_properties = {};
-    budget_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-    VkPhysicalDeviceMemoryProperties2 memory_properties = {};
-    memory_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
-    memory_properties.pNext = &budget_properties;
-    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties2(
-        vulkan_device->physical_device(), &memory_properties);
-    const VkPhysicalDeviceMemoryProperties& properties = memory_properties.memoryProperties;
-    for (uint32_t i = 0; i < properties.memoryHeapCount; ++i) {
-      if (properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-        usage += budget_properties.heapUsage[i];
-        budget += budget_properties.heapBudget[i];
-      }
-    }
-  }
-  if (!failed && !trim::OverBudget(usage, budget, percent)) {
+  // The device-local use and budget (and the test cap, vulkan_device_local_budget_mb).
+  const fh1_device_memory::State::Budget memory = device_memory.Query();
+  const uint64_t usage = memory.usage, budget = memory.budget;
+  // FH1 (#268): where new textures go to system memory (integrated GPUs with a small
+  // carve-out) a nearly full device-local heap is no reason to free render targets; render
+  // targets that went to system memory past their limit are.
+  const bool integrated = device_memory.active();
+  trim::Memory trim_memory;
+  trim_memory.usage = usage;
+  trim_memory.budget = budget;
+  trim_memory.heap_over_budget = integrated && device_memory.HeapOverBudget(memory);
+  trim_memory.system_usage = memory.system_usage;
+  trim_memory.system_budget = memory.system_budget;
+  trim_memory.render_targets_in_system =
+      device_memory.SystemBytes(fh1_device_memory::Use::kRenderTarget);
+  const trim::Reason reason = trim::ShouldTrim(integrated, failed, trim_memory, percent);
+  if (reason == trim::Reason::kNone) {
     return;
   }
   if (!AwaitAllQueueOperationsCompletion()) {
@@ -839,10 +841,19 @@ void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
   }
   render_target_trim_next_allowed_frame_ =
       trim::NextAllowedFrame(frame_current_, failed, before - after);
+  // FH1 (#268): the next placements see the memory the trim freed (render targets are made
+  // again in the next frame).
+  if (integrated) device_memory.Refresh();
   REXGPU_INFO(
-      "Render targets trimmed ({}): {} -> {} ({} -> {} MB); device-local memory {} of {} MB",
-      failed ? "an allocation failed" : "memory nearly full", count_before, count_after,
-      before >> 20, after >> 20, usage >> 20, budget >> 20);
+      "Render targets trimmed ({}): {} -> {} ({} -> {} MB); device-local memory {} of {} MB{}",
+      reason == trim::Reason::kAllocationFailed ? "an allocation failed"
+      : reason == trim::Reason::kRenderTargetsInSystemMemory
+          ? fmt::format("{} MB of them in system memory", trim_memory.render_targets_in_system >> 20)
+          : std::string("memory nearly full"),
+      count_before, count_after, before >> 20, after >> 20, usage >> 20, budget >> 20,
+      integrated ? fmt::format(", system memory {} of {} MB", memory.system_usage >> 20,
+                               memory.system_budget >> 20)
+                 : std::string());
 }
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
@@ -1250,6 +1261,9 @@ bool VulkanCommandProcessor::SetupContext() {
         "buffers bound to the compute shader");
     return false;
   }
+
+  // FH1 (#268): the memory layout, before the first allocation it places.
+  fh1_device_memory::Get().Initialize(vulkan_device);
 
   shared_memory_ =
       std::make_unique<VulkanSharedMemory>(*this, *memory_, guest_shader_pipeline_stages_);
@@ -2647,6 +2661,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   fences_free_.clear();
 
   device_lost_ = false;
+  fh1_device_memory::Get().Shutdown();
 
   CommandProcessor::ShutdownContext();
 }

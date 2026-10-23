@@ -37,6 +37,8 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "fh1_device_memory.h"
+
 REXCVAR_DEFINE_INT32(vulkan_render_target_initial_fill, 0, "GPU/Vulkan",
                      "Fill a host color render target before its first use: 0 leaves the driver's "
                      "memory (undefined), 1 clears it to zero, 2 to a loud magenta (64, 0, 64, 1) to "
@@ -1871,6 +1873,7 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
   }
   dfn.vkDestroyImageView(device, view_depth_color_, nullptr);
   dfn.vkDestroyImage(device, image_, nullptr);
+  fh1_device_memory::Get().Forget(memory_);
   dfn.vkFreeMemory(device, memory_, nullptr);
   render_target_cache_.render_target_memory_bytes_ -= memory_size_;
   --render_target_cache_.render_target_count_;
@@ -1949,9 +1952,10 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   VkImage image;
   VkDeviceMemory memory;
   VkDeviceSize memory_size = 0;
-  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
-          memory, nullptr, &memory_size)) {
+  // FH1 (#268): on integrated GPUs, system memory once device-local memory is nearly full.
+  if (!fh1_device_memory::CreateDedicatedImage(vulkan_device, image_create_info,
+                                               fh1_device_memory::Use::kRenderTarget, image, memory,
+                                               &memory_size)) {
     render_target_allocation_failed_ = true;
     REXGPU_ERROR(
         "VulkanRenderTarget: Failed to create a {}x{} {}xMSAA {} render target "
@@ -1985,6 +1989,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
         image_create_info.extent.height, uint32_t(1) << uint32_t(key.msaa_samples),
         key.GetFormatName());
     dfn.vkDestroyImage(device, image, nullptr);
+    fh1_device_memory::Get().Forget(memory);
     dfn.vkFreeMemory(device, memory, nullptr);
     return nullptr;
   }
@@ -2005,6 +2010,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
           xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat()));
       dfn.vkDestroyImageView(device, view_depth_color, nullptr);
       dfn.vkDestroyImage(device, image, nullptr);
+      fh1_device_memory::Get().Forget(memory);
       dfn.vkFreeMemory(device, memory, nullptr);
       return nullptr;
     }
@@ -2019,6 +2025,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       dfn.vkDestroyImageView(device, view_depth_stencil, nullptr);
       dfn.vkDestroyImageView(device, view_depth_color, nullptr);
       dfn.vkDestroyImage(device, image, nullptr);
+      fh1_device_memory::Get().Forget(memory);
       dfn.vkFreeMemory(device, memory, nullptr);
       return nullptr;
     }
@@ -2034,6 +2041,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
             xenos::GetColorRenderTargetFormatName(key.GetColorFormat()));
         dfn.vkDestroyImageView(device, view_depth_color, nullptr);
         dfn.vkDestroyImage(device, image, nullptr);
+        fh1_device_memory::Get().Forget(memory);
         dfn.vkFreeMemory(device, memory, nullptr);
         return nullptr;
       }
@@ -2052,6 +2060,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
         }
         dfn.vkDestroyImageView(device, view_depth_color, nullptr);
         dfn.vkDestroyImage(device, image, nullptr);
+        fh1_device_memory::Get().Forget(memory);
         dfn.vkFreeMemory(device, memory, nullptr);
         return nullptr;
       }
@@ -2074,6 +2083,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
     }
     dfn.vkDestroyImageView(device, view_depth_color, nullptr);
     dfn.vkDestroyImage(device, image, nullptr);
+    fh1_device_memory::Get().Forget(memory);
     dfn.vkFreeMemory(device, memory, nullptr);
     return nullptr;
   }

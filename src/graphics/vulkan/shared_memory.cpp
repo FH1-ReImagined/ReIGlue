@@ -23,6 +23,8 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "fh1_device_memory.h"
+
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -178,6 +180,7 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
   for (VkDeviceMemory memory : buffer_memory_) {
+    fh1_device_memory::Get().Forget(memory);
     dfn.vkFreeMemory(device, memory, nullptr);
   }
   buffer_memory_.clear();
@@ -237,14 +240,17 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  VkMemoryAllocateInfo memory_allocate_info;
-  memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  memory_allocate_info.pNext = nullptr;
-  memory_allocate_info.allocationSize = length_allocations
-                                        << host_gpu_memory_sparse_granularity_log2();
-  memory_allocate_info.memoryTypeIndex = buffer_memory_type_;
+  const VkDeviceSize allocation_size = VkDeviceSize(length_allocations)
+                                       << host_gpu_memory_sparse_granularity_log2();
+  // FH1 (#268): on integrated GPUs, system memory once device-local memory is nearly full.
+  VkMemoryRequirements buffer_memory_requirements;
+  dfn.vkGetBufferMemoryRequirements(device, buffer_, &buffer_memory_requirements);
   VkDeviceMemory memory;
-  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) != VK_SUCCESS) {
+  uint32_t memory_type;
+  if (fh1_device_memory::AllocateSparseMemory(
+          vulkan_device, fh1_device_memory::Use::kSharedMemory,
+          buffer_memory_requirements.memoryTypeBits, buffer_memory_type_, allocation_size, memory,
+          memory_type) != VK_SUCCESS) {
     REXGPU_ERROR("Shared memory: Failed to allocate sparse buffer memory");
     return false;
   }
@@ -252,7 +258,7 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
 
   VkSparseMemoryBind bind;
   bind.resourceOffset = offset_allocations << host_gpu_memory_sparse_granularity_log2();
-  bind.size = memory_allocate_info.allocationSize;
+  bind.size = allocation_size;
   bind.memory = memory;
   bind.memoryOffset = 0;
   bind.flags = 0;
