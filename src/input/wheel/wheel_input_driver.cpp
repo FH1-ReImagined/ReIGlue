@@ -35,6 +35,7 @@
 #include <rex/ui/virtual_key.h>
 
 #include "wheel_devices.h"
+#include "wheel_ff_reject.h"
 #include "wheel_gear_request.h"
 #include "wheel_handbrake.h"
 #include "wheel_min_force.h"
@@ -322,6 +323,72 @@ float MinForceLevelOf(const FfEffect& e, uint32_t device_gain, float level) {
   return FfMinForceLevel(e, device_gain, level, min);
 }
 
+// The direction of an SDL effect (each type keeps its own in SDL's union), or none.
+SDL_HapticDirection* EffectDirection(SDL_HapticEffect& e) {
+  switch (e.type) {
+    case SDL_HAPTIC_CONSTANT: return &e.constant.direction;
+    case SDL_HAPTIC_SPRING:
+    case SDL_HAPTIC_DAMPER:
+    case SDL_HAPTIC_INERTIA:
+    case SDL_HAPTIC_FRICTION: return &e.condition.direction;
+    case SDL_HAPTIC_SINE:
+    case SDL_HAPTIC_SQUARE:
+    case SDL_HAPTIC_TRIANGLE:
+    case SDL_HAPTIC_SAWTOOTHUP:
+    case SDL_HAPTIC_SAWTOOTHDOWN: return &e.periodic.direction;
+    case SDL_HAPTIC_RAMP: return &e.ramp.direction;
+    default: return nullptr;
+  }
+}
+
+// One of wheel_ff_reject.h's directions: SDL's steering axis, Cartesian X (a force from the east)
+// or polar east (9000 hundredths of a degree from north), all pulling the wheel left when positive.
+void SetEffectDirection(SDL_HapticEffect& e, int direction) {
+  SDL_HapticDirection* d = EffectDirection(e);
+  if (!d) {
+    return;
+  }
+  *d = SDL_HapticDirection{};
+  d->type = direction == 1   ? SDL_HAPTIC_CARTESIAN
+            : direction == 2 ? SDL_HAPTIC_POLAR
+                             : SDL_HAPTIC_STEERING_AXIS;
+  if (direction == 1) {
+    d->dir[0] = 1;
+  } else if (direction == 2) {
+    d->dir[0] = 9000;
+  }
+}
+
+// Creates the effect in the direction that worked last, else in the others (FfDirectionOrder);
+// `direction` becomes the one that worked. -1 when the wheel refuses all of them.
+int CreateEffectAnyDirection(SDL_Haptic* haptic, SDL_HapticEffect& e, int& direction) {
+  for (int d : FfDirectionOrder(direction)) {
+    SetEffectDirection(e, d);
+    const int id = SDL_CreateHapticEffect(haptic, &e);
+    if (id >= 0) {
+      if (d != direction) {
+        REXLOG_INFO("Wheel: effects are created {} from now on",
+                    d == 1 ? "in Cartesian X" : d == 2 ? "in polar east" : "on the steering axis");
+      }
+      direction = d;
+      return id;
+    }
+  }
+  SetEffectDirection(e, direction);
+  return -1;
+}
+
+const char* FfTypeName(uint32_t type) {
+  switch (type) {
+    case SDL_HAPTIC_CONSTANT: return "steering force (constant)";
+    case SDL_HAPTIC_SPRING: return "centring spring";
+    case SDL_HAPTIC_DAMPER: return "damper";
+    case SDL_HAPTIC_INERTIA: return "inertia";
+    case SDL_HAPTIC_FRICTION: return "friction";
+    default: return "effect";
+  }
+}
+
 float Norm(int16_t v) {
   return v < 0 ? v / 32768.0f : v / 32767.0f;
 }
@@ -550,6 +617,8 @@ struct WheelInputDriver::Wheel {
   const Profile* prof = nullptr;  // known wheel: fixed axes and pedal direction
   const ThrustmasterModel* tm = nullptr;  // a Thrustmaster by id: axes and buttons (#308)
   bool rest_pending = false;  // every axis read 0 when opened: rest read at the first report
+  FfRejections ff_rejected;  // the game's effect types this wheel refused (wheel_ff_reject.h)
+  int ff_direction = 0;      // the direction its effects are created in (wheel_ff_reject.h)
   std::vector<int16_t> rest;  // where each axis sat when the wheel was opened
   std::vector<uint8_t> armed;  // pedal axes seen at their resting end since the wheel was opened
   bool ffb = false;  // force feedback (wheel_primary.h: such a wheel comes first)
@@ -943,7 +1012,9 @@ void WheelInputDriver::ApplyRumbleLocked(Wheel& w, uint16_t left_motor, uint16_t
 // as another type, not only when its own block is played again.
 void WheelInputDriver::ApplyAutocenterLocked(Wheel& w) {
   const Uint32 f = SDL_GetHapticFeatures(w.haptic);
-  if ((f & SDL_HAPTIC_SPRING) || !(f & SDL_HAPTIC_AUTOCENTER)) {
+  // A spring the wheel refused becomes its autocentre too (#308).
+  if (((f & SDL_HAPTIC_SPRING) && !w.ff_rejected.Rejected(SDL_HAPTIC_SPRING)) ||
+      !(f & SDL_HAPTIC_AUTOCENTER)) {
     return;
   }
   const float strength = FfTypeStrength(kFfSpring, Strengths()) * fade_.level;
@@ -1000,6 +1071,7 @@ void WheelInputDriver::ApplyGameBlockLocked(Wheel& w, uint32_t block) {
       play = game_ff_.Active(block) && FfConditionFelt(c);
     }
   }
+  SetEffectDirection(fx, w.ff_direction);  // the direction its effects work in (#308)
   int& id = w.game_fx[i];
   if (!play) {
     if (id >= 0 && w.game_fx_running[i]) {
@@ -1014,10 +1086,24 @@ void WheelInputDriver::ApplyGameBlockLocked(Wheel& w, uint32_t block) {
     w.game_fx_running[i] = false;
   }
   if (id < 0) {
-    id = SDL_CreateHapticEffect(w.haptic, &fx);
+    // A type the wheel refused is not tried again until the game resets its force feedback or the
+    // wheel is plugged in again (#308: it was tried, and logged, every frame).
+    if (w.ff_rejected.Rejected(fx.type)) {
+      return;
+    }
+    id = CreateEffectAnyDirection(w.haptic, fx, w.ff_direction);
     if (id < 0) {
-      REXLOG_WARN("Wheel: the game's effect block {} (type {}) was rejected: {}", block, fx.type,
-                  SDL_GetError());
+      if (w.ff_rejected.Reject(fx.type)) {
+        REXLOG_WARN("Wheel: \"{}\" refuses the game's {} (effect block {}, SDL type {}) in every "
+                    "direction: {}. Not tried again until the game resets its force feedback or "
+                    "the wheel is plugged in again{}",
+                    w.name, FfTypeName(fx.type), block, fx.type, SDL_GetError(),
+                    fx.type == SDL_HAPTIC_SPRING &&
+                            (SDL_GetHapticFeatures(w.haptic) & SDL_HAPTIC_AUTOCENTER)
+                        ? "; the wheel's autocentre stands in for it"
+                        : "");
+        ApplyAutocenterLocked(w);
+      }
       return;
     }
     w.game_fx_sent[i] = fx;
@@ -1045,6 +1131,11 @@ bool WheelInputDriver::GameForceFeedback(const std::function<bool(FfState&)>& ch
   }
   if (!change(game_ff_)) {
     return true;
+  }
+  if (FfNothingDefined(game_ff_)) {
+    for (auto& w : wheels_) {
+      w->ff_rejected.Reset();  // a reset: effects a wheel refused are tried again (#308)
+    }
   }
   UpdateFadeLocked();
   for (uint32_t b = 1; b <= kFfMaxBlocks; b++) {
