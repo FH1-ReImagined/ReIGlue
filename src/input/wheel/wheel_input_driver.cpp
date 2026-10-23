@@ -38,6 +38,7 @@
 #include "wheel_gear_request.h"
 #include "wheel_handbrake.h"
 #include "wheel_min_force.h"
+#include "wheel_primary.h"
 #include "wheel_rumble.h"
 
 REXCVAR_DEFINE_STRING(wheel_mode, "auto", "Input",
@@ -169,6 +170,10 @@ REXCVAR_DEFINE_INT32(wheel_handbrake_axis, 0, "Input",
     .range(0, 99);
 REXCVAR_DEFINE_BOOL(wheel_invert_handbrake, false, "Input",
                     "Flip the handbrake axis detected as released/pulled");
+REXCVAR_DEFINE_STRING(wheel_device, "", "Input",
+                      "The wheel the first player drives with and the pedal, shifter and handbrake "
+                      "devices are read with: empty picks one with force feedback first; a device "
+                      "name, SDL GUID or vid:pid picks that one (and makes it a wheel)");
 
 namespace rex::input::wheel {
 
@@ -505,7 +510,8 @@ bool IsWheelDevice(SDL_JoystickID jid) {
          (ParseDeviceChoice(REXCVAR_GET(wheel_shifter_device)) == DeviceChoice::kNamed &&
           DeviceMatch(REXCVAR_GET(wheel_shifter_device), j)) ||
          (ParseDeviceChoice(REXCVAR_GET(wheel_handbrake_device)) == DeviceChoice::kNamed &&
-          DeviceMatch(REXCVAR_GET(wheel_handbrake_device), j));
+          DeviceMatch(REXCVAR_GET(wheel_handbrake_device), j)) ||
+         WheelDeviceMatch(REXCVAR_GET(wheel_device), j) > 0;
 }
 
 struct WheelInputDriver::Wheel {
@@ -542,6 +548,7 @@ struct WheelInputDriver::Wheel {
   const Profile* prof = nullptr;  // known wheel: fixed axes and pedal direction
   std::vector<int16_t> rest;  // where each axis sat when the wheel was opened
   std::vector<uint8_t> armed;  // pedal axes seen at their resting end since the wheel was opened
+  bool ffb = false;  // force feedback (wheel_primary.h: such a wheel comes first)
   int gear = kGearNeutral;  // the H-pattern gear engaged (EngageGear)
   GearRequest gear_request;  // what thumb_rx asks of the game (wheel_gear_request.h)
   bool keystroke_poll = false;  // ComputeStateLocked for a keystroke: not a state the game reads
@@ -610,13 +617,19 @@ void WheelInputDriver::RescanLocked() {
   const int handbrake = PickHandbrakeDevice(JoyInfos(ids, ids ? count : 0),
                                             REXCVAR_GET(wheel_handbrake_device));
   const SDL_JoystickID handbrake_jid = handbrake >= 0 ? ids[handbrake] : 0;
+  // The wheels (wheel_primary.h): wheel-like devices that are not read as another's pedals,
+  // shifter or handbrake, and the one wheel_device names. Ordered once they are open.
+  const std::vector<JoyInfo> joys = JoyInfos(ids, ids ? count : 0);
+  const std::vector<SDL_JoystickID> jids(ids, ids + (ids ? count : 0));
+  std::vector<bool> wheel_like(joys.size()), aux(joys.size());
+  for (size_t i = 0; i < joys.size(); i++) {
+    wheel_like[i] = IsWheelDevice(jids[i]);
+    aux[i] = pick.IsAux(static_cast<int>(i)) || static_cast<int>(i) == handbrake;
+  }
+  const std::string wheel_device = REXCVAR_GET(wheel_device);
   std::vector<SDL_JoystickID> wanted;
-  for (int i = 0; ids && i < count; i++) {
-    const SDL_JoystickID jid = ids[i];
-    const bool take = !pick.IsAux(i) && i != handbrake && IsWheelDevice(jid);
-    if (take) {
-      wanted.push_back(jid);
-    }
+  for (int i : WheelOrder(joys, wheel_like, std::vector<bool>(joys.size()), aux, wheel_device)) {
+    wanted.push_back(jids[i]);
   }
   SDL_free(ids);
   // A device named in the settings that is not there: said once until it comes.
@@ -652,6 +665,45 @@ void WheelInputDriver::RescanLocked() {
                                   [&](const auto& w) { return w->jid == jid; });
     if (!have) {
       OpenLocked(jid);
+    }
+  }
+  // The wheel first (#306): the one wheel_device names, then force feedback, then SDL's wheels.
+  // The first player drives with it and the other devices are read with it.
+  std::vector<bool> ffb(joys.size());
+  for (size_t i = 0; i < jids.size(); i++) {
+    for (const auto& w : wheels_) {
+      ffb[i] = ffb[i] || (w->jid == jids[i] && w->ffb);
+    }
+  }
+  const std::vector<int> order = WheelOrder(joys, wheel_like, ffb, aux, wheel_device);
+  auto rank = [&](SDL_JoystickID jid) {
+    for (size_t k = 0; k < order.size(); k++) {
+      if (jids[order[k]] == jid) {
+        return k;
+      }
+    }
+    return order.size();
+  };
+  std::stable_sort(wheels_.begin(), wheels_.end(),
+                   [&](const auto& a, const auto& b) { return rank(a->jid) < rank(b->jid); });
+  static SDL_JoystickID logged_primary = 0;
+  if (!wheels_.empty() && wheels_[0]->jid != logged_primary) {
+    logged_primary = wheels_[0]->jid;
+    const bool named = WheelDeviceMatch(wheel_device, JoyInfos(&logged_primary, 1)[0]) > 0;
+    if (named || wheels_.size() > 1) {
+      REXLOG_INFO("Wheel: \"{}\" is the wheel (the first player's; {})", wheels_[0]->name,
+                  named              ? "wheel_device"
+                  : wheels_[0]->ffb ? "it has force feedback"
+                                    : "the first of them");
+    }
+  }
+  if (ParseDeviceChoice(wheel_device) == DeviceChoice::kNamed &&
+      std::none_of(joys.begin(), joys.end(),
+                   [&](const JoyInfo& j) { return WheelDeviceMatch(wheel_device, j) > 0; })) {
+    static std::string logged_wheel_missing;
+    if (logged_wheel_missing != wheel_device) {
+      logged_wheel_missing = wheel_device;
+      REXLOG_INFO("Wheel: wheel_device \"{}\" is not connected", wheel_device);
     }
   }
   // The pedal device and the shifter device go with the first wheel; unplugged, the wheel's own
@@ -738,6 +790,8 @@ void WheelInputDriver::OpenLocked(SDL_JoystickID jid) {
     REXLOG_INFO("Wheel:   axis {} rests at {}", a, w->rest[a]);
   }
   SetupForceFeedbackLocked(*w);
+  w->ffb = w->haptic != nullptr || (!REXCVAR_GET(wheel_ffb) && SDL_WasInit(SDL_INIT_HAPTIC) &&
+                                    SDL_IsJoystickHaptic(joy));
   wheels_.push_back(std::move(w));
 }
 
