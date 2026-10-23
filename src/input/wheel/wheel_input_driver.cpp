@@ -35,6 +35,7 @@
 #include <rex/ui/virtual_key.h>
 
 #include "wheel_devices.h"
+#include "wheel_min_force.h"
 #include "wheel_rumble.h"
 
 REXCVAR_DEFINE_STRING(wheel_mode, "auto", "Input",
@@ -145,6 +146,12 @@ REXCVAR_DEFINE_STRING(wheel_shifter_device, "", "Input",
 REXCVAR_DEFINE_STRING(wheel_shifter_device_buttons, "", "Input",
                       "Shifter buttons on the shifter device, e.g. 1=0,2=1,3=2,4=3,5=4,6=5,r=6 or "
                       "up=..,down=.. (empty: a known shifter's layout)");
+REXCVAR_DEFINE_INT32(wheel_ffb_min_strength, 0, "Input",
+                     "Minimum steering force, 0 to 100 percent of the full force: the game's "
+                     "weaker steering forces are scaled up (smoothly, up to 4 times near the "
+                     "centre), stronger ones play as they are, so a light car still has weight "
+                     "(0: off; before wheel_ffb_strength; not the spring, damper or rumble)")
+    .range(0, 100);
 
 namespace rex::input::wheel {
 
@@ -258,6 +265,12 @@ FfStrengths Strengths() {
   s.engine = percent(REXCVAR_GET(wheel_rumble_engine_strength));
   s.road = percent(REXCVAR_GET(wheel_rumble_road_strength));
   return s;
+}
+
+// The game's steering force with wheel_ffb_min_strength (wheel_min_force.h).
+float MinForceLevelOf(const FfEffect& e, uint32_t device_gain, float level) {
+  const float min = std::clamp(REXCVAR_GET(wheel_ffb_min_strength), 0, 100) / 100.0f;
+  return FfMinForceLevel(e, device_gain, level, min);
 }
 
 float Norm(int16_t v) {
@@ -833,8 +846,9 @@ void WheelInputDriver::ApplyGameBlockLocked(Wheel& w, uint32_t block) {
       fx.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
       fx.constant.length = SDL_HAPTIC_INFINITY;
       const float sign = REXCVAR_GET(wheel_ffb_reverse) ? -kConstantToSdl : kConstantToSdl;
-      fx.constant.level =
-          static_cast<Sint16>(std::lround(sign * FfConstantLevel(e, scale) * 32767.0f));
+      fx.constant.level = static_cast<Sint16>(
+          std::lround(sign * MinForceLevelOf(e, game_ff_.device_gain(), FfConstantLevel(e, scale)) *
+                      32767.0f));
       play = game_ff_.Active(block);
     } else if (condition && (f & condition)) {
       const FfCondition c = FfConditionOf(e, scale);
