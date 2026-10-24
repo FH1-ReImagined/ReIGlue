@@ -15,10 +15,15 @@
 
 #include <rex/ui/surface_gnulinux.h>
 
+#include "fh1_minimized_surface.h"
+
 namespace rex {
 namespace ui {
 
 bool XcbWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
+  if (fh1::MinimizedSurfaceEmptyNow().load(std::memory_order_relaxed)) {
+    return false;  // FORZA_TEST_MINIMIZED_SURFACE_EMPTY while minimized (#221)
+  }
   xcb_get_geometry_reply_t* reply =
       xcb_get_geometry_reply(connection_, xcb_get_geometry(connection_, window_), nullptr);
   if (!reply) {
@@ -31,6 +36,9 @@ bool XcbWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) co
 }
 
 bool WaylandSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
+  if (fh1::MinimizedSurfaceEmptyNow().load(std::memory_order_relaxed)) {
+    return false;  // FORZA_TEST_MINIMIZED_SURFACE_EMPTY while minimized (#221)
+  }
   int w = 0, h = 0;
   if (!SDL_GetWindowSizeInPixels(sdl_window_, &w, &h) || w <= 0 || h <= 0) {
     return false;

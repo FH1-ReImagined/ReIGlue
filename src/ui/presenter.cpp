@@ -474,8 +474,14 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
     }
     // Try to recover from the connection becoming outdated in the previous
-    // paint.
-    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+    // paint. A forced paint (the window has been exposed or restored) also
+    // retries a connection that the surface's earlier state didn't allow: a
+    // minimized Win32 window has a 0x0 client area, but SDL reports no size
+    // change for a minimize or a restore, so no resize would ever retry it
+    // (#221: the picture stayed frozen after a restore).
+    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated ||
+        (force_paint && surface_paint_connection_state_ ==
+                            SurfacePaintConnectionState::kUnconnectedRetryAtStateChange)) {
       UpdateSurfacePaintConnectionFromUIThread(nullptr, false);
     }
     // If still paintable or recovered successfully, paint.
@@ -1395,7 +1401,7 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
           surface_height_in_paint_connection_ = surface_height;
-          if (!is_reconnect) {
+          if (!is_reconnect && repaint_needed_out) {
             *repaint_needed_out = true;
           }
           break;

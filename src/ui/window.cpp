@@ -22,6 +22,8 @@
 
 #include <imgui.h>
 
+#include "fh1_minimized_surface.h"
+
 REXCVAR_DEFINE_INT32(window_width, 0, "UI/Window",
                      "Window width in logical pixels (0 = use app default)")
     .range(0, 8192);
@@ -663,6 +665,12 @@ void Window::OnMinimized(WindowDestructionReceiver& destruction_receiver) {
     return;
   }
   REXLOG_INFO("Window minimized");
+  if (fh1::MinimizedSurfaceEmptyTest() && presenter_surface_) {
+    // As on Windows (#221): the surface has no area now, and the presenter
+    // drops its connection.
+    fh1::MinimizedSurfaceEmptyNow().store(true, std::memory_order_relaxed);
+    presenter_->OnSurfaceResizeFromUIThread();
+  }
   UIEvent e(this);
   SendEventToListeners([&e](auto listener) { listener->OnMinimized(e); }, destruction_receiver);
 }
@@ -672,6 +680,15 @@ void Window::OnRestored(WindowDestructionReceiver& destruction_receiver) {
     return;
   }
   REXLOG_INFO("Window restored");
+  fh1::MinimizedSurfaceEmptyNow().store(false, std::memory_order_relaxed);
+  // Paint now, before the listeners, as for a resize. A minimized Win32
+  // window's client area is 0x0, so a present while minimized finds the
+  // swapchain outdated and the reconnection finds no area; SDL reports no size
+  // change for a minimize or a restore, so only a forced paint reconnects
+  // (#221: the picture stayed frozen while the game ran on).
+  if (presenter_surface_) {
+    OnPaint(true);
+  }
   UIEvent e(this);
   SendEventToListeners([&e](auto listener) { listener->OnRestored(e); }, destruction_receiver);
 }
