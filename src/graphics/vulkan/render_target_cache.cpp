@@ -1065,6 +1065,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
     dfn.vkDestroyFramebuffer(device, framebuffer_pair.second.framebuffer, nullptr);
   }
   framebuffers_.clear();
+  fh1_frame_cost::GetSizes().framebuffers.store(int64_t(framebuffers_.size()), std::memory_order_relaxed);
 
   last_update_render_pass_ = VK_NULL_HANDLE;
   for (const auto& render_pass_pair : render_passes_) {
@@ -1112,6 +1113,7 @@ void VulkanRenderTargetCache::ClearCache() {
     dfn.vkDestroyFramebuffer(device, framebuffer_pair.second.framebuffer, nullptr);
   }
   framebuffers_.clear();
+  fh1_frame_cost::GetSizes().framebuffers.store(int64_t(framebuffers_.size()), std::memory_order_relaxed);
 
   last_update_render_pass_ = VK_NULL_HANDLE;
   for (const auto& render_pass_pair : render_passes_) {
@@ -1134,6 +1136,7 @@ void VulkanRenderTargetCache::TrimRenderTargets() {
     dfn.vkDestroyFramebuffer(device, framebuffer_pair.second.framebuffer, nullptr);
   }
   framebuffers_.clear();
+  fh1_frame_cost::GetSizes().framebuffers.store(int64_t(framebuffers_.size()), std::memory_order_relaxed);
   ResetAccumulatedRenderTargets();
   RenderTargetCache::ClearCache();
 }
@@ -2353,10 +2356,13 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
     return nullptr;
   }
   // Creates at a persistent location - safe to use pointers.
-  return &framebuffers_
-              .emplace(std::piecewise_construct, std::forward_as_tuple(key),
-                       std::forward_as_tuple(framebuffer, host_extent))
-              .first->second;
+  Framebuffer* result = &framebuffers_
+                             .emplace(std::piecewise_construct, std::forward_as_tuple(key),
+                                      std::forward_as_tuple(framebuffer, host_extent))
+                             .first->second;
+  // FH1 (#45): the minute summary's count (fh1_frame_cost.h).
+  fh1_frame_cost::GetSizes().framebuffers.store(int64_t(framebuffers_.size()), std::memory_order_relaxed);
+  return result;
 }
 
 VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key) {

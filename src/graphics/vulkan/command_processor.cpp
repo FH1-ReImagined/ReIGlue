@@ -42,6 +42,12 @@
 #include "fh1_render_target_trim.h"
 #include <rex/platform.h>
 #include "../fh1_frame_cost.h"
+#if REX_PLATFORM_MAC
+#include <mach/mach.h>
+#endif
+#if REX_PLATFORM_LINUX
+#include <unistd.h>
+#endif
 #include "fh1_readback_history.h"
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
@@ -804,11 +810,103 @@ double ThreadCpuMs() {
 #endif
 }
 
+// FH1 (#45): the process's resident memory, in bytes (0 where not known: Windows).
+uint64_t ProcessResidentBytes() {
+#if REX_PLATFORM_LINUX
+  std::FILE* statm = std::fopen("/proc/self/statm", "r");
+  if (!statm) return 0;
+  unsigned long long pages_total = 0, pages_resident = 0;
+  const int read = std::fscanf(statm, "%llu %llu", &pages_total, &pages_resident);
+  std::fclose(statm);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  return read == 2 && page_size > 0 ? uint64_t(pages_resident) * uint64_t(page_size) : 0;
+#elif REX_PLATFORM_MAC
+  mach_task_basic_info_data_t info = {};
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info),
+                &count) != KERN_SUCCESS) {
+    return 0;
+  }
+  return uint64_t(info.resident_size);
+#else
+  return 0;
+#endif
+}
+
+// FH1 (#45): clocks, temperature and power for the minute summary (Linux sysfs; 0 elsewhere or
+// when not found): the fastest CPU's clock (cpufreq), and the GPU's shader clock, temperature
+// and power from the hwmon of the DRM card with the Vulkan device's PCI ids (amdgpu: sclk, edge,
+// PPT; on an APU such as the Steam Deck's the power is the whole chip's).
+#if REX_PLATFORM_LINUX
+bool ReadSysfsNumber(const std::string& path, double* value) {
+  std::FILE* file = std::fopen(path.c_str(), "r");
+  if (!file) return false;
+  char text[64] = {};
+  const bool read = std::fgets(text, sizeof(text), file) != nullptr;
+  std::fclose(file);
+  if (!read) return false;
+  // Decimal, or 0x... (the PCI ids): strtod reads both.
+  char* end = nullptr;
+  const double number = std::strtod(text, &end);
+  if (end == text) return false;
+  *value = number;
+  return true;
+}
+#endif
+
+void ReadSensors(uint32_t vendor_id, uint32_t device_id, fh1_frame_cost::Snapshot& snapshot) {
+#if REX_PLATFORM_LINUX
+  double khz_max = 0;
+  for (uint32_t cpu = 0; cpu < 1024; ++cpu) {
+    double khz = 0;
+    if (!ReadSysfsNumber("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                             "/cpufreq/scaling_cur_freq",
+                         &khz)) {
+      if (cpu >= 64) break;
+      continue;
+    }
+    khz_max = std::max(khz_max, khz);
+  }
+  snapshot.cpu_ghz = khz_max / 1.0e6;
+  static std::string hwmon;
+  static bool searched = false;
+  if (!searched) {
+    searched = true;
+    for (uint32_t card = 0; card < 16 && hwmon.empty(); ++card) {
+      const std::string device = "/sys/class/drm/card" + std::to_string(card) + "/device/";
+      double vendor = 0, id = 0;
+      if (!ReadSysfsNumber(device + "vendor", &vendor) || !ReadSysfsNumber(device + "device", &id) ||
+          uint32_t(vendor) != vendor_id || uint32_t(id) != device_id) {
+        continue;
+      }
+      std::error_code error;
+      for (const auto& entry : std::filesystem::directory_iterator(device + "hwmon", error)) {
+        hwmon = entry.path().string() + "/";
+        break;
+      }
+    }
+  }
+  if (hwmon.empty()) return;
+  double value = 0;
+  if (ReadSysfsNumber(hwmon + "freq1_input", &value)) snapshot.gpu_ghz = value / 1.0e9;
+  if (ReadSysfsNumber(hwmon + "temp1_input", &value)) snapshot.gpu_celsius = value / 1000.0;
+  if (ReadSysfsNumber(hwmon + "power1_average", &value) ||
+      ReadSysfsNumber(hwmon + "power1_input", &value)) {
+    snapshot.gpu_watts = value / 1.0e6;
+  }
+#else
+  (void)vendor_id;
+  (void)device_id;
+  (void)snapshot;
+#endif
+}
+
 struct FrameCostState {
   bool started = false;
   std::chrono::steady_clock::time_point start, last;
   double last_cpu_ms = 0;
   fh1_frame_cost::Report report;
+  fh1_frame_cost::Summary summary;
   std::FILE* csv = nullptr;
   bool csv_tried = false;
 };
@@ -826,9 +924,11 @@ fh1_readback_history::History& GetReadbackHistory() {
 }
 
 // FH1 (#45): closes the frame's cost counters (fh1_frame_cost.h); a line in the log when
-// frames were much slower than usual, every frame to fh1_frame_cost_csv.
+// frames were much slower than usual, every frame to fh1_frame_cost_csv, and once a minute a
+// summary of the minute's frames and what the caches hold (fill_snapshot completes it).
+template <typename FillSnapshot>
 void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
-                     uint32_t render_target_count) {
+                     uint32_t render_target_count, FillSnapshot&& fill_snapshot) {
   FrameCostState& state = GetFrameCostState();
   fh1_frame_cost::Frame& frame = fh1_frame_cost::Current();
   const auto now = std::chrono::steady_clock::now();
@@ -837,6 +937,9 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
     state.started = true;
     state.start = state.last = now;
     state.last_cpu_ms = cpu_ms;
+    const fh1_frame_cost::Sizes& sizes = fh1_frame_cost::GetSizes();
+    state.summary.SetStart(sizes.watch_nodes_visited.load(std::memory_order_relaxed),
+                           sizes.watch_fires.load(std::memory_order_relaxed));
     frame = fh1_frame_cost::Frame();
     return;
   }
@@ -886,6 +989,25 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
   if (state.report.OnFrame(frame, t)) {
     REXGPU_WARN("{}", state.report.Line(t));
     state.report.Taken();
+  }
+  if (state.summary.OnFrame(frame, t)) {
+    fh1_frame_cost::Snapshot snapshot;
+    const fh1_frame_cost::Sizes& sizes = fh1_frame_cost::GetSizes();
+    snapshot.textures = sizes.textures.load(std::memory_order_relaxed);
+    snapshot.texture_bytes = fh1_frame_cost::TextureBytes();
+    snapshot.render_targets = render_target_count;
+    snapshot.render_target_bytes = render_target_bytes;
+    snapshot.shaders = sizes.shaders.load(std::memory_order_relaxed);
+    snapshot.pipelines = sizes.pipelines.load(std::memory_order_relaxed);
+    snapshot.framebuffers = sizes.framebuffers.load(std::memory_order_relaxed);
+    snapshot.watch_ranges = sizes.watch_ranges.load(std::memory_order_relaxed);
+    snapshot.watch_nodes = sizes.watch_nodes.load(std::memory_order_relaxed);
+    snapshot.watch_nodes_visited = sizes.watch_nodes_visited.load(std::memory_order_relaxed);
+    snapshot.watch_fires = sizes.watch_fires.load(std::memory_order_relaxed);
+    snapshot.readback_keys = uint32_t(GetReadbackHistory().size());
+    snapshot.process_resident_bytes = ProcessResidentBytes();
+    fill_snapshot(snapshot);
+    REXGPU_INFO("{}", state.summary.Line(t, snapshot));
   }
   frame = fh1_frame_cost::Frame();
 }
@@ -7292,9 +7414,39 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     if (!cache_clear_requested_) {
       TrimRenderTargetsIfNeeded();
     }
-    Fh1EndFrameCost(frame_current_,
-                    render_target_cache_ ? render_target_cache_->render_target_memory_bytes() : 0,
-                    render_target_cache_ ? render_target_cache_->render_target_count() : 0);
+    Fh1EndFrameCost(
+        frame_current_,
+        render_target_cache_ ? render_target_cache_->render_target_memory_bytes() : 0,
+        render_target_cache_ ? render_target_cache_->render_target_count() : 0,
+        [this](fh1_frame_cost::Snapshot& snapshot) {
+          for (const auto* buffers : {&readback_buffers_, &memexport_readback_buffers_}) {
+            for (const auto& entry : *buffers) {
+              ++snapshot.readback_buffers;
+              snapshot.readback_buffer_bytes +=
+                  uint64_t(entry.second.sizes[0]) + uint64_t(entry.second.sizes[1]);
+            }
+          }
+          if (memory_) {
+            for (uint32_t base : {UINT32_C(0x00000000), UINT32_C(0x40000000),
+                                  UINT32_C(0x80000000), UINT32_C(0x90000000)}) {
+              if (const memory::BaseHeap* heap = memory_->LookupHeap(base)) {
+                snapshot.guest_virtual_bytes +=
+                    uint64_t(heap->reserved_page_count()) * heap->page_size();
+              }
+            }
+            if (const memory::VirtualHeap* physical = memory_->GetPhysicalHeap()) {
+              snapshot.guest_physical_bytes =
+                  uint64_t(physical->reserved_page_count()) * physical->page_size();
+            }
+          }
+          const fh1_device_memory::State::Budget budget = fh1_device_memory::Get().Query();
+          snapshot.device_local_usage = budget.usage;
+          snapshot.device_local_budget = budget.budget;
+          snapshot.system_usage = budget.system_usage;
+          const ui::vulkan::VulkanDevice::Properties& properties =
+              GetVulkanDevice()->properties();
+          ReadSensors(properties.vendorID, properties.deviceID, snapshot);
+        });
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
 

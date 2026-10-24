@@ -984,10 +984,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       continue;
     }
     auto& pipeline = *pipelines_.emplace(pipeline_description, Pipeline()).first;
+    // FH1 (#45): the minute summary's counts (fh1_frame_cost.h).
+    fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
     PipelineCreationArguments creation_arguments;
     if (!TryGetPipelineCreationArgumentsForDescription(pipeline_description, &pipeline,
                                                        creation_arguments)) {
       pipelines_.erase(pipeline_description);
+      fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
       continue;
     }
     uint32_t bound_rts = 0;
@@ -1325,6 +1328,7 @@ void VulkanPipelineCache::Shutdown() {
     }
   }
   pipelines_.clear();
+  fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
 
   // Destroy all internal shaders.
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
@@ -1363,6 +1367,7 @@ void VulkanPipelineCache::Shutdown() {
     delete it.second;
   }
   shaders_.clear();
+  fh1_frame_cost::GetSizes().shaders.store(int64_t(shaders_.size()), std::memory_order_relaxed);
   loaded_shader_generation.fetch_add(1, std::memory_order_relaxed);
   shader_storage_index_ = 0;
   texture_binding_layout_map_.clear();
@@ -1398,6 +1403,8 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
   VulkanShader* shader = new VulkanShader(command_processor_.GetVulkanDevice(), shader_type,
                                           data_hash, host_address, dword_count);
   shaders_.emplace(data_hash, shader);
+  // FH1 (#45): the minute summary's counts (fh1_frame_cost.h).
+  fh1_frame_cost::GetSizes().shaders.store(int64_t(shaders_.size()), std::memory_order_relaxed);
   return shader;
 }
 
@@ -1408,6 +1415,7 @@ VulkanShader* VulkanPipelineCache::LoadShaderForDraw(const Shader& source) {
   auto* shader = new VulkanShader(command_processor_.GetVulkanDevice(), source.type(),
       hash, source.ucode_dwords(), source.ucode_dword_count(), std::endian::native);
   shaders_.emplace(hash, shader);
+  fh1_frame_cost::GetSizes().shaders.store(int64_t(shaders_.size()), std::memory_order_relaxed);
   return shader;
 }
 
@@ -1673,10 +1681,12 @@ bool VulkanPipelineCache::ConfigurePipeline(
   fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().pipeline_ms);
   ++fh1_frame_cost::Current().pipelines;
   auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
+  fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
   PipelineCreationArguments creation_arguments_real;
   if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
                                                      creation_arguments_real)) {
     pipelines_.erase(description);
+    fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
     return false;
   }
 
@@ -1702,6 +1712,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
 
   if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
     pipelines_.erase(description);
+    fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
     return false;
   }
   if (!queued_async_creation) {

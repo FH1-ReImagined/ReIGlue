@@ -20,6 +20,8 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 
+#include "fh1_frame_cost.h"
+
 namespace rex::graphics {
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
@@ -215,6 +217,10 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
     watch_buckets_[i] = node;
   }
 
+  // FH1 (#45): the minute summary's counts (fh1_frame_cost.h).
+  fh1_frame_cost::Sizes& sizes = fh1_frame_cost::GetSizes();
+  fh1_frame_cost::Count(sizes.watch_ranges, 1);
+  fh1_frame_cost::Count(sizes.watch_nodes, int64_t(bucket_last - bucket_first + 1));
   return reinterpret_cast<WatchHandle>(range);
 }
 
@@ -238,9 +244,11 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
   }
 
   // Fire per-range watches.
+  uint64_t nodes_visited = 0;
   for (uint32_t i = bucket_first; i <= bucket_last; ++i) {
     WatchNode* node = watch_buckets_[i];
     while (node != nullptr) {
+      ++nodes_visited;
       WatchRange* range = node->range;
       // Store the next node now since when the callback is triggered, the links
       // will be broken.
@@ -252,6 +260,10 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
       }
     }
   }
+  // FH1 (#45): how much watch list each write to guest memory walks (fh1_frame_cost.h).
+  fh1_frame_cost::Sizes& sizes = fh1_frame_cost::GetSizes();
+  sizes.watch_nodes_visited.fetch_add(nodes_visited, std::memory_order_relaxed);
+  sizes.watch_fires.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
@@ -318,7 +330,9 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   uint32_t bucket = range->page_first << page_size_log2_ >> kWatchBucketSizeLog2;
   WatchNode* node = range->node_first;
+  int64_t nodes = 0;
   while (node != nullptr) {
+    ++nodes;
     WatchNode* node_next = node->range_node_next;
     if (node->bucket_node_previous != nullptr) {
       node->bucket_node_previous->bucket_node_next = node->bucket_node_next;
@@ -333,6 +347,9 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
     node = node_next;
     ++bucket;
   }
+  fh1_frame_cost::Sizes& sizes = fh1_frame_cost::GetSizes();
+  fh1_frame_cost::Count(sizes.watch_ranges, -1);
+  fh1_frame_cost::Count(sizes.watch_nodes, -nodes);
   range->next_free = watch_range_first_free_;
   watch_range_first_free_ = range;
 }

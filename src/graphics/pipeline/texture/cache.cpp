@@ -672,6 +672,8 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
       used_previous_(track_usage ? texture_cache.texture_used_last_ : nullptr),
       used_next_(nullptr),
       in_usage_list_(track_usage) {
+  // FH1 (#45): the texture count of the minute summary (fh1_frame_cost.h).
+  fh1_frame_cost::Count(fh1_frame_cost::GetSizes().textures, 1);
   if (track_usage) {
     if (texture_cache.texture_used_last_) {
       texture_cache.texture_used_last_->used_next_ = this;
@@ -690,6 +692,7 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
 }
 
 TextureCache::Texture::~Texture() {
+  fh1_frame_cost::Count(fh1_frame_cost::GetSizes().textures, -1);
   if (mips_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
   }

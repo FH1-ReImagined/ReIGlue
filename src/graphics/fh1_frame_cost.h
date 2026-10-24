@@ -11,10 +11,12 @@
 // to a Report, which collects the slow frames and makes at most one log line every 10 s.
 // Free of Vulkan and the runtime, so tools/test_frame_cost.cpp can test it.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace rex::graphics::fh1_frame_cost {
 
@@ -292,6 +294,178 @@ class Report {
   uint32_t slow_count_ = 0;
   double worst_ms_ = 0;
   Frame slow_;
+  uint32_t lines_ = 0;
+};
+
+// FH1 (#45): what the GPU emulation holds, for a once-a-minute summary in the log. Steam Deck
+// players see the frame rate fall after 10-30 minutes of play; with these sizes and the minute's
+// frame costs side by side, a long session's log shows whether something grew and the frame
+// cost with it. Kept by the caches themselves, on whichever thread changes them (relaxed
+// atomics, changed only when an object is made or destroyed).
+struct Sizes {
+  std::atomic<int64_t> textures{0};      // texture cache entries
+  std::atomic<int64_t> shaders{0};       // guest shaders known to the pipeline cache
+  std::atomic<int64_t> pipelines{0};     // graphics pipeline descriptions (made or placeholder)
+  std::atomic<int64_t> framebuffers{0};  // render target framebuffers
+  std::atomic<int64_t> watch_ranges{0};  // shared memory ranges watched for CPU or GPU writes
+  std::atomic<int64_t> watch_nodes{0};   // their bucket nodes
+  // Watch nodes looked at by writes to guest memory (CPU write faults, resolves) and those
+  // writes, since the start.
+  std::atomic<uint64_t> watch_nodes_visited{0};
+  std::atomic<uint64_t> watch_fires{0};
+};
+
+inline Sizes& GetSizes() {
+  static Sizes sizes;
+  return sizes;
+}
+
+inline void Count(std::atomic<int64_t>& counter, int64_t delta) {
+  counter.fetch_add(delta, std::memory_order_relaxed);
+}
+
+// Everything else the summary reports, gathered when a line is due.
+struct Snapshot {
+  int64_t textures = 0;
+  uint64_t texture_bytes = 0;
+  uint32_t render_targets = 0;
+  uint64_t render_target_bytes = 0;
+  int64_t shaders = 0;
+  int64_t pipelines = 0;
+  int64_t framebuffers = 0;
+  int64_t watch_ranges = 0;
+  int64_t watch_nodes = 0;
+  uint64_t watch_nodes_visited = 0;  // since the start
+  uint64_t watch_fires = 0;          // since the start
+  uint32_t readback_buffers = 0;
+  uint64_t readback_buffer_bytes = 0;
+  uint32_t readback_keys = 0;
+  uint64_t guest_virtual_bytes = 0;   // reserved in the virtual heaps
+  uint64_t guest_physical_bytes = 0;  // reserved physical memory
+  uint64_t device_local_usage = 0;    // 0 when the driver does not tell
+  uint64_t device_local_budget = 0;
+  uint64_t system_usage = 0;  // the GPU's use of system memory (GTT)
+  uint64_t process_resident_bytes = 0;  // 0 where unknown
+  // Clocks, temperature and power (0 where unknown): a hotter, slower device and more work look
+  // the same in the frame rate.
+  double cpu_ghz = 0;      // the fastest CPU's clock now
+  double gpu_ghz = 0;      // the GPU's shader clock now
+  double gpu_celsius = 0;  // its temperature
+  double gpu_watts = 0;    // its power (on an APU, the whole chip's)
+};
+
+// One line a minute (the first a minute after the first frame): the minute's frame rate, its
+// frame costs on average, and the sizes now.
+class Summary {
+ public:
+  static constexpr double kIntervalSeconds = 60.0;
+
+  // Every frame end; true when a line is due (Line()).
+  bool OnFrame(const Frame& f, double now_seconds) {
+    if (!started_) {
+      started_ = true;
+      window_start_ = now_seconds;
+    }
+    ++frames_;
+    sum_.Add(f);
+    frame_ms_.push_back(float(f.ms));
+    return now_seconds - window_start_ >= kIntervalSeconds;
+  }
+
+  // The line for the minute that ends now; starts the next one.
+  std::string Line(double now_seconds, const Snapshot& s) {
+    const double seconds = std::max(now_seconds - window_start_, 1e-3);
+    const double n = frames_ ? double(frames_) : 1.0;
+    // 1% low: the frame rate of the slowest 1% of the frames (as RECOMP_PERF's low1).
+    double low1_fps = 0, worst_ms = 0;
+    if (!frame_ms_.empty()) {
+      const size_t slowest = std::max<size_t>(1, frame_ms_.size() / 100);
+      std::nth_element(frame_ms_.begin(), frame_ms_.begin() + (slowest - 1), frame_ms_.end(),
+                       [](float a, float b) { return a > b; });
+      double total = 0;
+      for (size_t i = 0; i < slowest; ++i) {
+        total += frame_ms_[i];
+        worst_ms = std::max(worst_ms, double(frame_ms_[i]));
+      }
+      low1_fps = total > 0 ? 1000.0 * double(slowest) / total : 0;
+    }
+    const uint64_t visited = s.watch_nodes_visited - watch_nodes_visited_;
+    const uint64_t fires = s.watch_fires - watch_fires_;
+    char memory[128] = "";
+    if (s.device_local_budget) {
+      std::snprintf(memory, sizeof(memory), ", GPU memory %.0f of %.0f MB device-local, %.0f MB system",
+                    Mb(s.device_local_usage), Mb(s.device_local_budget), Mb(s.system_usage));
+    }
+    char process[64] = "";
+    if (s.process_resident_bytes) {
+      std::snprintf(process, sizeof(process), ", process %.0f MB resident",
+                    Mb(s.process_resident_bytes));
+    }
+    char sensors[128] = "";
+    if (s.cpu_ghz > 0 || s.gpu_ghz > 0) {
+      int used = std::snprintf(sensors, sizeof(sensors), "; clocks:");
+      if (s.cpu_ghz > 0 && used > 0 && size_t(used) < sizeof(sensors)) {
+        used += std::snprintf(sensors + used, sizeof(sensors) - used, " CPU up to %.2f GHz",
+                              s.cpu_ghz);
+      }
+      if (s.gpu_ghz > 0 && used > 0 && size_t(used) < sizeof(sensors)) {
+        used += std::snprintf(sensors + used, sizeof(sensors) - used, "%s GPU %.2f GHz",
+                              s.cpu_ghz > 0 ? "," : "", s.gpu_ghz);
+        if (s.gpu_celsius > 0 && used > 0 && size_t(used) < sizeof(sensors)) {
+          used += std::snprintf(sensors + used, sizeof(sensors) - used, " %.0f C", s.gpu_celsius);
+        }
+        if (s.gpu_watts > 0 && used > 0 && size_t(used) < sizeof(sensors)) {
+          std::snprintf(sensors + used, sizeof(sensors) - used, " %.1f W", s.gpu_watts);
+        }
+      }
+    }
+    char text[1536];
+    std::snprintf(
+        text, sizeof(text),
+        "GPU minute %u: %.1f fps (1%% low %.1f, worst %.0f ms); a frame: command processor %.1f "
+        "ms CPU (%.2f us a draw), %.1f ms GPU waits, %.1f ms game waits, %.0f draws, %.2f MB "
+        "uploads, %.1f "
+        "resolve readbacks, %.0f memory watch nodes checked (%.1f writes); a second: %.1f "
+        "textures new, %.1f loaded, %.1f evicted, %.1f pipelines new; now: textures %lld (%.0f "
+        "MB), render targets %u (%.0f MB), shaders %lld, pipelines %lld, framebuffers %lld, "
+        "memory watches %lld (%lld nodes), readback buffers %u (%.0f MB, %u keys), guest memory "
+        "%.0f MB virtual + %.0f MB physical%s%s%s",
+        ++lines_, double(frames_) / seconds, low1_fps, worst_ms, sum_.cpu_ms / n,
+        sum_.draws ? 1000.0 * sum_.cpu_ms / double(sum_.draws) : 0.0, sum_.gpu_wait_ms / n, sum_.guest_wait_ms / n, double(sum_.draws) / n,
+        Mb(sum_.upload_bytes) / n, double(sum_.readbacks) / n, double(visited) / n,
+        double(fires) / n, double(sum_.textures_created) / seconds,
+        double(sum_.texture_loads) / seconds, double(sum_.textures_evicted) / seconds,
+        double(sum_.pipelines) / seconds, (long long)s.textures, Mb(s.texture_bytes),
+        s.render_targets, Mb(s.render_target_bytes), (long long)s.shaders,
+        (long long)s.pipelines, (long long)s.framebuffers, (long long)s.watch_ranges,
+        (long long)s.watch_nodes, s.readback_buffers, Mb(s.readback_buffer_bytes),
+        s.readback_keys, Mb(s.guest_virtual_bytes), Mb(s.guest_physical_bytes), memory, process,
+        sensors);
+    window_start_ = now_seconds;
+    frames_ = 0;
+    sum_ = Frame();
+    frame_ms_.clear();
+    watch_nodes_visited_ = s.watch_nodes_visited;
+    watch_fires_ = s.watch_fires;
+    return text;
+  }
+
+  // The counters since the start, at the start (so the first minute counts only its own).
+  void SetStart(uint64_t watch_nodes_visited, uint64_t watch_fires) {
+    watch_nodes_visited_ = watch_nodes_visited;
+    watch_fires_ = watch_fires;
+  }
+
+ private:
+  static double Mb(uint64_t bytes) { return double(bytes) / (1024.0 * 1024.0); }
+
+  bool started_ = false;
+  double window_start_ = 0;
+  uint32_t frames_ = 0;
+  Frame sum_;
+  std::vector<float> frame_ms_;
+  uint64_t watch_nodes_visited_ = 0;
+  uint64_t watch_fires_ = 0;
   uint32_t lines_ = 0;
 };
 
