@@ -25,6 +25,8 @@ set(REXGPU_XENOS_SOURCES
     pipeline/render_target/cache.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
+    pipeline/texture/pack.cpp
+    pipeline/texture/pack_format.cpp
     pipeline/shader/interpreter.cpp
     pipeline/shader/translator.cpp
     pipeline/shader/translator_disasm.cpp
@@ -157,6 +159,7 @@ rexglue_add_version_resource(rexgpu-xenos DESCRIPTION "ReXGlue Xenos GPU emulati
 
 target_include_directories(rexgpu-xenos PRIVATE
     ${REXGLUE_ROOT}/thirdparty/renderdoc
+    ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h: texture pack PNG files (pack.cpp)
     ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
 )
 

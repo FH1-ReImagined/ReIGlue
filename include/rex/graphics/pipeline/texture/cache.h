@@ -28,6 +28,10 @@
 
 namespace rex::graphics {
 
+namespace texture_pack {
+class Packs;
+}  // namespace texture_pack
+
 // Manages host copies of guest textures, performing untiling, format and endian
 // conversion of textures stored in the shared memory, and also handling
 // invalidation.
@@ -251,6 +255,18 @@ class TextureCache {
 
     void LogAction(const char* action) const;
 
+    // FH1 (#384): texture packs (command processor thread).
+    struct PackState {
+      uint64_t fingerprint = 0;  // of the loaded picture, 0 if not fingerprinted
+      uint64_t replacement = 0;  // the fingerprint when the pack has a file for it, else 0
+      uint64_t last_load_ms = 0;
+      uint8_t quick_reloads = 0;
+      bool classified = false;
+      bool skipped = false;  // never fingerprinted (its kind, or rewritten as the game runs)
+    };
+    PackState& pack_state() { return pack_state_; }
+    const PackState& pack_state() const { return pack_state_; }
+
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
     explicit Texture(TextureCache& texture_cache, const TextureKey& key, bool track_usage = true);
@@ -286,6 +302,8 @@ class TextureCache {
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+
+    PackState pack_state_;
   };
 
   // Rules of data access in load shaders:
@@ -560,6 +578,13 @@ class TextureCache {
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
 
+  // FH1 (#384): texture packs (texture_pack/pack.h); nullptr when off. A backend that draws
+  // replacements is told when a loaded texture has one, and uploads them at frame starts.
+  texture_pack::Packs* texture_packs() const { return packs_; }
+  virtual bool SupportsTexturePackReplacement() const { return false; }
+  virtual void OnTexturePackReplacement(Texture& /*texture*/) {}
+  virtual void TexturePackBeginFrame() {}
+
  private:
   struct PendingTextureLoad {
     Texture* texture = nullptr;
@@ -622,6 +647,12 @@ class TextureCache {
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
+
+  // FH1 (#384): texture packs. packs_state_: -1 not looked up yet, 0 off, 1 on.
+  void ResolveTexturePacks();
+  void TexturePackOnLoad(Texture& texture, bool base_loaded);
+  texture_pack::Packs* packs_ = nullptr;
+  int8_t packs_state_ = -1;
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;

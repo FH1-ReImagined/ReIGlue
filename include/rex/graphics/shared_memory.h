@@ -82,6 +82,12 @@ class SharedMemory {
   // memory copy. Hold the global critical region if relying on this for state
   // transitions such as watch installation.
   bool IsRangeValid(uint32_t start, uint32_t length) const;
+  // FH1 (#384, texture packs): whether a page of the range holds data the GPU wrote
+  // (resolves) that the CPU has not overwritten since, and the guest data itself (big-endian).
+  bool IsRangeGpuWritten(uint32_t start, uint32_t length);
+  const uint8_t* GuestData(uint32_t start) const {
+    return memory_.TranslatePhysical<const uint8_t*>(start);
+  }
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception

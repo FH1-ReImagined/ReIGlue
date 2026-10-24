@@ -12,6 +12,7 @@
 #include "../../fh1_frame_cost.h"
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <utility>
 
@@ -22,6 +23,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/pack.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
@@ -235,6 +237,7 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
 }
 
 TextureCache::~TextureCache() {
+  if (packs_) packs_->LogSummary(true);
   DestroyAllTextures(true);
 
   if (scaled_resolve_global_watch_handle_) {
@@ -331,6 +334,12 @@ void TextureCache::BeginFrame() {
   // sure bindings are reset so a new attempt will surely be made if the texture
   // is requested again.
   ResetTextureBindings();
+  // FH1 (#384): replacements decoded since the last frame (bindings take them from now on).
+  if (packs_state_ < 0) ResolveTexturePacks();
+  if (packs_) {
+    TexturePackBeginFrame();
+    packs_->LogSummary(false);
+  }
 }
 
 void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
@@ -465,8 +474,125 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     return false;
   }
   texture.LogAction("Loaded");
+  if (packs_state_) TexturePackOnLoad(texture, pending_load.load_base);
 
   return true;
+}
+
+void TextureCache::ResolveTexturePacks() {
+  packs_ = texture_pack::Packs::Get();
+  packs_state_ = packs_ ? 1 : 0;
+  if (packs_ && packs_->replacing() && !SupportsTexturePackReplacement()) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXGPU_WARN("Texture packs: replacing textures needs the Vulkan renderer; only dumping");
+    }
+  }
+}
+
+// FH1 (#384): fingerprints a texture whose data was just loaded, queues its dump and looks up
+// its replacement. Runs on loads only (creation, or a reload after the game wrote the memory),
+// never per draw.
+void TextureCache::TexturePackOnLoad(Texture& texture, bool base_loaded) {
+  if (packs_state_ < 0) ResolveTexturePacks();
+  if (!packs_) return;
+  Texture::PackState& state = texture.pack_state();
+  if (state.skipped) return;
+  using texture_pack::Skip;
+  // Counts the whole call's time, on every return.
+  struct Timing {
+    texture_pack::Packs* packs;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    uint64_t hash_ns = 0, hashed = 0;
+    ~Timing() {
+      packs->CountLoad(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count()),
+                       hash_ns, hashed);
+    }
+  } timing{packs_};
+  const TextureKey key = texture.key();
+  const uint32_t base_start = key.base_page << 12;
+  const uint32_t base_size = texture.GetGuestBaseSize();
+  if (!state.classified) {
+    // What the texture is never changes: decided at its first load.
+    state.classified = true;
+    Skip skip = Skip::kCount;
+    if (key.scaled_resolve || key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.depth_or_array_size_minus_1) {
+      skip = Skip::kShape;
+    } else if (!key.base_page) {
+      skip = Skip::kNoBase;
+    } else if (texture_pack::IsScreenSized(key.GetWidth(), key.GetHeight())) {
+      skip = Skip::kScreen;
+    } else if (texture_pack::GuestFormatFile(key.format) == texture_pack::Format::kNone) {
+      // Counted as GPU-written when it is (render targets), so the summary's formats are art.
+      skip = shared_memory().IsRangeGpuWritten(base_start, base_size) ? Skip::kGpuWritten
+                                                                        : Skip::kFormat;
+    } else if (key.GetWidth() < 8 && key.GetHeight() < 8) {
+      skip = Skip::kTiny;
+    }
+    if (skip != Skip::kCount) {
+      state.skipped = true;
+      packs_->CountSkip(skip, key.format);
+      return;
+    }
+  }
+  // Reloaded three times, each within a second of the last: the game writes it as it runs (a
+  // video, a gauge, a render target read back); streaming reuses memory far less often.
+  const uint64_t now = current_submission_time_;
+  if (state.last_load_ms && now - state.last_load_ms < 1000) {
+    if (++state.quick_reloads >= 3) {
+      state.skipped = true;
+      state.fingerprint = 0;
+      state.replacement = 0;
+      packs_->CountSkip(Skip::kDynamic, key.format);
+      return;
+    }
+  } else {
+    state.quick_reloads = 0;
+  }
+  state.last_load_ms = now;
+  if (!base_loaded && state.fingerprint) {
+    return;  // only the mips changed: the picture's fingerprint stays
+  }
+  if (shared_memory().IsRangeGpuWritten(base_start, base_size)) {
+    state.fingerprint = 0;
+    state.replacement = 0;
+    packs_->CountSkip(Skip::kGpuWritten, key.format);
+  } else {
+    texture_pack::GuestTexture guest;
+    guest.format = key.format;
+    guest.endianness = key.endianness;
+    guest.width = key.GetWidth();
+    guest.height = key.GetHeight();
+    guest.pitch = key.pitch;
+    guest.mip_levels = key.mip_max_level + 1;
+    guest.tiled = key.tiled;
+    guest.packed_mips = key.packed_mips;
+    const uint8_t* base = shared_memory().GuestData(base_start);
+    const auto hash_start = std::chrono::steady_clock::now();
+    state.fingerprint = packs_->Fingerprint(guest, texture.guest_layout(), base, base_size);
+    timing.hash_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - hash_start)
+                                  .count());
+    timing.hashed = base_size;
+    if (packs_->dumping()) {
+      const bool has_mips = key.mip_page && key.mip_max_level && texture.GetGuestMipsSize();
+      packs_->Dump(state.fingerprint, guest, texture.guest_layout(), base, base_size,
+                   has_mips ? shared_memory().GuestData(key.mip_page << 12) : nullptr,
+                   has_mips ? texture.GetGuestMipsSize() : 0);
+    }
+    state.replacement = packs_->replacing() && SupportsTexturePackReplacement() &&
+                                packs_->HasReplacement(state.fingerprint)
+                            ? state.fingerprint
+                            : 0;
+    if (state.replacement) {
+      packs_->CountReplacementUsed(state.replacement);
+      OnTexturePackReplacement(texture);
+    }
+  }
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {

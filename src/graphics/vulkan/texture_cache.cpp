@@ -534,6 +534,8 @@ VulkanTextureCache::~VulkanTextureCache() {
     dfn.vkDestroyPipelineLayout(device, load_pipeline_layout_, nullptr);
   }
 
+  DestroyTexturePackReplacements();
+
   // Textures memory is allocated using the Vulkan Memory Allocator, destroy all
   // textures before destroying VMA.
   DestroyAllTextures(true);
@@ -2082,8 +2084,11 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
     if (IsSignedVersionSeparateForFormat(binding->key)) {
       if (binding->texture && uses_unsigned &&
           host_format_pair.format_unsigned.format != VK_FORMAT_UNDEFINED) {
+        VkImageView pack_view = GetTexturePackView(*binding->texture, binding->host_swizzle);
         vulkan_binding.image_view_unsigned =
-            static_cast<VulkanTexture*>(binding->texture)->GetView(false, binding->host_swizzle);
+            pack_view ? pack_view
+                      : static_cast<VulkanTexture*>(binding->texture)
+                            ->GetView(false, binding->host_swizzle);
       }
       if (binding->texture_signed && uses_signed &&
           host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
@@ -2094,7 +2099,9 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
       VulkanTexture* texture = static_cast<VulkanTexture*>(binding->texture);
       if (texture) {
         if (uses_unsigned && host_format_pair.format_unsigned.format != VK_FORMAT_UNDEFINED) {
-          vulkan_binding.image_view_unsigned = texture->GetView(false, binding->host_swizzle);
+          VkImageView pack_view = GetTexturePackView(*texture, binding->host_swizzle);
+          vulkan_binding.image_view_unsigned =
+              pack_view ? pack_view : texture->GetView(false, binding->host_swizzle);
         }
         if (uses_signed && host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
           vulkan_binding.image_view_signed = texture->GetView(true, binding->host_swizzle);
@@ -3554,6 +3561,310 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
                : xenos::ClampMode::kMirroredRepeat;
   }
   return clamp_mode;
+}
+
+// --- FH1 (#384): texture pack replacements ----------------------------------------------
+
+namespace {
+
+VkFormat TexturePackVkFormat(texture_pack::Format format) {
+  switch (format) {
+    case texture_pack::Format::kR8:
+      return VK_FORMAT_R8_UNORM;
+    case texture_pack::Format::kRG8:
+      return VK_FORMAT_R8G8_UNORM;
+    case texture_pack::Format::kRGBA8:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+    case texture_pack::Format::kBGRA8:
+      return VK_FORMAT_B8G8R8A8_UNORM;
+    case texture_pack::Format::kBC1:
+      return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case texture_pack::Format::kBC2:
+      return VK_FORMAT_BC2_UNORM_BLOCK;
+    case texture_pack::Format::kBC3:
+      return VK_FORMAT_BC3_UNORM_BLOCK;
+    case texture_pack::Format::kBC4:
+      return VK_FORMAT_BC4_UNORM_BLOCK;
+    case texture_pack::Format::kBC5:
+      return VK_FORMAT_BC5_UNORM_BLOCK;
+    case texture_pack::Format::kBC7:
+      return VK_FORMAT_BC7_UNORM_BLOCK;
+    default:
+      return VK_FORMAT_UNDEFINED;
+  }
+}
+
+VkComponentSwizzle TexturePackSwizzle(uint32_t host_swizzle, uint32_t component) {
+  const uint32_t value = (host_swizzle >> (3 * component)) & 0b111;
+  if (value == component) return VK_COMPONENT_SWIZZLE_IDENTITY;
+  switch (value) {
+    case xenos::XE_GPU_TEXTURE_SWIZZLE_R:
+      return VK_COMPONENT_SWIZZLE_R;
+    case xenos::XE_GPU_TEXTURE_SWIZZLE_G:
+      return VK_COMPONENT_SWIZZLE_G;
+    case xenos::XE_GPU_TEXTURE_SWIZZLE_B:
+      return VK_COMPONENT_SWIZZLE_B;
+    case xenos::XE_GPU_TEXTURE_SWIZZLE_A:
+      return VK_COMPONENT_SWIZZLE_A;
+    case xenos::XE_GPU_TEXTURE_SWIZZLE_0:
+      return VK_COMPONENT_SWIZZLE_ZERO;
+    case xenos::XE_GPU_TEXTURE_SWIZZLE_1:
+      return VK_COMPONENT_SWIZZLE_ONE;
+    default:
+      return VK_COMPONENT_SWIZZLE_IDENTITY;
+  }
+}
+
+// The same picture at another size: the aspect ratio within a texel (0: size not known).
+bool TexturePackAspectMatches(uint32_t width, uint32_t height, uint32_t guest_width,
+                              uint32_t guest_height) {
+  if (!guest_width || !guest_height) return true;
+  const int64_t cross = int64_t(width) * guest_height - int64_t(height) * guest_width;
+  return std::abs(cross) <= int64_t(std::max(width, height));
+}
+
+}  // namespace
+
+void VulkanTextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+  TextureCache::CompletedSubmissionUpdated(completed_submission_index);
+  while (!pack_staging_.empty() && pack_staging_.front().submission <= completed_submission_index) {
+    vmaDestroyBuffer(vma_allocator_, pack_staging_.front().buffer,
+                     pack_staging_.front().allocation);
+    pack_staging_.pop_front();
+  }
+}
+
+void VulkanTextureCache::OnTexturePackReplacement(Texture& texture) {
+  Texture::PackState& state = texture.pack_state();
+  auto [it, inserted] = pack_replacements_.try_emplace(state.replacement);
+  Replacement& replacement = it->second;
+  const uint32_t width = texture.key().GetWidth(), height = texture.key().GetHeight();
+  if (!replacement.guest_width) {
+    // Preloaded before any texture had this fingerprint: check now.
+    replacement.guest_width = width;
+    replacement.guest_height = height;
+    if (replacement.image &&
+        !TexturePackAspectMatches(replacement.width, replacement.height, width, height)) {
+      replacement.failed = true;
+      REXGPU_WARN("Texture packs: {:016x} not used: its aspect ratio differs from the game's {}x{}",
+                  state.replacement, width, height);
+    }
+  }
+  if (inserted) {
+    if (!pack_client_) pack_client_ = std::make_shared<texture_pack::Client>();
+    texture_packs()->RequestDecode(state.replacement, width, height, pack_client_);
+  }
+  if (replacement.failed) state.replacement = 0;
+}
+
+void VulkanTextureCache::TexturePackBeginFrame() {
+  texture_pack::Packs* packs = texture_packs();
+  if (!packs || !packs->replacing()) return;
+  if (packs->preload() && !pack_preloaded_) {
+    pack_preloaded_ = true;
+    if (!pack_client_) pack_client_ = std::make_shared<texture_pack::Client>();
+    for (uint64_t fingerprint : packs->Replacements()) {
+      if (pack_replacements_.try_emplace(fingerprint).second) {
+        packs->RequestDecode(fingerprint, 0, 0, pack_client_);
+      }
+    }
+  }
+  if (pack_client_ && pack_client_->HasReady()) {
+    for (auto& decoded : pack_client_->Take()) pack_uploads_.push_back(std::move(decoded));
+  }
+  // At most 32 MiB a frame (and at least one file), so loading a pack does not stall a frame.
+  uint64_t budget = uint64_t(32) << 20;
+  bool first = true;
+  while (!pack_uploads_.empty() && (first || pack_uploads_.front()->data.size() <= budget)) {
+    std::unique_ptr<texture_pack::Decoded> decoded = std::move(pack_uploads_.front());
+    pack_uploads_.pop_front();
+    budget -= std::min<uint64_t>(budget, decoded->data.size());
+    first = false;
+    UploadTexturePackReplacement(*decoded);
+    pack_client_->Uploaded(decoded->data.size());
+  }
+}
+
+void VulkanTextureCache::UploadTexturePackReplacement(const texture_pack::Decoded& decoded) {
+  texture_pack::Packs* packs = texture_packs();
+  auto it = pack_replacements_.find(decoded.fingerprint);
+  if (it == pack_replacements_.end() || it->second.image || it->second.failed) return;
+  Replacement& replacement = it->second;
+  auto fail = [&](const char* reason) {
+    replacement.failed = true;
+    if (reason) {
+      packs->CountUnusable();
+      REXGPU_WARN("Texture packs: {:016x} not used: {}", decoded.fingerprint, reason);
+    }
+  };
+  if (!decoded.ok) {
+    fail(nullptr);  // the worker said why
+    return;
+  }
+  if (!TexturePackAspectMatches(decoded.width, decoded.height, replacement.guest_width,
+                                replacement.guest_height)) {
+    fail("its aspect ratio differs from the game's texture");
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const uint32_t max_size = vulkan_device->properties().maxImageDimension2D;
+  if (decoded.width > max_size || decoded.height > max_size) {
+    fail("it is larger than this GPU's textures can be");
+    return;
+  }
+  const VkFormat format = TexturePackVkFormat(decoded.format);
+  VkFormatProperties format_properties = {};
+  if (format != VK_FORMAT_UNDEFINED) {
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), format, &format_properties);
+  }
+  if (!(format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+    fail("this GPU cannot sample its format");
+    return;
+  }
+  VkImageCreateInfo image_create_info = {};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.format = format;
+  image_create_info.extent = {decoded.width, decoded.height, 1};
+  image_create_info.mipLevels = uint32_t(decoded.levels.size());
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImage image;
+  VmaAllocation allocation;
+  if (VkResult result = CreateTextureImage(vma_allocator_, image_create_info, image, allocation)) {
+    device_memory::ReportImageFailure(vulkan_device, device_memory::Use::kTexture,
+                                      image_create_info, result);
+    fail("could not make its image (out of GPU memory?)");
+    return;
+  }
+  VkBufferCreateInfo buffer_create_info = {};
+  buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_create_info.size = decoded.data.size();
+  buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VmaAllocationCreateInfo staging_create_info = {};
+  staging_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+  staging_create_info.flags =
+      VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  VkBuffer staging_buffer;
+  VmaAllocation staging_allocation;
+  VmaAllocationInfo staging_info = {};
+  if (vmaCreateBuffer(vma_allocator_, &buffer_create_info, &staging_create_info, &staging_buffer,
+                      &staging_allocation, &staging_info) != VK_SUCCESS ||
+      !staging_info.pMappedData) {
+    vmaDestroyImage(vma_allocator_, image, allocation);
+    fail("no memory to upload it");
+    return;
+  }
+  std::memcpy(staging_info.pMappedData, decoded.data.data(), decoded.data.size());
+  vmaFlushAllocation(vma_allocator_, staging_allocation, 0, VK_WHOLE_SIZE);
+  pack_staging_.push_back(
+      {command_processor_.GetCurrentSubmission(), staging_buffer, staging_allocation});
+
+  const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
+  command_processor_.PushImageMemoryBarrier(
+      image, range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  std::vector<VkBufferImageCopy> regions(decoded.levels.size());
+  for (size_t level = 0; level < decoded.levels.size(); ++level) {
+    VkBufferImageCopy& region = regions[level];
+    region = {};
+    region.bufferOffset = decoded.levels[level].offset;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(level), 0, 1};
+    region.imageExtent = {decoded.levels[level].width, decoded.levels[level].height, 1};
+  }
+  command_processor_.deferred_command_buffer().CmdVkCopyBufferToImage(
+      staging_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+      regions.data());
+  command_processor_.PushImageMemoryBarrier(
+      image, range, VK_PIPELINE_STAGE_TRANSFER_BIT, guest_shader_pipeline_stages_,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+  VmaAllocationInfo image_info;
+  vmaGetAllocationInfo(vma_allocator_, allocation, &image_info);
+  device_memory::Get().Allocated(device_memory::Use::kTexture, image_info.memoryType,
+                                 image_info.size);
+  replacement.image = image;
+  replacement.allocation = allocation;
+  replacement.format = format;
+  replacement.width = decoded.width;
+  replacement.height = decoded.height;
+  pack_gpu_bytes_ += image_info.size;
+  packs->CountUploaded(image_info.size);
+  if (pack_uploads_logged_ < 16) {
+    ++pack_uploads_logged_;
+    REXGPU_INFO("Texture packs: {:016x} ({}) drawn from a {}x{} {} file with {} levels ({} KiB)",
+                decoded.fingerprint,
+                replacement.guest_width ? std::to_string(replacement.guest_width) + "x" +
+                                              std::to_string(replacement.guest_height)
+                                        : std::string("preloaded"),
+                decoded.width, decoded.height, texture_pack::FormatName(decoded.format),
+                decoded.levels.size(), image_info.size >> 10);
+  }
+}
+
+VkImageView VulkanTextureCache::GetTexturePackView(const Texture& texture,
+                                                   uint32_t host_swizzle) {
+  const uint64_t fingerprint = texture.pack_state().replacement;
+  if (!fingerprint) return VK_NULL_HANDLE;
+  auto it = pack_replacements_.find(fingerprint);
+  if (it == pack_replacements_.end() || !it->second.image || it->second.failed) {
+    return VK_NULL_HANDLE;
+  }
+  Replacement& replacement = it->second;
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  if (!vulkan_device->properties().imageViewFormatSwizzle) {
+    host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+  }
+  auto view_it = replacement.views.find(host_swizzle);
+  if (view_it != replacement.views.end()) return view_it->second;
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.image = replacement.image;
+  // As the guest texture's own view of a 2D texture (VulkanTexture::GetView).
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+  view_create_info.format = replacement.format;
+  view_create_info.components.r = TexturePackSwizzle(host_swizzle, 0);
+  view_create_info.components.g = TexturePackSwizzle(host_swizzle, 1);
+  view_create_info.components.b = TexturePackSwizzle(host_swizzle, 2);
+  view_create_info.components.a = TexturePackSwizzle(host_swizzle, 3);
+  view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
+  VkImageView view;
+  if (vulkan_device->functions().vkCreateImageView(vulkan_device->device(), &view_create_info,
+                                                   nullptr, &view) != VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  replacement.views.emplace(host_swizzle, view);
+  return view;
+}
+
+void VulkanTextureCache::DestroyTexturePackReplacements() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (auto& [fingerprint, replacement] : pack_replacements_) {
+    for (const auto& view : replacement.views) dfn.vkDestroyImageView(device, view.second, nullptr);
+    if (replacement.image) {
+      VmaAllocationInfo info;
+      vmaGetAllocationInfo(vma_allocator_, replacement.allocation, &info);
+      device_memory::Get().Freed(device_memory::Use::kTexture, info.memoryType, info.size);
+      vmaDestroyImage(vma_allocator_, replacement.image, replacement.allocation);
+    }
+  }
+  pack_replacements_.clear();
+  for (const PackStaging& staging : pack_staging_) {
+    vmaDestroyBuffer(vma_allocator_, staging.buffer, staging.allocation);
+  }
+  pack_staging_.clear();
+  pack_gpu_bytes_ = 0;
 }
 
 }  // namespace rex::graphics::vulkan

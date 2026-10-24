@@ -21,6 +21,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
+#include <rex/graphics/pipeline/texture/pack.h>
 
 namespace rex::graphics::vulkan {
 
@@ -78,6 +79,7 @@ class VulkanTextureCache final : public TextureCache {
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
 
   // Must be called within a frame - creates and untiles textures needed by
   // shaders, and enqueues transitioning them into the sampled usage. This may
@@ -151,6 +153,10 @@ class VulkanTextureCache final : public TextureCache {
                                              bool load_mips) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
+
+  bool SupportsTexturePackReplacement() const override { return true; }
+  void OnTexturePackReplacement(Texture& texture) override;
+  void TexturePackBeginFrame() override;
 
  private:
   enum LoadDescriptorSetIndex {
@@ -405,6 +411,37 @@ class VulkanTextureCache final : public TextureCache {
   std::vector<uint64_t> scaled_resolve_sparse_allocated_;
   bool scaled_resolve_last_usage_write_ = false;
   std::pair<uint64_t, uint64_t> scaled_resolve_last_written_range_{0, 0};
+
+  // FH1 (#384): texture pack replacements, by fingerprint. Uploaded once, then always in
+  // SHADER_READ_ONLY_OPTIMAL; the guest texture keeps its own image (loaded as before), and
+  // bindings of its unsigned view sample the replacement instead.
+  struct Replacement {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    // The guest texture's size, for the aspect ratio check (0: not seen yet, preloading).
+    uint32_t guest_width = 0;
+    uint32_t guest_height = 0;
+    bool failed = false;
+    std::unordered_map<uint32_t, VkImageView> views;  // by host swizzle
+  };
+  struct PackStaging {
+    uint64_t submission;
+    VkBuffer buffer;
+    VmaAllocation allocation;
+  };
+  VkImageView GetTexturePackView(const Texture& texture, uint32_t host_swizzle);
+  void UploadTexturePackReplacement(const texture_pack::Decoded& decoded);
+  void DestroyTexturePackReplacements();
+  std::unordered_map<uint64_t, Replacement> pack_replacements_;
+  std::shared_ptr<texture_pack::Client> pack_client_;
+  std::deque<std::unique_ptr<texture_pack::Decoded>> pack_uploads_;
+  std::deque<PackStaging> pack_staging_;
+  uint64_t pack_gpu_bytes_ = 0;
+  uint32_t pack_uploads_logged_ = 0;
+  bool pack_preloaded_ = false;
 };
 
 }  // namespace rex::graphics::vulkan
