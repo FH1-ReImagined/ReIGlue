@@ -83,6 +83,13 @@ class VulkanPipelineCache {
                            uint32_t dword_count);
   // Own a separate translation for this render scale, preserving native-endian ucode.
   VulkanShader* LoadShaderForDraw(const Shader& shader);
+  // FH1 (#378): a shader the pipeline lookahead found queued (guest-endian words), without the
+  // command processor's memo of loads by address.
+  VulkanShader* LoadShaderAhead(xenos::ShaderType shader_type, const uint32_t* words,
+                                uint32_t dword_count) {
+    return LoadShader(shader_type, words, dword_count,
+                      XXH3_64bits(words, dword_count * sizeof(uint32_t)));
+  }
   // Analyze shader microcode on the translator thread.
   void AnalyzeShaderUcode(Shader& shader) { shader.AnalyzeUcode(ucode_disasm_buffer_); }
 
@@ -105,6 +112,18 @@ class VulkanPipelineCache {
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
+  // FH1 (#378): for a draw queued behind the current one (fh1_pipeline_lookahead.cpp), on the
+  // command processor thread with the registers as they will be at that draw: translates its
+  // shaders and, if its pipeline does not exist yet, hands it to the creation threads, without a
+  // placeholder. A draw that meets it before it is built is skipped as with a placeholder, or
+  // waits for it when pipelines are created synchronously.
+  enum class AheadResult { kKnown, kQueued, kFailed };
+  bool CanQueuePipelinesAhead() const { return !creation_threads_.empty(); }
+  AheadResult QueuePipelineAhead(
+      VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key);
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;
@@ -256,13 +275,18 @@ class VulkanPipelineCache {
     // destroyed by it while the pipeline cache is active.
     std::atomic<const PipelineLayoutProvider*> pipeline_layout{nullptr};
     std::atomic<bool> is_placeholder{false};
+    // FH1 (#378): built ahead of its draw (QueuePipelineAhead) and no draw has used it yet: it
+    // is stored at the first. While being built, is_placeholder is set with no pipeline.
+    // Command processor thread only.
+    bool fh1_ahead = false;
     Pipeline() = default;
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
         : pipeline_layout(pipeline_layout_provider) {}
     Pipeline(const Pipeline& other)
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout.load(std::memory_order_acquire)),
-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {}
+          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          fh1_ahead(other.fh1_ahead) {}
     Pipeline& operator=(const Pipeline& other) {
       if (this == &other) {
         return *this;
@@ -272,6 +296,7 @@ class VulkanPipelineCache {
                             std::memory_order_release);
       is_placeholder.store(other.is_placeholder.load(std::memory_order_acquire),
                            std::memory_order_release);
+      fh1_ahead = other.fh1_ahead;
       return *this;
     }
   };
@@ -471,6 +496,16 @@ class VulkanPipelineCache {
 
   // Previously used pipeline, to avoid lookups if the state wasn't changed.
   const std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
+
+  // FH1 (#378): the pipelines the last lookahead started (QueuePipelineAhead), for the wait for
+  // all of them with synchronous creation, and that wait.
+  std::vector<Pipeline*> fh1_ahead_set_;
+  static bool Fh1IsBeingBuiltAhead(const Pipeline& pipeline) {
+    return pipeline.is_placeholder.load(std::memory_order_acquire) &&
+           pipeline.pipeline.load(std::memory_order_acquire) == VK_NULL_HANDLE;
+  }
+  bool Fh1WaitForAhead(Pipeline* first);
+  void Fh1StoreDrawnAhead(std::pair<const PipelineDescription, Pipeline>& pipeline);
   // <Submission index, pipeline>.
   std::deque<std::pair<uint64_t, VkPipeline>> deferred_destroy_pipelines_;
   std::mutex deferred_destroy_lock_;

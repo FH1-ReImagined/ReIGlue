@@ -180,6 +180,20 @@ class RenderTargetCache {
   // each.
   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
 
+  // FH1 (#378): what Update would bind for a draw that has not run yet, for building its
+  // pipeline ahead (vulkan/fh1_pipeline_lookahead.cpp). The accumulated bindings Update keeps
+  // (the render target keys, 0 for none; depth first, then the colors), as they are now
+  // (GetBindingPrediction) and as Update would change them (PredictUpdate, from the current
+  // registers), without creating, transferring or binding anything. Host render targets only.
+  struct BindingPrediction {
+    uint32_t accumulated_keys[5] = {};
+    bool valid = false;
+  };
+  void GetBindingPrediction(BindingPrediction& prediction) const;
+  bool PredictUpdate(BindingPrediction& prediction, bool is_rasterization_done,
+                     reg::RB_DEPTHCONTROL normalized_depth_control,
+                     uint32_t normalized_color_mask) const;
+
  protected:
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)

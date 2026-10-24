@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "fh1_command_cursor.h"
 #include "fh1_frame_cost.h"
 #include <algorithm>
 #include <cinttypes>
@@ -723,14 +724,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
-  do {
-    if (!ExecutePacket(&reader)) {
-      // This probably should be fatal - but we're going to continue anyways.
-      REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
-      assert_always();
-      break;
-    }
-  } while (reader.read_count());
+  {
+    // FH1 (#378): the pipeline lookahead's view of the ring (fh1_command_cursor.h).
+    fh1_command_cursor::cursor.ring_start = read_index;
+    fh1_command_cursor::cursor.ring = &reader;
+    fh1_command_cursor::Scope cursor_scope(&reader);
+    do {
+      if (!ExecutePacket(&reader)) {
+        // This probably should be fatal - but we're going to continue anyways.
+        REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
+        assert_always();
+        break;
+      }
+    } while (reader.read_count());
+    fh1_command_cursor::cursor.ring = nullptr;
+  }
+  fh1_command_cursor::cursor.ring_done +=
+      (write_index + primary_buffer_size_ / sizeof(uint32_t) - read_index) %
+      (primary_buffer_size_ / sizeof(uint32_t));
 
   OnPrimaryBufferEnd();
 
@@ -743,6 +754,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
+  fh1_command_cursor::Scope cursor_scope(&reader);  // FH1 (#378)
   do {
     if (!ExecutePacket(&reader)) {
       // Return up a level if we encounter a bad packet.
@@ -757,6 +769,7 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
+  fh1_command_cursor::Scope cursor_scope(&reader);  // FH1 (#378)
   do {
     if (!ExecutePacket(&reader)) {
       REXGPU_ERROR("**** ExecutePacket: Failed to execute packet.");

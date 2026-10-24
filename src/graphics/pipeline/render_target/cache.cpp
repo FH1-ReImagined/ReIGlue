@@ -393,6 +393,155 @@ void RenderTargetCache::ClearCache() {
   }
 }
 
+void RenderTargetCache::GetBindingPrediction(BindingPrediction& prediction) const {
+  prediction.valid = are_accumulated_render_targets_valid_;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    const RenderTarget* render_target = last_update_accumulated_render_targets_[i];
+    prediction.accumulated_keys[i] = render_target ? render_target->key().key : 0;
+  }
+}
+
+bool RenderTargetCache::PredictUpdate(BindingPrediction& prediction, bool is_rasterization_done,
+                                      reg::RB_DEPTHCONTROL normalized_depth_control,
+                                      uint32_t normalized_color_mask) const {
+  // Update's choice of render targets and its accumulation, on keys instead of render targets
+  // (one render target per key).
+  if (GetPath() != Path::kHostRenderTargets) {
+    return true;
+  }
+  const RegisterFile& regs = register_file();
+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+  if (msaa_samples > xenos::MsaaSamples::k4X) {
+    return false;
+  }
+  uint32_t msaa_samples_x_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t pitch_pixels = rb_surface_info.surface_pitch;
+  if (!pitch_pixels) {
+    is_rasterization_done = false;
+  } else if (pitch_pixels > xenos::kTexture2DCubeMaxWidthHeight) {
+    return false;
+  }
+  uint32_t pitch_tiles_at_32bpp =
+      ((pitch_pixels << msaa_samples_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
+      xenos::kEdramTileWidthSamples;
+
+  uint32_t depth_and_color_rts_used_bits = 0;
+  uint32_t edram_bases[1 + xenos::kMaxColorRenderTargets];
+  uint32_t resource_formats[1 + xenos::kMaxColorRenderTargets];
+  if (is_rasterization_done) {
+    if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
+      depth_and_color_rts_used_bits |= 1;
+      auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+      edram_bases[0] = rb_depth_info.depth_base;
+      resource_formats[0] = uint32_t(rb_depth_info.depth_format);
+    }
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!(normalized_color_mask & (uint32_t(0b1111) << (4 * i)))) {
+        continue;
+      }
+      auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+      uint32_t rt_bit_index = 1 + i;
+      depth_and_color_rts_used_bits |= uint32_t(1) << rt_bit_index;
+      edram_bases[rt_bit_index] = color_info.color_base;
+      resource_formats[rt_bit_index] =
+          uint32_t(GetColorResourceFormat(xenos::GetStorageColorFormat(color_info.color_format)));
+    }
+  }
+  uint32_t rts_remaining = depth_and_color_rts_used_bits & ~(uint32_t(1));
+  uint32_t rt_index;
+  while (rex::bit_scan_forward(rts_remaining, &rt_index)) {
+    rts_remaining &= ~(uint32_t(1) << rt_index);
+    uint32_t edram_base = edram_bases[rt_index];
+    uint32_t rts_other_remaining =
+        depth_and_color_rts_used_bits & (~((uint32_t(1) << (rt_index + 1)) - 1) | uint32_t(1));
+    uint32_t rt_other_index;
+    while (rex::bit_scan_forward(rts_other_remaining, &rt_other_index)) {
+      rts_other_remaining &= ~(uint32_t(1) << rt_other_index);
+      if (edram_bases[rt_other_index] == edram_base) {
+        depth_and_color_rts_used_bits &= ~(uint32_t(1) << rt_other_index);
+      }
+    }
+  }
+
+  uint32_t* accumulated = prediction.accumulated_keys;
+  if (!depth_and_color_rts_used_bits) {
+    if (prediction.valid) {
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (!accumulated[i]) {
+          continue;
+        }
+        RenderTargetKey rt_key;
+        rt_key.key = accumulated[i];
+        if (rt_key.pitch_tiles_at_32bpp != pitch_tiles_at_32bpp ||
+            rt_key.msaa_samples != msaa_samples) {
+          prediction.valid = false;
+          break;
+        }
+      }
+    }
+    if (!prediction.valid) {
+      std::memset(accumulated, 0, sizeof(prediction.accumulated_keys));
+    }
+    return true;
+  }
+
+  uint32_t used[1 + xenos::kMaxColorRenderTargets] = {};
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(depth_and_color_rts_used_bits & (uint32_t(1) << i))) {
+      continue;
+    }
+    RenderTargetKey rt_key;
+    rt_key.base_tiles = edram_bases[i];
+    rt_key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
+    rt_key.msaa_samples = msaa_samples;
+    rt_key.is_depth = i == 0;
+    rt_key.resource_format = resource_formats[i];
+    used[i] = rt_key.key;
+  }
+  if (prediction.valid) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!accumulated[i]) {
+        if (used[i]) {
+          prediction.valid = false;
+          break;
+        }
+        continue;
+      }
+      if (used[i]) {
+        if (used[i] != accumulated[i]) {
+          prediction.valid = false;
+          break;
+        }
+      } else {
+        RenderTargetKey rt_key;
+        rt_key.key = accumulated[i];
+        if (rt_key.pitch_tiles_at_32bpp != pitch_tiles_at_32bpp ||
+            rt_key.msaa_samples != msaa_samples) {
+          prediction.valid = false;
+          break;
+        }
+      }
+    }
+    for (uint32_t i = 1; prediction.valid && i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!accumulated[i]) {
+        continue;
+      }
+      for (uint32_t j = 0; j < i; ++j) {
+        if (accumulated[j] == accumulated[i]) {
+          prediction.valid = false;
+          break;
+        }
+      }
+    }
+  }
+  if (!prediction.valid) {
+    std::memcpy(accumulated, used, sizeof(used));
+    prediction.valid = true;
+  }
+  return true;
+}
+
 void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
 }

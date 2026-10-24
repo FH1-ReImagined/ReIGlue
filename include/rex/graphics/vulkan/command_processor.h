@@ -288,6 +288,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
 
+  // FH1 (#378): called by the pipeline cache, inside a draw whose pipeline does not exist yet:
+  // walks the commands queued behind the draw and starts building the pipelines they need
+  // (VulkanPipelineCache::QueuePipelineAhead). fh1_pipeline_lookahead.cpp.
+  void Fh1PipelineLookahead();
+
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;

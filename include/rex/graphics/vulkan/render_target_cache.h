@@ -149,6 +149,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+  // FH1 (#378): the render pass key Update would use for a draw that has not run yet, from the
+  // current registers (RenderTargetCache::PredictUpdate), for building its pipeline ahead.
+  bool PredictRenderPassKey(BindingPrediction& prediction, bool is_rasterization_done,
+                            reg::RB_DEPTHCONTROL normalized_depth_control,
+                            uint32_t normalized_color_mask, RenderPassKey& key_out) const;
   // Binding information for the last successful update.
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }

@@ -20,6 +20,7 @@
 #include <chrono>
 #include <unordered_set>
 #include <rex/graphics/shader_warmup.h>
+#include "fh1_pipeline_lookahead.h"
 #include "fh1_shader_load_memo.h"
 #include <string>
 #include <string_view>
@@ -69,6 +70,9 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_store_pipeline_cache, true, "GPU/Vulkan",
                     "Keep device-local driver pipelines for startup shader warm-up")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// FH1 (#378): fh1_pipeline_lookahead.cpp.
+REXCVAR_DECLARE(bool, vulkan_pipeline_lookahead);
 
 namespace rex::graphics::vulkan {
 
@@ -1369,6 +1373,8 @@ void VulkanPipelineCache::Shutdown() {
   shaders_.clear();
   fh1_frame_cost::GetSizes().shaders.store(int64_t(shaders_.size()), std::memory_order_relaxed);
   loaded_shader_generation.fetch_add(1, std::memory_order_relaxed);
+  // FH1 (#378): the lookahead's saved state may point at the deleted shaders.
+  fh1_pipeline_lookahead::shader_epoch.fetch_add(1, std::memory_order_relaxed);
   shader_storage_index_ = 0;
   texture_binding_layout_map_.clear();
   texture_binding_layouts_.clear();
@@ -1652,8 +1658,63 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   auto it = pipelines_.find(description);
+  // FH1 (#378): this draw's pipeline does not exist yet. Before making it, look at the draws the
+  // game has queued behind this one and start building every other pipeline they need, all at
+  // once on the creation threads (fh1_pipeline_lookahead.cpp), so they are ready, or nearly,
+  // when the command processor reaches them. Creating synchronously, wait for the whole set here
+  // once instead of once per draw.
+  bool ahead_walked = false;
+  if (it == pipelines_.end() && REXCVAR_GET(vulkan_pipeline_lookahead) &&
+      CanQueuePipelinesAhead()) {
+    fh1_ahead_set_.clear();
+    command_processor_.Fh1PipelineLookahead();
+    ahead_walked = true;
+    // The walk may have started this one too (a later draw with the same state).
+    it = pipelines_.find(description);
+  }
+  auto create_synchronously = []() {
+    return !REXCVAR_GET(async_shader_compilation) || REXCVAR_GET(sync_pipeline_creation);
+  };
+  // Not on the path of a pipeline that exists (nothing walked, nothing to wait for).
+  auto finish_ahead = [&](Pipeline* first) -> bool {
+    bool ready = true;
+    if ((first || (ahead_walked && !fh1_ahead_set_.empty())) && create_synchronously()) {
+      ready = Fh1WaitForAhead(first);
+    }
+    if (ahead_walked) {
+      fh1_ahead_set_.clear();
+    }
+    return ready;
+  };
   if (it != pipelines_.end()) {
+    // Checked first: once a creation thread has finished one, its pipeline is seen below.
+    const bool being_built_ahead = Fh1IsBeingBuiltAhead(it->second);
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    if (being_built_ahead) {
+      if (!create_synchronously()) {
+        // Skipped like a draw with a placeholder until it is built.
+        finish_ahead(nullptr);
+        pipeline_out = VK_NULL_HANDLE;
+        pipeline_layout_out = nullptr;
+        if (pipeline_handle_out) {
+          *pipeline_handle_out = &it->second;
+        }
+        return true;
+      }
+      bool ready;
+      {
+        fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().pipeline_ms);
+        ready = finish_ahead(&it->second);
+      }
+      if (!ready) {
+        REXGPU_ERROR("VulkanPipelineCache: a pipeline built ahead was not ready after 10 s");
+        return false;
+      }
+      found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    } else if (ahead_walked) {
+      fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().pipeline_ms);
+      finish_ahead(nullptr);
+    }
     if (found_pipeline == VK_NULL_HANDLE) {
       fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().pipeline_ms);
       ++fh1_frame_cost::Current().pipelines;
@@ -1663,6 +1724,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
         return false;
       }
       found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    }
+    if (it->second.fh1_ahead) {
+      Fh1StoreDrawnAhead(*it);
     }
     const PipelineLayoutProvider* found_pipeline_layout =
         it->second.pipeline_layout.load(std::memory_order_acquire);
@@ -1713,11 +1777,15 @@ bool VulkanPipelineCache::ConfigurePipeline(
   if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
     pipelines_.erase(description);
     fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
+    finish_ahead(nullptr);
     return false;
   }
   if (!queued_async_creation) {
     pipeline.second.is_placeholder.store(false, std::memory_order_release);
   }
+  // FH1 (#378): creating synchronously, this draw's pipeline was made while the creation threads
+  // built the ones the lookahead found; wait for those too.
+  finish_ahead(nullptr);
 
   if (pipeline_storage_file_) {
     assert_not_null(storage_write_thread_);
@@ -1746,6 +1814,108 @@ bool VulkanPipelineCache::IsCreatingPipelines() const {
     return startup_loading_;
   }
   return startup_loading_ || !creation_queue_.empty() || creation_threads_busy_ != 0;
+}
+
+VulkanPipelineCache::AheadResult VulkanPipelineCache::QueuePipelineAhead(
+    VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    VulkanRenderTargetCache::RenderPassKey render_pass_key) {
+  if (creation_threads_.empty()) {
+    return AheadResult::kFailed;
+  }
+  // The shaders are translated here, on the command processor thread, as the draw would; only
+  // the pipeline is made on the creation threads.
+  if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
+    return AheadResult::kFailed;
+  }
+  PipelineDescription description;
+  if (!GetCurrentStateDescription(vertex_shader, pixel_shader, primitive_processing_result,
+                                  normalized_depth_control, normalized_color_mask, render_pass_key,
+                                  description)) {
+    return AheadResult::kFailed;
+  }
+  if (pipelines_.find(description) != pipelines_.end()) {
+    return AheadResult::kKnown;
+  }
+  auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
+  fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
+  PipelineCreationArguments creation_arguments;
+  if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
+                                                     creation_arguments)) {
+    pipelines_.erase(description);
+    fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()),
+                                               std::memory_order_relaxed);
+    return AheadResult::kFailed;
+  }
+  uint32_t shader_writes_color_targets =
+      pixel_shader ? pixel_shader->shader().writes_color_targets() : 0;
+  bool shader_writes_depth = pixel_shader ? pixel_shader->shader().writes_depth()
+                                          : normalized_depth_control.z_write_enable != 0;
+  creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
+      pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask),
+      shader_writes_color_targets, shader_writes_depth);
+  // Being built: no pipeline yet, marked as a placeholder (a draw meeting it is skipped or
+  // waits); the creation thread clears the mark when it is done.
+  pipeline.second.is_placeholder.store(true, std::memory_order_release);
+  pipeline.second.fh1_ahead = true;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    creation_queue_.push(creation_arguments);
+  }
+  creation_request_cond_.notify_one();
+  fh1_ahead_set_.push_back(&pipeline.second);
+  return AheadResult::kQueued;
+}
+
+bool VulkanPipelineCache::Fh1WaitForAhead(Pipeline* first) {
+  // Polled as sync_pipeline_creation's wait for a placeholder (command_processor.cpp): pipelines
+  // take milliseconds, and this wait is rare (an empty cache with synchronous creation).
+  const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + std::chrono::seconds(10);
+  bool ready = true;
+  auto wait_for = [&](const Pipeline& pipeline) {
+    while (Fh1IsBeingBuiltAhead(pipeline)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    return true;
+  };
+  if (first) {
+    ready = wait_for(*first);
+  }
+  for (const Pipeline* pipeline : fh1_ahead_set_) {
+    if (!wait_for(*pipeline)) {
+      break;
+    }
+  }
+  ++fh1_pipeline_lookahead::stats.waits;
+  fh1_pipeline_lookahead::stats.wait_ms +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  return ready;
+}
+
+void VulkanPipelineCache::Fh1StoreDrawnAhead(
+    std::pair<const PipelineDescription, Pipeline>& pipeline) {
+  // Built ahead and now drawn with: stored like one made for its draw. Never stored if no draw
+  // uses it (a lookahead that guessed wrong).
+  pipeline.second.fh1_ahead = false;
+  ++fh1_pipeline_lookahead::stats.drawn_ahead;
+  if (!pipeline_storage_file_) {
+    return;
+  }
+  assert_not_null(storage_write_thread_);
+  pipeline_storage_file_flush_needed_ = true;
+  {
+    std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+    storage_write_pipeline_queue_.emplace_back();
+    PipelineStoredDescription& stored_description = storage_write_pipeline_queue_.back();
+    stored_description.description_hash = pipeline.first.GetHash();
+    std::memcpy(&stored_description.description, &pipeline.first, sizeof(pipeline.first));
+  }
+  storage_write_request_cond_.notify_all();
 }
 
 void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
@@ -4044,6 +4214,15 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       creation_arguments.pipeline->second.pipeline.exchange(pipeline, std::memory_order_acq_rel);
   creation_arguments.pipeline->second.pipeline_layout.store(creation_arguments.pipeline_layout,
                                                             std::memory_order_release);
+  // FH1 (#378): the log's pipeline summary (fh1_pipeline_lookahead.h).
+  if (creating_placeholder) {
+    fh1_pipeline_lookahead::stats.placeholders.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    fh1_pipeline_lookahead::stats.created.fetch_add(1, std::memory_order_relaxed);
+    if (was_placeholder && old_pipeline == VK_NULL_HANDLE) {
+      fh1_pipeline_lookahead::stats.created_ahead.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   if (creating_placeholder) {
     creation_arguments.pipeline->second.is_placeholder.store(true, std::memory_order_release);
   } else {
@@ -4091,6 +4270,12 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
       } else {
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+        // FH1 (#378): one started ahead (no placeholder) is not being built any more.
+        if (has_placeholder) {
+          fh1_pipeline_lookahead::stats.failed_ahead.fetch_add(1, std::memory_order_relaxed);
+          creation_arguments.pipeline->second.is_placeholder.store(false,
+                                                                   std::memory_order_release);
+        }
       }
     }
 
@@ -4124,6 +4309,11 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       } else {
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+        if (has_placeholder) {  // FH1 (#378): as in CreationThread
+          fh1_pipeline_lookahead::stats.failed_ahead.fetch_add(1, std::memory_order_relaxed);
+          creation_arguments.pipeline->second.is_placeholder.store(false,
+                                                                   std::memory_order_release);
+        }
       }
     }
   }

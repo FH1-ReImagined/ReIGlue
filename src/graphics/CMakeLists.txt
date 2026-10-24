@@ -46,6 +46,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
     vulkan/fh1_device_memory.cpp
+    vulkan/fh1_pipeline_lookahead.cpp
     vulkan/fh1_dlss.cpp
     vulkan/fh1_fsr3.cpp
     vulkan/fh1_smaa.cpp

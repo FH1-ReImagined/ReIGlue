@@ -1546,6 +1546,48 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
   return true;
 }
 
+bool VulkanRenderTargetCache::PredictRenderPassKey(BindingPrediction& prediction,
+                                                   bool is_rasterization_done,
+                                                   reg::RB_DEPTHCONTROL normalized_depth_control,
+                                                   uint32_t normalized_color_mask,
+                                                   RenderPassKey& key_out) const {
+  if (!PredictUpdate(prediction, is_rasterization_done, normalized_depth_control,
+                     normalized_color_mask)) {
+    return false;
+  }
+  RenderPassKey render_pass_key;
+  render_pass_key.msaa_samples = register_file().Get<reg::RB_SURFACE_INFO>().msaa_samples;
+  if (GetPath() == Path::kHostRenderTargets) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!prediction.accumulated_keys[i]) {
+        continue;
+      }
+      RenderTargetKey rt_key;
+      rt_key.key = prediction.accumulated_keys[i];
+      render_pass_key.depth_and_color_used |= uint32_t(1) << i;
+      switch (i) {
+        case 0:
+          render_pass_key.depth_format = rt_key.GetDepthFormat();
+          break;
+        case 1:
+          render_pass_key.color_0_view_format = rt_key.GetColorFormat();
+          break;
+        case 2:
+          render_pass_key.color_1_view_format = rt_key.GetColorFormat();
+          break;
+        case 3:
+          render_pass_key.color_2_view_format = rt_key.GetColorFormat();
+          break;
+        default:
+          render_pass_key.color_3_view_format = rt_key.GetColorFormat();
+          break;
+      }
+    }
+  }
+  key_out = render_pass_key;
+  return true;
+}
+
 void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     VkRenderingAttachmentInfo* color_attachments, uint32_t* color_attachment_count_out,
     VkRenderingAttachmentInfo* depth_attachment,

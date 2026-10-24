@@ -40,6 +40,7 @@
 #include <rex/graphics/util/fh1_hud.h>
 #include "fh1_device_memory.h"
 #include "fh1_render_target_trim.h"
+#include "fh1_pipeline_lookahead.h"
 #include "fh1_submission_watch.h"
 #include <rex/platform.h>
 #include "../fh1_frame_cost.h"
@@ -3374,6 +3375,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
+  // FH1 (#378): the log's pipeline summary (fh1_pipeline_lookahead.h).
+  ++fh1_pipeline_lookahead::stats.frames;
+  if (skip_present_due_async_placeholder) {
+    ++fh1_pipeline_lookahead::stats.skipped_frames;
+  }
+  fh1_pipeline_lookahead::LogSummary();
   if (skip_present_due_async_placeholder) {
     static bool skipped_incomplete_frame_logged = false;
     if (!skipped_incomplete_frame_logged) {
@@ -5452,6 +5459,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
+    ++fh1_pipeline_lookahead::stats.skipped_draws;  // FH1 (#378)
     return true;
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
