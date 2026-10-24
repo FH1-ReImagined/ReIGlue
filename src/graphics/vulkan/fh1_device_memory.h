@@ -23,9 +23,6 @@ namespace placement = fh1_memory_placement;
 enum class Use : uint32_t { kTexture, kRenderTarget, kSharedMemory, kScaledResolve, kCount };
 
 const char* UseName(Use use);
-inline placement::Kind KindOf(Use use) {
-  return use == Use::kTexture ? placement::Kind::kTexture : placement::Kind::kHot;
-}
 
 class State {
  public:
@@ -36,7 +33,11 @@ class State {
   // Memory moves to system memory: an integrated GPU (or the test budget cap) and
   // vulkan_integrated_memory_spill.
   bool active() const;
+  // An integrated GPU with a small carve-out, or the test budget cap (whatever the setting).
+  bool integrated() const { return device_ && (layout_.integrated || cap_mb_) && layout_.can_move(); }
   const placement::Layout& layout() const { return layout_; }
+  // The share of each device-local heap's budget that `use` may fill (the settings).
+  static uint32_t SharePercent(Use use);
 
   // The device-local use and budget, all heaps and per heap (the test cap applied), queried
   // now.

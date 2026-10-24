@@ -40,6 +40,7 @@
 #include <rex/graphics/util/fh1_hud.h>
 #include "fh1_device_memory.h"
 #include "fh1_render_target_trim.h"
+#include "fh1_submission_watch.h"
 #include <rex/platform.h>
 #include "../fh1_frame_cost.h"
 #if REX_PLATFORM_MAC
@@ -145,6 +146,13 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_skip_render_targets, true, "GPU/Vulkan",
 REXCVAR_DEFINE_STRING(fh1_frame_cost_csv, "", "GPU/Vulkan",
                       "Testing: write what the command processor did in every frame (draws, "
                       "textures, uploads, pipelines, render targets, waits) to this CSV file")
+    .debug_only();
+
+REXCVAR_DEFINE_INT32(vulkan_submission_draw_limit, -1, "GPU/Vulkan",
+                     "End a GPU submission after this many draws (a frame then reaches the GPU in "
+                     "several parts, so no single part can run into Windows' 2 s GPU timeout): "
+                     "-1 = 1000 on integrated GPUs with a small carve-out, else none; 0 = none")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
 REXCVAR_DEFINE_UINT32(vulkan_render_target_trim_percent, 90, "GPU/Vulkan",
@@ -658,6 +666,28 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
 // A host wait for the GPU longer than this is logged: the queue made no progress for that
 // long (presentation holding it, for instance).
 constexpr int64_t kSlowSubmissionWaitMs = 2000;
+
+// FH1 (#268): the submissions' draws and the slow waits for them (fh1_submission_watch.h).
+// One command processor per process; its thread alone touches these.
+fh1_submission_watch::Watch fh1_submission_watch_state;
+uint32_t fh1_draws_in_submission = 0;
+uint64_t fh1_submission_splits = 0;
+
+// FORZA_TEST_SLOW_WAIT_MS=<n>: log waits for the GPU from n ms (at most one every 10 s), to
+// see the submissions' draws on a fast GPU.
+struct Fh1SlowWaitTestHook {
+  Fh1SlowWaitTestHook() {
+    if (const char* v = std::getenv("FORZA_TEST_SLOW_WAIT_MS"); v && *v) {
+      fh1_submission_watch_state.SetSlowWaitMs(std::max<int64_t>(0, std::atoll(v)));
+    }
+  }
+} fh1_slow_wait_test_hook;
+
+int64_t Fh1NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // Test hook: FORZA_TEST_GPU_LOSS_AT_FRAME=<n> makes the submission fence check report
 // VK_ERROR_DEVICE_LOST from frame n on, to exercise the device-loss reporting path.
@@ -5031,6 +5061,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   ++fh1_frame_cost::Current().draws;
+  // FH1 (#268): on integrated GPUs, at most so many draws in one submission. Not inside an
+  // occlusion query, which a submission's end would cut short.
+  if (submission_open_ && frame_open_ && !active_occlusion_query_.valid &&
+      fh1_submission_watch::ShouldSplit(
+          fh1_draws_in_submission,
+          fh1_submission_watch::DrawLimit(REXCVAR_GET(vulkan_submission_draw_limit),
+                                          fh1_device_memory::Get().integrated()))) {
+    if (EndSubmission(false)) ++fh1_submission_splits;
+  }
+  ++fh1_draws_in_submission;
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
@@ -6848,9 +6888,30 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     }
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
-      if (int64_t ms = waited_ms(); ms >= kSlowSubmissionWaitMs) {
-        REXGPU_WARN("Vulkan: waited {} ms for submission {} to finish on the GPU", ms,
-                    await_submission);
+      const int64_t ms = waited_ms();
+      // FH1 (#268): what the submissions waited for held, and how full the device-local
+      // memory was.
+      const bool log_slow =
+          ms >= kSlowSubmissionWaitMs ||
+          fh1_submission_watch_state.ShouldLogWait(ms, Fh1NowMs());
+      if (log_slow) {
+        std::string held;
+        const int64_t now_ms = Fh1NowMs();
+        for (uint64_t s = submission_completed_ + 1; s <= await_submission; ++s) {
+          if (const auto* r = fh1_submission_watch_state.Find(s)) {
+            held += fmt::format("{}{}: {} draws, submitted {} ms ago", held.empty() ? "" : "; ",
+                                s, r->draws, now_ms - r->submitted_ms);
+          }
+        }
+        const fh1_device_memory::State::Budget memory = fh1_device_memory::Get().Query();
+        const std::string context = fmt::format(
+            " ({}; device-local {} of {} MB, system {} of {} MB; {} slow waits since the last "
+            "report, {} submissions split)",
+            held.empty() ? std::string("no record") : held, memory.usage >> 20,
+            memory.budget >> 20, memory.system_usage >> 20, memory.system_budget >> 20,
+            fh1_submission_watch_state.TakeSlowWaits(), fh1_submission_splits);
+        REXGPU_WARN("Vulkan: waited {} ms for submission {} to finish on the GPU{}", ms,
+                    await_submission, context);
       }
     } else {
       REXGPU_ERROR("Failed to await submission completion Vulkan fences (VkResult {}, after {} ms)",
@@ -7035,6 +7096,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    fh1_draws_in_submission = 0;
 
     // Start a new deferred command buffer - will submit it to the real one in
     // the end of the submission (when async pipeline object creation requests
@@ -7291,6 +7353,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
 
     SubmitBarriers(true);
+
+    fh1_submission_watch_state.Submitted(GetCurrentSubmission(), fh1_draws_in_submission,
+                                         Fh1NowMs());
 
     assert_false(command_buffers_writable_.empty());
     CommandBuffer command_buffer = command_buffers_writable_.back();

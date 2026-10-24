@@ -18,6 +18,24 @@ REXCVAR_DEFINE_BOOL(vulkan_integrated_memory_spill, true, "GPU/Vulkan",
                     "device-local memory (the BIOS carve-out). No effect on discrete GPUs")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_UINT32(vulkan_integrated_texture_percent,
+                      rex::graphics::vulkan::fh1_memory_placement::kTexturePercent, "GPU/Vulkan",
+                      "Integrated GPUs with a small carve-out: new textures go to a device-local "
+                      "heap only while its use stays under this percentage of its budget, else to "
+                      "system memory")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
+REXCVAR_DEFINE_UINT32(vulkan_integrated_device_local_percent,
+                      rex::graphics::vulkan::fh1_memory_placement::kHotPercent, "GPU/Vulkan",
+                      "Integrated GPUs with a small carve-out: new render targets and guest memory "
+                      "pages go to a device-local heap only while its use stays under this "
+                      "percentage of its budget, else to system memory")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
 REXCVAR_DEFINE_UINT32(vulkan_device_local_budget_mb, 0, "GPU/Vulkan",
                       "Testing: treat the device-local memory budget as at most this many MB and "
                       "place memory as on an integrated GPU, also on a discrete one (0 = the "
@@ -68,6 +86,12 @@ const char* UseName(Use use) {
     default:
       return "memory";
   }
+}
+
+uint32_t State::SharePercent(Use use) {
+  return std::min(use == Use::kTexture ? REXCVAR_GET(vulkan_integrated_texture_percent)
+                                       : REXCVAR_GET(vulkan_integrated_device_local_percent),
+                  uint32_t(100));
 }
 
 State& Get() {
@@ -141,8 +165,8 @@ void State::Initialize(const ui::vulkan::VulkanDevice* device) {
     REXGPU_INFO(
         "Vulkan memory heaps: {}; {}: new textures go to system memory (heap {}) above {}% of "
         "a device-local heap's budget, render targets and guest memory pages above {}%",
-        heaps, device_kind, layout_.system_heap, placement::kTexturePercent,
-        placement::kHotPercent);
+        heaps, device_kind, layout_.system_heap, SharePercent(Use::kTexture),
+        SharePercent(Use::kRenderTarget));
   } else {
     REXGPU_INFO("Vulkan memory heaps: {}; {}: GPU memory stays device-local", heaps,
                 device_kind);
@@ -278,7 +302,7 @@ placement::Order State::Choose(Use use, uint32_t allowed, uint64_t size, bool al
   const Budget b = Estimate();
   return placement::Choose(
       layout_, allowed,
-      placement::FittingHeaps(layout_, KindOf(use), b.heaps, size, allocator_blocks));
+      placement::FittingHeaps(layout_, SharePercent(use), b.heaps, size, allocator_blocks));
 }
 
 void State::Allocated(Use use, uint32_t type, uint64_t size) {

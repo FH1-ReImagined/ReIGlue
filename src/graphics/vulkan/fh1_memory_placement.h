@@ -10,7 +10,10 @@
 // So on an integrated GPU with a small carve-out (or with the test budget cap), new textures
 // go to a device-local heap only while its use stays under kTexturePercent of its own budget,
 // and render targets and guest memory pages under kHotPercent; past that they go to a memory
-// type of the system memory heap that the resource accepts. The device-local heaps are tried
+// type of the system memory heap that the resource accepts. The shares leave room in the
+// carve-out for the rest of the system: AMD's Windows driver reports a fixed budget (95% of
+// each heap) that ignores the compositor and other programs, and with the carve-out nearly
+// full the driver paged until one submission ran past Windows' 2 s timeout (#268). The device-local heaps are tried
 // one by one, plain device-local types before host-visible ones: AMD's Windows driver splits
 // a Vega APU's 512 MB carve-out into a 256 MB heap and a 256 MB host-visible heap, each with
 // its own budget. Discrete GPUs, and APUs whose device-local heap is not small next to the
@@ -42,11 +45,12 @@ constexpr uint32_t kMaxHeaps = 16;
 constexpr uint32_t kMaxTiers = 8;
 constexpr uint32_t kMaxOrder = 2 * kMaxTiers + 2;
 
-// Textures stay in a device-local heap while its use (with the new allocation) stays under
-// this share of its budget; render targets and guest memory pages under kHotPercent (a little
-// room for the driver's own allocations).
-constexpr uint64_t kTexturePercent = 80;
-constexpr uint64_t kHotPercent = 95;
+// The default shares (vulkan_integrated_texture_percent, vulkan_integrated_device_local_percent):
+// textures never go to device-local memory there (they are read-only and the GPU samples
+// system memory about as fast); render targets and guest memory pages while a heap's use
+// (with the new allocation) stays under half its budget.
+constexpr uint32_t kTexturePercent = 0;
+constexpr uint32_t kHotPercent = 50;
 // A carve-out is small when the system memory heap is at least this many times its size.
 constexpr uint64_t kSmallCarveOutRatio = 2;
 
@@ -189,18 +193,17 @@ inline uint64_t AllocatorBlockBytes(uint64_t heap_bytes) {
   return uint64_t(256) << 20;
 }
 
-enum class Kind { kTexture, kHot };
-
-// Whether `growth` more bytes of device-local memory keep a heap's use within the kind's
-// share of its budget. Without a budget (no VK_EXT_memory_budget and no cap) everything fits.
-inline bool Fits(Kind kind, uint64_t usage, uint64_t growth, uint64_t budget) {
+// Whether `growth` more bytes of device-local memory keep a heap's use within `percent` of
+// its budget. Without a budget (no VK_EXT_memory_budget and no cap) everything fits.
+inline bool Fits(uint32_t percent, uint64_t usage, uint64_t growth, uint64_t budget) {
   if (!budget) return true;
-  return (usage + growth) * 100 <= budget * (kind == Kind::kTexture ? kTexturePercent : kHotPercent);
+  return (usage + growth) * 100 <= budget * uint64_t(percent);
 }
 
-// The device-local heaps (a mask) that can take `size` more bytes of `kind`. With
-// allocator_blocks (VMA), a new block of that heap counts instead when it is larger.
-inline uint32_t FittingHeaps(const Layout& l, Kind kind, const HeapUse& u, uint64_t size,
+// The device-local heaps (a mask) that can take `size` more bytes within `percent` of their
+// budgets. With allocator_blocks (VMA), a new block of that heap counts instead when it is
+// larger.
+inline uint32_t FittingHeaps(const Layout& l, uint32_t percent, const HeapUse& u, uint64_t size,
                              bool allocator_blocks) {
   uint32_t heaps = 0;
   for (uint32_t h = 0; h < l.heap_count; ++h) {
@@ -210,7 +213,7 @@ inline uint32_t FittingHeaps(const Layout& l, Kind kind, const HeapUse& u, uint6
       const uint64_t block = AllocatorBlockBytes(l.heap_bytes[h]);
       growth = block > size ? block : size;
     }
-    if (Fits(kind, u.usage[h], growth, u.budget[h])) heaps |= uint32_t(1) << h;
+    if (Fits(percent, u.usage[h], growth, u.budget[h])) heaps |= uint32_t(1) << h;
   }
   return heaps;
 }
