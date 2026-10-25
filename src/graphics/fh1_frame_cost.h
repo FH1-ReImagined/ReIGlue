@@ -23,6 +23,9 @@ namespace rex::graphics::fh1_frame_cost {
 struct Frame {
   double ms = 0;             // since the previous frame end
   double cpu_ms = 0;         // the command processor thread's CPU time (0 where unknown)
+  // cpu_ms is the frame's own (false: a coarse clock's step, which only means something summed
+  // over many frames; CpuClock below).
+  bool cpu_per_frame = true;
   double gpu_wait_ms = 0;    // blocked on GPU fences (frames in flight, readbacks, trims)
   double guest_wait_ms = 0;  // WAIT_REG_MEM: waiting for the game to write a value
   uint32_t draws = 0;
@@ -53,6 +56,7 @@ struct Frame {
   void Add(const Frame& o) {
     ms += o.ms;
     cpu_ms += o.cpu_ms;
+    cpu_per_frame = cpu_per_frame && o.cpu_per_frame;
     gpu_wait_ms += o.gpu_wait_ms;
     guest_wait_ms += o.guest_wait_ms;
     draws += o.draws;
@@ -93,6 +97,118 @@ inline uint64_t& TextureBytes() {
   static uint64_t bytes = 0;
   return bytes;
 }
+
+// FH1 (#400): the command processor thread's CPU time per frame, from the clocks the platform
+// has (CpuClock::EndFrame takes their readings at each frame end, in ms since the thread started,
+// negative where a clock is missing):
+// - a precise one: CLOCK_THREAD_CPUTIME_ID on Linux and macOS (Precise::kDirect); on Windows
+//   the thread's cycles (QueryThreadCycleTime) at the time stamp counter's rate (CyclesPerMs),
+//   only where the CPU reports an invariant time stamp counter (InvariantTsc). Microsoft does
+//   not promise that these cycles run at that rate, so on Windows (Precise::kChecked) the
+//   conversion times a frame only once CpuTimeCheck found it agreeing with GetThreadTimes, not
+//   again after a check that disagrees, and not in a frame whose GetThreadTimes reading failed;
+// - a coarse one (Windows: GetThreadTimes, 100 ns units but advancing in scheduler ticks of
+//   about 15.6 ms, sampled): its steps are kept as the frame's cpu_ms with cpu_per_frame false,
+//   right only summed over many frames (the minute line, the slow-frame window's average);
+//   the slow-frame cause then ignores the CPU time.
+
+// Cycles per ms from two samples of the time stamp counter and QueryPerformanceCounter; 0 when
+// the samples cannot tell (no time passed, a counter went back).
+inline double CyclesPerMs(uint64_t tsc_first, uint64_t tsc_last, int64_t qpc_first,
+                          int64_t qpc_last, int64_t qpc_frequency) {
+  if (qpc_frequency <= 0 || qpc_last <= qpc_first || tsc_last <= tsc_first) return 0;
+  const double ms = double(qpc_last - qpc_first) * 1000.0 / double(qpc_frequency);
+  return double(tsc_last - tsc_first) / ms;
+}
+inline double CyclesToMs(uint64_t cycles, double cycles_per_ms) {
+  return cycles_per_ms > 0 ? double(cycles) / cycles_per_ms : -1;
+}
+// CPUID: the highest extended leaf (0x80000000 EAX) and leaf 0x80000007's EDX, bit 8 of which
+// says the time stamp counter runs at a constant rate in every power state.
+inline bool InvariantTsc(uint32_t max_extended_leaf, uint32_t edx_80000007) {
+  return max_extended_leaf >= 0x80000007u && (edx_80000007 >> 8 & 1);
+}
+// GetThreadTimes' kernel plus user time (100 ns units) in ms.
+inline double ThreadTimesToMs(uint64_t kernel_100ns, uint64_t user_100ns) {
+  return double(kernel_100ns + user_100ns) / 10000.0;
+}
+
+// Checks the precise clock against the coarse one: each time the coarse one has advanced
+// kCheckMs (enough scheduler ticks for its sampling to average out), the precise one must have
+// advanced as much, within kTolerance.
+class CpuTimeCheck {
+ public:
+  static constexpr double kCheckMs = 5000.0;
+  static constexpr double kTolerance = 0.25;
+  enum class State { kUnchecked, kAgrees, kDisagrees };
+
+  State Update(double precise_ms, double coarse_ms) {
+    if (state_ == State::kDisagrees) return state_;
+    if (!started_) {
+      started_ = true;
+      precise_start_ = precise_ms;
+      coarse_start_ = coarse_ms;
+      return state_;
+    }
+    const double coarse = coarse_ms - coarse_start_;
+    if (coarse < kCheckMs) return state_;
+    ratio_ = (precise_ms - precise_start_) / coarse;
+    state_ = ratio_ >= 1.0 - kTolerance && ratio_ <= 1.0 + kTolerance ? State::kAgrees
+                                                                      : State::kDisagrees;
+    precise_start_ = precise_ms;
+    coarse_start_ = coarse_ms;
+    return state_;
+  }
+  State state() const { return state_; }
+  double ratio() const { return ratio_; }  // the last check's precise / coarse
+
+ private:
+  State state_ = State::kUnchecked;
+  bool started_ = false;
+  double precise_start_ = 0, coarse_start_ = 0, ratio_ = 0;
+};
+
+class CpuClock {
+ public:
+  // How far the precise clock is trusted: kDirect, a thread CPU-time clock of the system
+  // (Linux, macOS); kChecked, a conversion (Windows' cycles) that times single frames only while
+  // CpuTimeCheck agrees and the coarse reference was read in the same frame end.
+  enum class Precise { kDirect, kChecked };
+  explicit CpuClock(Precise precise) : precise_(precise) {}
+
+  // A frame's end: sets its cpu_ms and cpu_per_frame. A step is taken only between two readings
+  // of the same clock at consecutive frame ends; a missing reading (negative) leaves the frame
+  // and the next one without that clock's step, and unknown frames get 0, not per frame.
+  void EndFrame(double precise_ms, double coarse_ms, Frame& frame) {
+    const bool has_precise = precise_ms >= 0, has_coarse = coarse_ms >= 0;
+    bool use_precise = has_precise && had_precise_;
+    if (precise_ == Precise::kChecked) {
+      // Fail closed: no check, and no per-frame time, without both readings; a rejection
+      // stays (CpuTimeCheck::Update).
+      const CpuTimeCheck::State state =
+          has_precise && has_coarse ? check_.Update(precise_ms, coarse_ms) : check_.state();
+      use_precise = use_precise && has_coarse && state == CpuTimeCheck::State::kAgrees;
+    }
+    frame.cpu_per_frame = use_precise;
+    frame.cpu_ms = 0;
+    if (use_precise) {
+      frame.cpu_ms = std::max(0.0, precise_ms - last_precise_ms_);
+    } else if (has_coarse && had_coarse_) {
+      frame.cpu_ms = std::max(0.0, coarse_ms - last_coarse_ms_);
+    }
+    had_precise_ = has_precise;
+    had_coarse_ = has_coarse;
+    if (has_precise) last_precise_ms_ = precise_ms;
+    if (has_coarse) last_coarse_ms_ = coarse_ms;
+  }
+  const CpuTimeCheck& check() const { return check_; }
+
+ private:
+  Precise precise_;
+  CpuTimeCheck check_;
+  bool had_precise_ = false, had_coarse_ = false;  // the previous frame end's readings
+  double last_precise_ms_ = 0, last_coarse_ms_ = 0;
+};
 
 // Adds the time of its scope to a counter (milliseconds).
 class Timer {
@@ -174,24 +290,33 @@ class Report {
     // the typical one within half a minute.
     if (!typical_frames_) {
       typical_ms_ = f.ms;
-      typical_cpu_ms_ = f.cpu_ms;
       typical_draws_ = f.draws;
     } else {
       const double weight = slow ? kSlowTypicalWeight : kTypicalWeight;
       typical_ms_ += (f.ms - typical_ms_) * weight;
-      typical_cpu_ms_ += (f.cpu_ms - typical_cpu_ms_) * weight;
       typical_draws_ += (double(f.draws) - typical_draws_) * weight;
+    }
+    // The typical CPU time only from per-frame values (#400), restarted after coarse ones.
+    if (!f.cpu_per_frame) {
+      typical_cpu_frames_ = 0;
+      typical_cpu_ms_ = 0;
+    } else if (!typical_cpu_frames_++) {
+      typical_cpu_ms_ = f.cpu_ms;
+    } else {
+      typical_cpu_ms_ += (f.cpu_ms - typical_cpu_ms_) * (slow ? kSlowTypicalWeight : kTypicalWeight);
     }
     ++typical_frames_;
     if (starting) return false;
     if (window_open_) {
       ++window_frames_;
+      window_cpu_ms_ += f.cpu_ms;
     }
     if (slow) {
       if (!window_open_) {
         window_open_ = true;
         window_start_ = now_seconds;
         window_frames_ = 1;
+        window_cpu_ms_ = f.cpu_ms;
         slow_ = Frame();
         slow_count_ = 0;
         worst_ms_ = 0;
@@ -220,10 +345,11 @@ class Report {
     const double ms = slow_.ms / n;
     const double cpu = slow_.cpu_ms / n;
     const double gpu_wait = slow_.gpu_wait_ms / n;
-    // Mostly idle (neither working nor waiting for the GPU): the game was late.
-    if (cpu > 0 && cpu + gpu_wait < 0.5 * ms) return Cause::kGame;
+    // Mostly idle (neither working nor waiting for the GPU): the game was late. Only with the
+    // slow frames' own CPU time (#400).
+    if (slow_.cpu_per_frame && cpu > 0 && cpu + gpu_wait < 0.5 * ms) return Cause::kGame;
     double extra_draws_ms = 0;
-    if (typical_draws_ > 0 && typical_cpu_ms_ > 0) {
+    if (slow_.cpu_per_frame && typical_cpu_frames_ && typical_draws_ > 0 && typical_cpu_ms_ > 0) {
       const double draws = double(slow_.draws) / n;
       extra_draws_ms = std::max(0.0, draws - typical_draws_) * (typical_cpu_ms_ / typical_draws_);
     }
@@ -253,17 +379,25 @@ class Report {
   // The log line for the window: how many frames were slow and what each did on average.
   std::string Line(double now_seconds) const {
     const double n = slow_count_ ? double(slow_count_) : 1.0;
-    char text[1280];
+    // The slow frames' own CPU time, or only the window's average per frame (#400).
+    char cpu[96];
+    if (slow_.cpu_per_frame) {
+      std::snprintf(cpu, sizeof(cpu), "%.0f ms CPU", slow_.cpu_ms / n);
+    } else {
+      std::snprintf(cpu, sizeof(cpu), "CPU not timed per frame (%.1f ms a frame in the window)",
+                    window_frames_ ? window_cpu_ms_ / double(window_frames_) : 0.0);
+    }
+    char text[1400];
     std::snprintf(
         text, sizeof(text),
         "GPU slow frames: %u of %u in %.0f s over %.0f ms (worst %.0f ms, typical %.0f ms); "
-        "each: command processor %.0f ms CPU, %.0f ms GPU waits, %.0f ms game waits, %.0f draws "
+        "each: command processor %s, %.0f ms GPU waits, %.0f ms game waits, %.0f draws "
         "(typical %.0f); textures %.1f new (%.1f MB, %.1f ms), %.1f loaded (%.1f MB, %.1f ms), "
         "%.1f evicted (%.1f MB); uploads %.1f MB (%.1f ms); shaders %.1f (%.1f ms), pipelines "
         "%.1f (%.1f ms); render targets %.1f new (%.1f MB, %.1f ms), %u trims; resolve readbacks "
         "%.1f (%.1f MB, %.1f ms, %.1f ms GPU waits); cause: %s",
         slow_count_, window_frames_, now_seconds - window_start_, SlowThresholdMs(), worst_ms_,
-        typical_ms_, slow_.cpu_ms / n, slow_.gpu_wait_ms / n, slow_.guest_wait_ms / n,
+        typical_ms_, cpu, slow_.gpu_wait_ms / n, slow_.guest_wait_ms / n,
         double(slow_.draws) / n, typical_draws_, slow_.textures_created / n,
         Mb(slow_.texture_created_bytes) / n, slow_.texture_create_ms / n, slow_.texture_loads / n,
         Mb(slow_.texture_load_bytes) / n, slow_.texture_load_ms / n, slow_.textures_evicted / n,
@@ -288,7 +422,9 @@ class Report {
   double start_seconds_ = 0;
   uint64_t typical_frames_ = 0;
   double typical_ms_ = 0, typical_cpu_ms_ = 0, typical_draws_ = 0;
+  uint64_t typical_cpu_frames_ = 0;
   bool window_open_ = false;
+  double window_cpu_ms_ = 0;
   double window_start_ = 0;
   uint32_t window_frames_ = 0;
   uint32_t slow_count_ = 0;

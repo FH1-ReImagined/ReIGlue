@@ -829,15 +829,58 @@ VulkanCommandProcessor::~VulkanCommandProcessor() = default;
 
 namespace {
 
-// FH1 (#45): the command processor thread's CPU time, in ms (0 where not known: Windows,
-// whose thread times advance in scheduler ticks).
-double ThreadCpuMs() {
+// FH1 (#45, #400): the command processor thread's CPU time, in ms since it started, from a
+// precise clock and a coarse one (negative where there is none; fh1_frame_cost.h CpuClock
+// decides which one times the frames). Linux and macOS: CLOCK_THREAD_CPUTIME_ID, no coarse one.
+// Windows: the thread's cycles (QueryThreadCycleTime) at the time stamp counter's rate, measured
+// once for 2 ms against QueryPerformanceCounter, only with an invariant time stamp counter
+// (CPUID 0x80000007 EDX bit 8); and GetThreadTimes, which CpuClock checks the cycles against.
+double ThreadCpuPreciseMs() {
 #if REX_PLATFORM_WIN32
-  return 0;
+#if REX_ARCH_AMD64
+  static const double cycles_per_ms = [] {
+    int regs[4] = {};
+    __cpuid(regs, int(0x80000000u));
+    const uint32_t max_extended_leaf = uint32_t(regs[0]);
+    uint32_t edx = 0;
+    if (max_extended_leaf >= 0x80000007u) {
+      __cpuid(regs, int(0x80000007u));
+      edx = uint32_t(regs[3]);
+    }
+    if (!fh1_frame_cost::InvariantTsc(max_extended_leaf, edx)) return 0.0;
+    LARGE_INTEGER frequency, first, last;
+    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&first)) return 0.0;
+    const uint64_t tsc_first = __rdtsc();
+    do {
+      QueryPerformanceCounter(&last);
+    } while (last.QuadPart - first.QuadPart < frequency.QuadPart / 500);
+    const uint64_t tsc_last = __rdtsc();
+    return fh1_frame_cost::CyclesPerMs(tsc_first, tsc_last, first.QuadPart, last.QuadPart,
+                                       frequency.QuadPart);
+  }();
+  ULONG64 cycles = 0;
+  if (cycles_per_ms <= 0 || !QueryThreadCycleTime(GetCurrentThread(), &cycles)) return -1;
+  return fh1_frame_cost::CyclesToMs(cycles, cycles_per_ms);
+#else
+  return -1;
+#endif
 #else
   timespec ts;
-  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return -1;
   return double(ts.tv_sec) * 1000.0 + double(ts.tv_nsec) / 1.0e6;
+#endif
+}
+
+double ThreadCpuCoarseMs() {
+#if REX_PLATFORM_WIN32
+  FILETIME creation, exited, kernel, user;
+  if (!GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user)) return -1;
+  const auto units = [](const FILETIME& f) {
+    return uint64_t(f.dwHighDateTime) << 32 | uint64_t(f.dwLowDateTime);
+  };
+  return fh1_frame_cost::ThreadTimesToMs(units(kernel), units(user));
+#else
+  return -1;
 #endif
 }
 
@@ -935,7 +978,12 @@ void ReadSensors(uint32_t vendor_id, uint32_t device_id, fh1_frame_cost::Snapsho
 struct FrameCostState {
   bool started = false;
   std::chrono::steady_clock::time_point start, last;
-  double last_cpu_ms = 0;
+#if REX_PLATFORM_WIN32
+  // Windows' cycle conversion times frames only once checked against GetThreadTimes (#400).
+  fh1_frame_cost::CpuClock cpu{fh1_frame_cost::CpuClock::Precise::kChecked};
+#else
+  fh1_frame_cost::CpuClock cpu{fh1_frame_cost::CpuClock::Precise::kDirect};
+#endif
   fh1_frame_cost::Report report;
   fh1_frame_cost::Summary summary;
   std::FILE* csv = nullptr;
@@ -963,11 +1011,12 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
   FrameCostState& state = GetFrameCostState();
   fh1_frame_cost::Frame& frame = fh1_frame_cost::Current();
   const auto now = std::chrono::steady_clock::now();
-  const double cpu_ms = ThreadCpuMs();
+  const double precise_cpu_ms = ThreadCpuPreciseMs();
+  const double coarse_cpu_ms = ThreadCpuCoarseMs();
   if (!state.started) {
     state.started = true;
     state.start = state.last = now;
-    state.last_cpu_ms = cpu_ms;
+    state.cpu.EndFrame(precise_cpu_ms, coarse_cpu_ms, frame);  // the clocks' first readings
     const fh1_frame_cost::Sizes& sizes = fh1_frame_cost::GetSizes();
     state.summary.SetStart(sizes.watch_nodes_visited.load(std::memory_order_relaxed),
                            sizes.watch_fires.load(std::memory_order_relaxed));
@@ -975,9 +1024,22 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
     return;
   }
   frame.ms = std::chrono::duration<double, std::milli>(now - state.last).count();
-  frame.cpu_ms = cpu_ms > state.last_cpu_ms ? cpu_ms - state.last_cpu_ms : 0;
+  const fh1_frame_cost::CpuTimeCheck::State check = state.cpu.check().state();
+  state.cpu.EndFrame(precise_cpu_ms, coarse_cpu_ms, frame);
+  if (state.cpu.check().state() != check) {
+    // Windows (#400): the cycles' conversion checked against GetThreadTimes (logged when the
+    // verdict changes: the first agreement, a disagreement).
+    if (state.cpu.check().state() == fh1_frame_cost::CpuTimeCheck::State::kAgrees) {
+      REXGPU_INFO("Vulkan: command processor CPU time from thread cycles is {:.0f}% of "
+                  "GetThreadTimes'; timed per frame",
+                  100.0 * state.cpu.check().ratio());
+    } else {
+      REXGPU_WARN("Vulkan: command processor CPU time from thread cycles is {:.0f}% of "
+                  "GetThreadTimes'; not timed per frame from now on",
+                  100.0 * state.cpu.check().ratio());
+    }
+  }
   state.last = now;
-  state.last_cpu_ms = cpu_ms;
   const double t = std::chrono::duration<double>(now - state.start).count();
   if (!state.csv_tried) {
     state.csv_tried = true;
@@ -991,7 +1053,7 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
             "texture_evicted_bytes,upload_bytes,upload_ms,shaders,shader_ms,pipelines,pipeline_ms,"
             "render_targets,render_target_bytes,render_target_ms,render_target_trims,"
             "texture_total_mb,render_target_total_mb,render_target_count,readbacks,readback_bytes,"
-            "readback_ms,readback_wait_ms,readbacks_skipped\n",
+            "readback_ms,readback_wait_ms,readbacks_skipped,cpu_per_frame\n",
             state.csv);
       }
     }
@@ -999,7 +1061,7 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
   if (state.csv) {
     std::fprintf(state.csv,
                  "%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%u,%u,%llu,%.3f,%u,%llu,%.3f,%u,%llu,%llu,%.3f,%u,"
-                 "%.3f,%u,%.3f,%u,%llu,%.3f,%u,%.1f,%.1f,%u,%u,%llu,%.3f,%.3f,%u\n",
+                 "%.3f,%u,%.3f,%u,%llu,%.3f,%u,%.1f,%.1f,%u,%u,%llu,%.3f,%.3f,%u,%d\n",
                  std::chrono::duration<double>(
                      std::chrono::system_clock::now().time_since_epoch())
                      .count(),
@@ -1014,7 +1076,7 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
                  frame.render_target_trims, double(fh1_frame_cost::TextureBytes()) / 1048576.0,
                  double(render_target_bytes) / 1048576.0, render_target_count, frame.readbacks,
                  (unsigned long long)frame.readback_bytes, frame.readback_ms,
-                 frame.readback_wait_ms, frame.readbacks_skipped);
+                 frame.readback_wait_ms, frame.readbacks_skipped, int(frame.cpu_per_frame));
     if (frame_index % 300 == 0) std::fflush(state.csv);
   }
   if (state.report.OnFrame(frame, t)) {
