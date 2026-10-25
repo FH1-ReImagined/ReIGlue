@@ -1,6 +1,6 @@
 #pragma once
-// FH1 (#384): the texture pack file formats: DDS reading and writing. Nothing else of the SDK, so
-// tools/test_texture_pack_dds.cpp builds it alone.
+// FH1 (#384): the texture pack file formats: DDS reading and writing, and the pack order. Nothing
+// else of the SDK, so tools/test_texture_pack_dds.cpp builds it alone.
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -57,5 +57,12 @@ std::vector<uint8_t> EncodeDds(Format format, uint32_t width, uint32_t height,
 // and DX10 ones (BC1-5, BC7, RGBA8, BGRA8, R8, RG8). Uncompressed rows may be padded as the
 // header's pitch says (see the code). false and a reason in error when it cannot be used.
 bool DecodeDds(const uint8_t* data, size_t size, Decoded& out, std::string& error);
+
+// texture_packs: the pack folders, in order ('|'-separated; a later one wins for the same
+// fingerprint). "." is the files directly in the pack root (not its folders: the loose files
+// of milestone 1's layout). A name that is not a plain folder name in the pack root ("..", a
+// path, "dump" in any case) is left out and counted in refused; a name given twice keeps its
+// first place; empty names are skipped ("|" alone: no packs).
+std::vector<std::string> ParsePackOrder(const std::string& value, size_t& refused);
 
 }  // namespace rex::graphics::texture_pack

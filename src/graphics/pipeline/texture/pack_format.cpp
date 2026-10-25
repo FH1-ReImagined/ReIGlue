@@ -370,4 +370,24 @@ bool DecodeDds(const uint8_t* data, size_t size, Decoded& out, std::string& erro
   return true;
 }
 
+std::vector<std::string> ParsePackOrder(const std::string& value, size_t& refused) {
+  std::vector<std::string> names;
+  size_t start = 0;
+  while (start <= value.size()) {
+    size_t end = value.find('|', start);
+    if (end == std::string::npos) end = value.size();
+    std::string name = value.substr(start, end - start);
+    start = end + 1;
+    if (name.empty()) continue;
+    std::string lower = name;
+    for (char& c : lower) c = char(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    if (name == ".." || name.find_first_of("/\\:") != std::string::npos || lower == "dump") {
+      ++refused;
+      continue;
+    }
+    if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+  }
+  return names;
+}
+
 }  // namespace rex::graphics::texture_pack
