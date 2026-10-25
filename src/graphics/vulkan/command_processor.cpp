@@ -2612,6 +2612,7 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
 
+  Fh1WorldAoInitialize();
   return true;
 }
 
@@ -2752,6 +2753,7 @@ void VulkanCommandProcessor::ShutdownSubmissionThread() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  Fh1WorldAoShutdown();
   ShutdownSubmissionThread();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
@@ -5451,6 +5453,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  // FH1 (#380): may record the world AO compute passes (outside the render pass).
+  if (!Fh1WorldAoBeforeDraw(pixel_shader, used_texture_mask)) {
+    return draw_fail("world_ao_submission");
+  }
+
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
@@ -5884,6 +5891,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+
+  // FH1 (#380): after the shadow mask's blur, multiplies the world AO into it.
+  Fh1WorldAoAfterDraw(pixel_shader);
 
   if (hdr_menu_background) {
     // Include the decoded 1280x720 movie, but not the following logo, text or

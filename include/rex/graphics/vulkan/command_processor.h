@@ -727,6 +727,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline fh1_resolve_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout fh1_resolve_layout_ = VK_NULL_HANDLE;
   bool Fh1SynchronizeResolve(uint32_t address, uint32_t length);
+  // FH1 (#380): ambient occlusion in the world's sun shadow mask (fh1_world_ao.cpp).
+  struct Fh1WorldAo;
+  Fh1WorldAo* fh1_world_ao_ = nullptr;
+  void Fh1WorldAoInitialize();
+  void Fh1WorldAoShutdown();
+  bool Fh1WorldAoBeforeDraw(const Shader* pixel_shader, uint32_t used_texture_mask);
+  void Fh1WorldAoAfterDraw(const Shader* pixel_shader);
+  bool Fh1WorldAoResources(uint32_t width, uint32_t height);
+  void Fh1WorldAoCompute(VkImageView depth_view, VkImageView packed_view);
+  VkPipeline Fh1WorldAoApplyPipeline(VulkanRenderTargetCache::RenderPassKey key);
+  bool Fh1WorldAoProjection(float* params);
   void Fh1SelectNativeHud(bool native_hud);
   bool Fh1CreateRenderCaches(uint32_t scale_x, uint32_t scale_y);
   void Fh1ApplyGraphicsRequest();
