@@ -32,9 +32,9 @@ namespace rex::graphics::vulkan::driver_cache_file {
 constexpr uint32_t kFormatVersion = 2;
 constexpr size_t kHeaderSize = 64;
 constexpr size_t kEntryHeaderSize = 24;
-// One pipeline's driver data; real ones take tens of KB.
+// One pipeline's opaque driver data; size varies substantially by driver.
 constexpr size_t kMaxEntrySize = 16 * 1024 * 1024;
-// The whole file: about 50 KB per pipeline on the largest drivers seen, so thousands fit.
+// Bound disk usage even when a driver produces megabytes per pipeline (#406).
 constexpr uint64_t kMaxFileSize = uint64_t(512) * 1024 * 1024;
 
 struct Identity {
@@ -172,23 +172,30 @@ inline ReadResult Read(const std::filesystem::path& path, const Identity& id) {
 
 struct WriteResult {
   bool written = false;
-  // Over kMaxFileSize: nothing was written.
-  bool too_large = false;
+  // Counts include only valid entries; skipped entries did not fit the file budget.
+  size_t entries = 0;
+  size_t skipped = 0;
   uint64_t bytes = 0;
 };
 inline WriteResult Write(const std::filesystem::path& path, const std::vector<Entry>& entries,
-                         const Identity& id) {
+                         const Identity& id, uint64_t budget = kMaxFileSize) {
   WriteResult result;
+  budget = std::min(budget, kMaxFileSize);
+  if (budget < kHeaderSize) return result;
   std::vector<const Entry*> valid;
   valid.reserve(entries.size());
   uint64_t bytes = kHeaderSize;
   for (const auto& entry : entries) {
     if (!entry.data || !ValidPayload(*entry.data, id)) continue;
+    const uint64_t entry_bytes = kEntryHeaderSize + entry.size();
+    // The caller sorts by description key, so the retained subset is stable across
+    // starts. Skip whole entries, then keep looking for smaller ones that fit.
+    if (entry_bytes > budget - bytes) { ++result.skipped; continue; }
     valid.push_back(&entry);
-    bytes += kEntryHeaderSize + entry.size();
+    bytes += entry_bytes;
   }
   result.bytes = bytes;
-  if (bytes > kMaxFileSize) { result.too_large = true; return result; }
+  result.entries = valid.size();
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
   if (ec) return result;

@@ -728,24 +728,25 @@ void VulkanPipelineCache::SaveDriverPipelineCache() {
   bool log_limit = false;
   {
     std::lock_guard lock(driver_cache_mutex_);
-    // Over the limit: not retried until another pipeline is added.
-    if ((result.written || result.too_large) && path == driver_cache_path_) {
+    // A bounded subset is a completed save; retry I/O failures on the next save.
+    if (result.written && path == driver_cache_path_) {
       driver_cache_saved_generation_ = generation;
     }
-    if (result.too_large && !driver_cache_limit_logged_) {
+    if (result.written && result.skipped && !driver_cache_limit_logged_) {
       driver_cache_limit_logged_ = true;
       log_limit = true;
     }
   }
   if (result.written) {
     REXGPU_INFO("Vulkan driver pipeline cache: saved {} bytes for {} pipelines", result.bytes,
-                entries.size());
-  } else if (log_limit) {
-    REXGPU_WARN("Vulkan driver pipeline cache: not saved, {} bytes is over the {} MiB limit; "
-                "pipelines added from now on are compiled again next time",
-                result.bytes, driver_cache_file::kMaxFileSize >> 20);
-  } else if (!result.too_large) {
+                result.entries);
+  } else {
     REXGPU_WARN("Could not save Vulkan driver pipeline cache; existing cache retained");
+  }
+  if (log_limit) {
+    REXGPU_WARN("Vulkan driver pipeline cache: retained {} pipelines within the {} MiB limit; "
+                "{} pipelines omitted and may compile again next time",
+                result.entries, driver_cache_file::kMaxFileSize >> 20, result.skipped);
   }
 }
 void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
