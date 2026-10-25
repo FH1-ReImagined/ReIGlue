@@ -86,6 +86,8 @@ class DeferredCommandBuffer {
     write_stream_ = hoisted ? &hoisted_stream_ : &command_stream_;
   }
   size_t hoisted_stream_size() const { return hoisted_stream_.size(); }
+  // FH1 (#45): the size of the stream commands are written to now.
+  size_t write_stream_size() const { return write_stream_->size(); }
   // Drops the hoisted commands from `size` on (only those of the latest hoist point).
   void TruncateHoistedStream(size_t size) {
     assert_true(size <= hoisted_stream_.size());

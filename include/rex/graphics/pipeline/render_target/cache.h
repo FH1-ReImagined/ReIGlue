@@ -10,8 +10,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <unordered_map>
@@ -501,7 +503,47 @@ class RenderTargetCache {
   // false).
   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
 
-  void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
+  void ResetAccumulatedRenderTargets() {
+    are_accumulated_render_targets_valid_ = false;
+    ++update_state_generation_;
+  }
+
+  // FH1 (#45): what Update's result depends on besides the cache's own state: the registers it
+  // reads, its arguments and the height the draw may cover. Two Updates with equal inputs and
+  // no change to the cache between them (update_state_generation) bind, own and transfer the
+  // same, so an implementation may keep the first one's result (vulkan_render_target_update_reuse).
+  // Host render targets only.
+  struct UpdateInputs {
+    uint32_t values[11] = {};
+    bool operator==(const UpdateInputs& other) const {
+      return std::memcmp(values, other.values, sizeof(values)) == 0;
+    }
+  };
+  void GetUpdateInputs(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                       uint32_t normalized_color_mask, const Shader& vertex_shader,
+                       UpdateInputs& inputs_out);
+  // Changed by everything that may change what Update does for the same inputs: ownership
+  // changes, render targets created or dropped, the accumulated bindings reset, cache clears.
+  uint64_t update_state_generation() const { return update_state_generation_; }
+  void BumpUpdateStateGeneration() { ++update_state_generation_; }
+  // A reused Update: no transfers (the ranges are owned already), as the full one would leave.
+  void ClearLastUpdateTransfers() {
+    for (std::vector<Transfer>& transfers : last_update_transfers_) {
+      transfers.clear();
+    }
+  }
+  // Verification of a reused Update (vulkan_render_target_update_reuse_verify): the common
+  // state it would change, before and after the full Update.
+  struct UpdateStateSnapshot {
+    // Start, end, owner and the two host depth owners (keys) of each range.
+    std::vector<std::array<uint32_t, 5>> ownership;
+    RenderTarget* used[1 + xenos::kMaxColorRenderTargets];
+    RenderTarget* accumulated[1 + xenos::kMaxColorRenderTargets];
+    bool accumulated_valid;
+  };
+  void SnapshotUpdateState(UpdateStateSnapshot& snapshot_out) const;
+  // Empty if the state is as in the snapshot and no transfers are pending, otherwise what differs.
+  const char* CompareUpdateState(const UpdateStateSnapshot& snapshot) const;
   RenderTarget* const* last_update_accumulated_render_targets() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_accumulated_render_targets_;
@@ -698,6 +740,9 @@ class RenderTargetCache {
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+
+  // FH1 (#45): see update_state_generation().
+  uint64_t update_state_generation_ = 0;
 };
 
 }  // namespace rex::graphics

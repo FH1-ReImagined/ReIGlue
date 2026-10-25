@@ -47,6 +47,17 @@ REXCVAR_DEFINE_INT32(vulkan_render_target_initial_fill, 0, "GPU/Vulkan",
     .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_render_target_update_reuse, true, "GPU/Vulkan",
+                    "Keep the render target setup of the previous draw when this one has the same "
+                    "render target registers and nothing changed the render targets in between "
+                    "(no ownership change, resolve, clear or new render target): skips the "
+                    "lookups and the EDRAM ownership walk the command processor did per draw")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(vulkan_render_target_update_reuse_verify, false, "GPU/Vulkan",
+                    "With vulkan_render_target_update_reuse, still do the full render target "
+                    "setup for a reused draw and log where it differs (testing)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -1411,9 +1422,101 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   return copied && cleared;
 }
 
+// FH1 (#45): nearly every draw (95% in a race) binds the render targets of the one before,
+// with the same registers, and nothing touched the render targets between the two. Update
+// then finds the same render targets, owns the same EDRAM ranges already (no transfers),
+// builds the same render pass key and framebuffer and needs no barrier: keep that result.
+bool VulkanRenderTargetCache::AccumulatedRenderTargetsInDrawUsage() const {
+  RenderTarget* const* render_targets = last_update_accumulated_render_targets();
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    const RenderTarget* rt = render_targets[i];
+    if (!rt) {
+      continue;
+    }
+    const auto& vulkan_rt = *static_cast<const VulkanRenderTarget*>(rt);
+    VkPipelineStageFlags stage_mask;
+    VkAccessFlags access_mask;
+    VkImageLayout layout;
+    VulkanRenderTarget::GetDrawUsage(i == 0, &stage_mask, &access_mask, &layout);
+    if (vulkan_rt.current_stage_mask() != stage_mask ||
+        vulkan_rt.current_access_mask() != access_mask || vulkan_rt.current_layout() != layout) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
+  if (GetPath() != Path::kHostRenderTargets || !REXCVAR_GET(vulkan_render_target_update_reuse)) {
+    update_reuse_valid_ = false;
+    return UpdateFull(is_rasterization_done, normalized_depth_control, normalized_color_mask,
+                      vertex_shader);
+  }
+  ++update_reuse_updates_;
+  UpdateInputs inputs;
+  GetUpdateInputs(is_rasterization_done, normalized_depth_control, normalized_color_mask,
+                  vertex_shader, inputs);
+  bool reuse = update_reuse_valid_ && update_reuse_generation_ == update_state_generation() &&
+               inputs == update_reuse_inputs_ && AccumulatedRenderTargetsInDrawUsage();
+  if (reuse) {
+    ++update_reuse_hits_;
+    if (!REXCVAR_GET(vulkan_render_target_update_reuse_verify)) {
+      ClearLastUpdateTransfers();
+      return true;
+    }
+  }
+  update_reuse_valid_ = false;
+  UpdateStateSnapshot snapshot;
+  RenderPassKey snapshot_render_pass_key;
+  VkRenderPass snapshot_render_pass = VK_NULL_HANDLE;
+  const Framebuffer* snapshot_framebuffer = nullptr;
+  size_t snapshot_commands = 0, snapshot_barriers = 0;
+  if (reuse) {
+    SnapshotUpdateState(snapshot);
+    snapshot_render_pass_key = last_update_render_pass_key_;
+    snapshot_render_pass = last_update_render_pass_;
+    snapshot_framebuffer = last_update_framebuffer_;
+    snapshot_commands = command_processor_.deferred_command_buffer().write_stream_size();
+    snapshot_barriers = command_processor_.GetPendingBarrierCount();
+  }
+  if (!UpdateFull(is_rasterization_done, normalized_depth_control, normalized_color_mask,
+                  vertex_shader)) {
+    return false;
+  }
+  if (reuse) {
+    const char* difference = CompareUpdateState(snapshot);
+    if (!*difference) {
+      if (!(last_update_render_pass_key_ == snapshot_render_pass_key) ||
+          last_update_render_pass_ != snapshot_render_pass) {
+        difference = "render pass";
+      } else if (last_update_framebuffer_ != snapshot_framebuffer) {
+        difference = "framebuffer";
+      } else if (command_processor_.deferred_command_buffer().write_stream_size() !=
+                 snapshot_commands) {
+        difference = "commands";
+      } else if (command_processor_.GetPendingBarrierCount() != snapshot_barriers) {
+        difference = "barriers";
+      }
+    }
+    if (*difference) {
+      if (++update_reuse_mismatches_ <= 16) {
+        REXGPU_WARN("Render target update reuse: a reused draw's full update differs ({})",
+                    difference);
+      }
+    }
+  }
+  update_reuse_inputs_ = inputs;
+  update_reuse_generation_ = update_state_generation();
+  update_reuse_valid_ = true;
+  return true;
+}
+
+bool VulkanRenderTargetCache::UpdateFull(bool is_rasterization_done,
+                                         reg::RB_DEPTHCONTROL normalized_depth_control,
+                                         uint32_t normalized_color_mask,
+                                         const Shader& vertex_shader) {
   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
                                  normalized_color_mask, vertex_shader)) {
     return false;

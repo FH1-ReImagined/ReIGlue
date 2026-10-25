@@ -335,12 +335,14 @@ RenderTargetCache::~RenderTargetCache() {
 
 void RenderTargetCache::InitializeCommon() {
   assert_true(ownership_ranges_.empty());
+  ++update_state_generation_;
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
                                                   RenderTargetKey(), RenderTargetKey()));
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
+  ++update_state_generation_;
   ownership_ranges_.clear();
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
@@ -361,6 +363,7 @@ void RenderTargetCache::ShutdownCommon() {
 }
 
 void RenderTargetCache::ClearCache() {
+  ++update_state_generation_;
   // Keep only render targets currently owning any EDRAM data.
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
@@ -544,6 +547,76 @@ bool RenderTargetCache::PredictUpdate(BindingPrediction& prediction, bool is_ras
 
 void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
+}
+
+void RenderTargetCache::GetUpdateInputs(bool is_rasterization_done,
+                                        reg::RB_DEPTHCONTROL normalized_depth_control,
+                                        uint32_t normalized_color_mask,
+                                        const Shader& vertex_shader, UpdateInputs& inputs_out) {
+  assert_true(GetPath() == Path::kHostRenderTargets);
+  const RegisterFile& regs = register_file();
+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  bool depth_used = normalized_depth_control.z_enable || normalized_depth_control.stencil_enable;
+  uint32_t* values = inputs_out.values;
+  values[0] = uint32_t(is_rasterization_done) | (uint32_t(depth_used) << 1) |
+              (uint32_t(REXCVAR_GET(mrt_edram_used_range_clamp_to_min)) << 2);
+  values[1] = normalized_color_mask;
+  values[2] = regs[XE_GPU_REG_RB_SURFACE_INFO];
+  values[3] = regs[XE_GPU_REG_RB_DEPTH_INFO];
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    values[4 + i] = regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
+  }
+  // The height Update estimates (the same calls), only where it uses it.
+  uint32_t height_used = 0;
+  xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+  uint32_t pitch_pixels = rb_surface_info.surface_pitch;
+  if (is_rasterization_done && pitch_pixels && (depth_used || normalized_color_mask) &&
+      msaa_samples <= xenos::MsaaSamples::k4X) {
+    uint32_t msaa_samples_x_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
+    uint32_t pitch_tiles_at_32bpp =
+        ((pitch_pixels << msaa_samples_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
+        xenos::kEdramTileWidthSamples;
+    height_used = std::min(GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples),
+                           draw_extent_estimator_.EstimateMaxY(true, vertex_shader));
+  }
+  values[8] = height_used;
+  values[9] = 0;
+  values[10] = 0;
+}
+
+void RenderTargetCache::SnapshotUpdateState(UpdateStateSnapshot& snapshot_out) const {
+  snapshot_out.ownership.clear();
+  for (const auto& range : ownership_ranges_) {
+    snapshot_out.ownership.push_back({range.first, range.second.end_tiles,
+                                      range.second.render_target.key,
+                                      range.second.host_depth_render_target_unorm24.key,
+                                      range.second.host_depth_render_target_float24.key});
+  }
+  std::memcpy(snapshot_out.used, last_update_used_render_targets_, sizeof(snapshot_out.used));
+  std::memcpy(snapshot_out.accumulated, last_update_accumulated_render_targets_,
+              sizeof(snapshot_out.accumulated));
+  snapshot_out.accumulated_valid = are_accumulated_render_targets_valid_;
+}
+
+const char* RenderTargetCache::CompareUpdateState(const UpdateStateSnapshot& snapshot) const {
+  for (const std::vector<Transfer>& transfers : last_update_transfers_) {
+    if (!transfers.empty()) {
+      return "transfers";
+    }
+  }
+  UpdateStateSnapshot now;
+  SnapshotUpdateState(now);
+  if (now.ownership != snapshot.ownership) {
+    return "ownership";
+  }
+  if (std::memcmp(now.used, snapshot.used, sizeof(now.used))) {
+    return "used render targets";
+  }
+  if (std::memcmp(now.accumulated, snapshot.accumulated, sizeof(now.accumulated)) ||
+      now.accumulated_valid != snapshot.accumulated_valid) {
+    return "accumulated render targets";
+  }
+  return "";
 }
 
 bool RenderTargetCache::Update(bool is_rasterization_done,
@@ -1278,6 +1351,7 @@ void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   // Clear ownership - any overlap of data written before the barrier is safe.
   OwnershipRange empty_range(xenos::kEdramTileCount, RenderTargetKey(), RenderTargetKey(),
                              RenderTargetKey());
+  ++update_state_generation_;
   if (ownership_ranges_.size() == 1) {
     // Do not reallocate map elements if not needed (either nothing drawn since
     // the last barrier, or all of the EDRAM is owned by one render target).
@@ -1320,6 +1394,7 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
     }
     // Insert even if failed to create, not to try to create again.
     render_targets_.emplace(key, render_target);
+    ++update_state_generation_;
   }
   return render_target;
 }
@@ -1397,6 +1472,8 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   if (length_tiles == 0) {
     return;
   }
+  // FH1 (#45): any ownership change (most calls change nothing, but telling needs the walk).
+  ++update_state_generation_;
   uint32_t dest_pitch_tiles = dest.GetPitchTiles();
   bool dest_is_64bpp = dest.Is64bpp();
   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&

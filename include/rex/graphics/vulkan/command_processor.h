@@ -157,6 +157,11 @@ class VulkanCommandProcessor : public CommandProcessor {
     assert_true(submission_open_);
     return deferred_command_buffer_;
   }
+  // FH1 (#45): barriers pushed and not submitted yet (render target update reuse checks).
+  size_t GetPendingBarrierCount() const {
+    return pending_barriers_buffer_memory_barriers_.size() +
+           pending_barriers_image_memory_barriers_.size() + pending_barriers_.size();
+  }
 
   bool submission_open() const { return submission_open_; }
   Fh1Dlss* fh1_dlss() const { return fh1_dlss_.get(); }

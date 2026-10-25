@@ -149,6 +149,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+  // FH1 (#45): draws whose Update was the previous one's (vulkan_render_target_update_reuse),
+  // and those verified against the full Update (..._verify) and found different, since the last
+  // call.
+  void TakeUpdateReuseStats(uint64_t& updates_out, uint64_t& reused_out,
+                            uint64_t& mismatches_out) {
+    updates_out = update_reuse_updates_;
+    reused_out = update_reuse_hits_;
+    mismatches_out = update_reuse_mismatches_;
+    update_reuse_updates_ = update_reuse_hits_ = update_reuse_mismatches_ = 0;
+  }
   // FH1 (#378): the render pass key Update would use for a draw that has not run yet, from the
   // current registers (RenderTargetCache::PredictUpdate), for building its pipeline ahead.
   bool PredictRenderPassKey(BindingPrediction& prediction, bool is_rasterization_done,
@@ -323,6 +333,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   const RenderTarget* const*
       last_update_framebuffer_attachments_[1 + xenos::kMaxColorRenderTargets] = {};
   const Framebuffer* last_update_framebuffer_ = VK_NULL_HANDLE;
+
+  // FH1 (#45): the inputs of the last full Update and the state generation after it.
+  bool UpdateFull(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                  uint32_t normalized_color_mask, const Shader& vertex_shader);
+  bool AccumulatedRenderTargetsInDrawUsage() const;
+  UpdateInputs update_reuse_inputs_;
+  uint64_t update_reuse_generation_ = 0;
+  bool update_reuse_valid_ = false;
+  uint64_t update_reuse_updates_ = 0;
+  uint64_t update_reuse_hits_ = 0;
+  uint64_t update_reuse_mismatches_ = 0;
 
   // For host render targets.
 

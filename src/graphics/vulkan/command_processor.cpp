@@ -51,6 +51,7 @@
 #include <unistd.h>
 #endif
 #include "fh1_readback_history.h"
+REXCVAR_DECLARE(bool, vulkan_render_target_update_reuse_verify);
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
 REXCVAR_DECLARE(bool, forza_present_16_9);
@@ -7581,6 +7582,23 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
           const ui::vulkan::VulkanDevice::Properties& properties =
               GetVulkanDevice()->properties();
           ReadSensors(properties.vendorID, properties.deviceID, snapshot);
+          // FH1 (#45): how many draws kept the previous render target setup, once a minute.
+          for (VulkanRenderTargetCache* rt_cache :
+               {render_target_cache_.get(), fh1_other_render_targets_.get()}) {
+            if (!rt_cache) {
+              continue;
+            }
+            uint64_t updates, reused, mismatches;
+            rt_cache->TakeUpdateReuseStats(updates, reused, mismatches);
+            if (updates) {
+              REXGPU_INFO(
+                  "Render target update reuse: {} of {} draws ({:.1f}%){}", reused, updates,
+                  100.0 * double(reused) / double(updates),
+                  REXCVAR_GET(vulkan_render_target_update_reuse_verify)
+                      ? fmt::format(", verified, {} differed", mismatches)
+                      : std::string());
+            }
+          }
         });
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
