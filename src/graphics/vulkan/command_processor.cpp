@@ -199,14 +199,13 @@ bool Fh1NativeEnabled() {
 // A pitch match alone does not make a draw part of the native display.
 bool Fh1ScreenViewport(const RegisterFile& regs) {
   const auto pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
-  if (pitch != 1280 && pitch != 640 && pitch != 320 && pitch != 160) return false;
   const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
   const auto tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
   const auto br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
-  return fh1::IsDisplayViewport(vte.vport_x_scale_ena, vte.vport_y_scale_ena,
-      regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
-      regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
-      br.br_x - tl.tl_x, br.br_y - tl.tl_y);
+  return fh1::IsNativeScreenViewport(pitch, vte.vport_x_scale_ena, vte.vport_y_scale_ena,
+                                     regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
+                                     regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+                                     br.br_x - tl.tl_x, br.br_y - tl.tl_y);
 }
 
 // glslang default built-in resource limits.
