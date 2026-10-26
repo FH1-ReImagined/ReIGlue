@@ -373,6 +373,33 @@ bool VulkanSharedMemory::UploadRanges(
   return successful;
 }
 
+// Patch 0396: VR true stereo's right eye pass repeats the left eye's uploads with their data.
+bool VulkanSharedMemory::Fh1UploadData(uint32_t start, const uint8_t* data, uint32_t length) {
+  if (!length) return true;
+  Use(Usage::kTransferDestination, std::make_pair(start, length));
+  command_processor_.SubmitBarriers(true);
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  const uint64_t submission_current = command_processor_.GetCurrentSubmission();
+  while (length) {
+    VkBuffer upload_buffer;
+    VkDeviceSize upload_buffer_offset, upload_buffer_size;
+    uint8_t* mapping = upload_buffer_pool_->RequestPartial(
+        submission_current, length, size_t(1) << page_size_log2(), upload_buffer,
+        upload_buffer_offset, upload_buffer_size);
+    if (!mapping) return false;
+    std::memcpy(mapping, data, size_t(upload_buffer_size));
+    VkBufferCopy region;
+    region.srcOffset = upload_buffer_offset;
+    region.dstOffset = start;
+    region.size = upload_buffer_size;
+    command_buffer.CmdVkCopyBuffer(upload_buffer, buffer_, 1, &region);
+    start += uint32_t(upload_buffer_size);
+    data += upload_buffer_size;
+    length -= uint32_t(upload_buffer_size);
+  }
+  return true;
+}
+
 void VulkanSharedMemory::WriteUsageBarrier(Usage from, Usage to) {
   VkPipelineStageFlags src_stage_mask, dst_stage_mask;
   VkAccessFlags src_access_mask, dst_access_mask;

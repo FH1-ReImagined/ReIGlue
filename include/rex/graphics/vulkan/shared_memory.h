@@ -56,6 +56,7 @@ class VulkanSharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  bool Fh1UploadData(uint32_t start, const uint8_t* data, uint32_t length) override;  // patch 0396
 
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,

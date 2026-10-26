@@ -833,6 +833,42 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool fh1_vr_sharpen_failed_ = false;
   bool Fh1VrSharpenEnsurePipeline();
   void Fh1VrSharpen(Fh1VrSlot& slot, uint32_t width, uint32_t height, uint32_t frame_index);
+  // Patch 0396: true stereo. The base command processor executes the main view's segment of
+  // the frame twice (CommandProcessor::Fh1Stereo*); here: which draws start and end it, each
+  // eye's offset for the main view's 3D draws, the left eye's picture (the pre-HUD composite
+  // before the right eye's pass) and both eyes, side by side, for the VR client.
+  bool Fh1StereoWanted() override;
+  Fh1StereoDraw Fh1StereoClassify() override;
+  void Fh1StereoBegin() override;
+  bool Fh1StereoLeftDone() override;
+  void Fh1StereoReplayBegin() override;
+  void Fh1StereoEnd(bool right_eye_done) override;
+  void Fh1StereoRegistersReplaced() override;
+  SharedMemory* Fh1StereoSharedMemory() override;
+  // The main view's 3D draws while an eye is drawn: the offset to take from the clip-space
+  // position (zero for every other draw).
+  void Fh1StereoDrawOffset(const reg::RB_DEPTHCONTROL& normalized_depth_control);
+  int fh1_stereo_eye_ = -1;  // -1: mono; 0: the left eye's pass; 1: the right eye's
+  float fh1_stereo_eye_clip_[2][4] = {};
+  float fh1_stereo_draw_eye_[4] = {};
+  uint32_t fh1_stereo_scissor_x_[2][2] = {{0, 1280}, {0, 1280}};  // guest pixels per eye
+  bool fh1_stereo_draw_scissor_ = false;
+  bool fh1_stereo_mirrored_ = false, fh1_stereo_handedness_known_ = false;
+  uint32_t fh1_stereo_depth_base_ = UINT32_MAX;
+  bool fh1_stereo_composite_seen_ = false;
+  uint32_t fh1_stereo_composite_base_ = 0;
+  uint64_t fh1_stereo_offset_draws_ = 0;  // this frame's draws with the eye offset (left eye)
+  std::array<HdrScene, kMaxFramesInFlight> fh1_stereo_left_{};
+  VkDescriptorPool fh1_stereo_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_stereo_gamma_source_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_stereo_gamma_destination_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_stereo_sharpen_sets_{};
+  bool fh1_stereo_failed_ = false;
+  bool Fh1StereoEnsureDescriptors();
+  bool Fh1StereoLayers(Fh1VrSlot& slot, uint32_t width, uint32_t height, VkPipeline gamma_pipeline,
+                       VkDescriptorSet gamma_ramp_set, uint32_t frame_index);
+  void Fh1VrSharpenImage(VkImageView source, VkImage destination, VkImageView destination_view,
+                         VkDescriptorSet set, uint32_t width, uint32_t height);
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;

@@ -17,6 +17,9 @@
 #define REX_GUEST_OUTPUT_EXPORT_FRAMES 0x1u  // the guest output (patch 0391)
 #define REX_GUEST_OUTPUT_EXPORT_LAYERS 0x2u  // the scene before the HUD and the HUD alone
 #define REX_GUEST_OUTPUT_EXPORT_STEREO 0x4u  // both eyes from the scene and its depth (patch 0394)
+// Patch 0396: both eyes drawn by the game's renderer (the main view's commands executed once per
+// eye, each with its eye's offset): true stereo, in the same side-by-side layer as patch 0394's.
+#define REX_GUEST_OUTPUT_EXPORT_TRUE_STEREO 0x8u
 
 // RexGuestOutputLayers::layers bits.
 #define REX_GUEST_OUTPUT_LAYER_SCENE 0x1u
@@ -43,6 +46,12 @@ uint32_t rexui_GuestOutputExportFlags(void);
 // Stereo (patch 0394): the eyes' distance in metres and the most a pixel may shift, a fraction of
 // the picture's width.
 void rexui_GuestOutputStereoParams(float* eye_distance, float* max_shift);
+// Patch 0396: true stereo's eyes: their distance in metres and the main view's projection scale
+// in x (P00: 1 / the tangent of half its horizontal field of view), for the offset in clip space.
+void rexui_GuestOutputTrueStereoParams(float* eye_distance, float* p00);
+// Patch 0396: the part of the picture each eye sees, across: left eye's first and last, right
+// eye's first and last, fractions of the width (0 and 1: all of it).
+void rexui_GuestOutputTrueStereoEyes(float* eye_x);
 // Patch 0395: how much the scene layer is sharpened, 0 (not at all) to 1 (the most): a
 // contrast-adaptive sharpening pass on the scene before it is handed over (the desktop window's
 // FSR/CAS present effect never reaches the headset's picture).

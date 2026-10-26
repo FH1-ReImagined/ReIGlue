@@ -150,6 +150,8 @@ std::atomic<bool> enabled{false};
 std::atomic<uint32_t> flags{0};  // patch 0393: REX_GUEST_OUTPUT_EXPORT_*
 std::atomic<float> stereo_eye_distance{0.064f}, stereo_max_shift{0.03f};
 std::atomic<float> sharpen{0.0f};  // patch 0395
+std::atomic<float> true_stereo_eye_distance{0.064f}, true_stereo_p00{0.0f};  // patch 0396
+std::atomic<float> true_stereo_eye_x[4] = {0.0f, 1.0f, 0.0f, 1.0f};
 std::atomic<uint32_t> next_tag{0};
 std::mutex mutex;
 std::shared_ptr<void> latest;  // keeps the image alive while it is the newest
@@ -3422,6 +3424,29 @@ REX_GUEST_OUTPUT_EXPORT void rexui_SetGuestOutputStereo(float eye_distance, floa
   namespace e = rex::ui::vulkan::guest_output_export;
   e::stereo_eye_distance.store(eye_distance, std::memory_order_relaxed);
   e::stereo_max_shift.store(max_shift, std::memory_order_relaxed);
+}
+
+// Patch 0396: true stereo's eyes (the headset's eye distance in metres; the main view's P00, the
+// reciprocal of the tangent of half its horizontal field of view). 0 for P00: no offset yet.
+REX_GUEST_OUTPUT_EXPORT void rexui_GuestOutputTrueStereoParams(float* eye_distance, float* p00) {
+  namespace e = rex::ui::vulkan::guest_output_export;
+  if (eye_distance) *eye_distance = e::true_stereo_eye_distance.load(std::memory_order_relaxed);
+  if (p00) *p00 = e::true_stereo_p00.load(std::memory_order_relaxed);
+}
+REX_GUEST_OUTPUT_EXPORT void rexui_SetGuestOutputTrueStereo(float eye_distance, float p00) {
+  namespace e = rex::ui::vulkan::guest_output_export;
+  e::true_stereo_eye_distance.store(eye_distance, std::memory_order_relaxed);
+  e::true_stereo_p00.store(p00, std::memory_order_relaxed);
+}
+// Each eye's part of the picture across (left eye's first and last, right eye's; fractions).
+REX_GUEST_OUTPUT_EXPORT void rexui_GuestOutputTrueStereoEyes(float* eye_x) {
+  namespace e = rex::ui::vulkan::guest_output_export;
+  for (int i = 0; i < 4; ++i) eye_x[i] = e::true_stereo_eye_x[i].load(std::memory_order_relaxed);
+}
+REX_GUEST_OUTPUT_EXPORT void rexui_SetGuestOutputTrueStereoEyes(const float* eye_x) {
+  namespace e = rex::ui::vulkan::guest_output_export;
+  for (int i = 0; i < 4; ++i)
+    e::true_stereo_eye_x[i].store(eye_x ? eye_x[i] : (i & 1 ? 1.0f : 0.0f), std::memory_order_relaxed);
 }
 
 // Patch 0395: the client's sharpening of the scene layer, 0 (off) to 1.
