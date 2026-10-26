@@ -1,0 +1,43 @@
+ReIGlue
+A fork of ReXGlue for Forza recompilations, starting with Forza Horizon 1: ReImagined.
+https://github.com/FH1-ReImagined/ReIGlue
+
+ReXGlue
+  https://github.com/rexglue/rexglue-sdk
+  Copyright (c) 2026, Tom Clay <tomc@tctechstuff.com> and the ReXGlue contributors.
+  BSD 3-Clause License: see LICENSE. ReIGlue is ReXGlue with changes on top; the
+  license, copyright notices and history of ReXGlue are kept unchanged.
+
+Xenia
+  https://xenia.jp, https://github.com/xenia-project/xenia
+  Copyright (c) 2022, Ben Vanik and Xenia project contributors.
+  ReXGlue's runtime and Xenos GPU emulation are derived from Xenia (see LICENSE).
+  Many ReIGlue changes port later Xenia fixes; their commit messages name them.
+
+Pinyon Shift
+  https://github.com/arcanite24/pinyon-shift
+  https://github.com/arcanite24/shiftglue-sdk
+  Copyright (c) 2026, Pinyon Shift contributors.
+  BSD 3-Clause License: see LICENSE-Pinyon-Shift. Adapted here: the native
+  ultrawide presentation and HUD viewport transforms (0063), the scRGB HDR
+  presenter, highlight curve and HUD coverage shaders (0091), and the contraction
+  part of its macOS pixel-math tuning (0082).
+
+Downloaded at configure time, not stored in this repository (pinned revisions,
+SHA-256 checked; each license is installed beside the GPU library):
+  NVIDIA DLSS SDK headers and loader (NVIDIA's license in that SDK), for 0046.
+  AMD FidelityFX SDK FSR 3.1 shaders (MIT), for 0072.
+  SMAA by Jorge Jimenez et al., iryoku/smaa (MIT), for 0077.
+
+ReIGlue contributors
+  The changes on top of ReXGlue come from the Forza Horizon 1: ReImagined project
+  (https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined); the first ones
+  were written for RecompiledHaloReach. Authors, as each commit records:
+    Maximiliano Militzer (Dyotson)
+    Sean O’Connor (soconnor0919)
+  Thanks also to the players who reported problems and sent logs; the issues the
+  commit messages cite (#N, Forza Horizon 1: ReImagined's issues) name them.
+
+Xbox, Xbox 360 and Forza are trademarks of Microsoft. ReIGlue is not affiliated
+with or endorsed by Microsoft, Xbox, Playground Games, Turn 10 or the ReXGlue
+project.
