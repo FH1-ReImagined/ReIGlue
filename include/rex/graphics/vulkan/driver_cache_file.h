@@ -170,15 +170,30 @@ inline ReadResult Read(const std::filesystem::path& path, const Identity& id) {
   return result;
 }
 
+// Used only by the serialized storage writer. Keep weak references so remembering a
+// successful save does not keep old driver payloads alive after cache replacement.
+struct WriteState {
+  struct SavedEntry {
+    uint64_t key;
+    uint32_t fresh_size;
+    uint64_t checksum;
+    std::weak_ptr<const std::vector<uint8_t>> data;
+  };
+  std::filesystem::path path;
+  std::array<uint8_t, kHeaderSize> header{};
+  std::vector<SavedEntry> entries;
+};
 struct WriteResult {
   bool written = false;
+  bool unchanged = false;
   // Counts include only valid entries; skipped entries did not fit the file budget.
   size_t entries = 0;
   size_t skipped = 0;
   uint64_t bytes = 0;
 };
 inline WriteResult Write(const std::filesystem::path& path, const std::vector<Entry>& entries,
-                         const Identity& id, uint64_t budget = kMaxFileSize) {
+                         const Identity& id, uint64_t budget = kMaxFileSize,
+                         WriteState* state = nullptr) {
   WriteResult result;
   budget = std::min(budget, kMaxFileSize);
   if (budget < kHeaderSize) return result;
@@ -196,6 +211,25 @@ inline WriteResult Write(const std::filesystem::path& path, const std::vector<En
   }
   result.bytes = bytes;
   result.entries = valid.size();
+  const auto header = EncodeHeader(id, valid.size());
+  if (state && state->path == path && state->header == header &&
+      state->entries.size() == valid.size()) {
+    bool same = true;
+    for (size_t i = 0; i < valid.size(); ++i) {
+      const auto& saved = state->entries[i];
+      const auto& entry = *valid[i];
+      const auto data = saved.data.lock();
+      // Check bytes as well as the checksum when the immutable payload changed:
+      // collisions must never suppress a changed retained entry.
+      if (saved.key != entry.key || saved.fresh_size != entry.fresh_size ||
+          saved.checksum != entry.checksum || !data ||
+          (data != entry.data && *data != *entry.data)) {
+        same = false;
+        break;
+      }
+    }
+    if (same) { result.unchanged = true; return result; }
+  }
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
   if (ec) return result;
@@ -211,7 +245,6 @@ inline WriteResult Write(const std::filesystem::path& path, const std::vector<En
   bool written = false;
   {
     std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-    const auto header = EncodeHeader(id, valid.size());
     bool ok = bool(file.write(reinterpret_cast<const char*>(header.data()), kHeaderSize));
     for (const Entry* entry : valid) {
       if (!ok) break;
@@ -236,6 +269,15 @@ inline WriteResult Write(const std::filesystem::path& path, const std::vector<En
 #endif
   }
   if (!written) std::filesystem::remove(temporary, ec);
+  // Failed writes leave the last successful snapshot intact, allowing a retry.
+  if (written && state) {
+    state->path = path;
+    state->header = header;
+    state->entries.clear();
+    state->entries.reserve(valid.size());
+    for (const Entry* entry : valid)
+      state->entries.push_back({entry->key, entry->fresh_size, entry->checksum, entry->data});
+  }
   result.written = written;
   return result;
 }

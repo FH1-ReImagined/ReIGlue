@@ -434,6 +434,7 @@ class VulkanPipelineCache {
   std::filesystem::path driver_cache_path_;
   uint64_t driver_cache_generation_ = 0;
   uint64_t driver_cache_saved_generation_ = 0;
+  driver_cache_file::WriteState driver_cache_write_state_;
   bool driver_cache_limit_logged_ = false;
   std::atomic<uint32_t> driver_cache_reused_{0};
   std::atomic<uint32_t> driver_cache_compiled_{0};

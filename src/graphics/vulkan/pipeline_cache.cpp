@@ -440,6 +440,7 @@ void VulkanPipelineCache::DestroyDriverPipelineCache() {
   driver_cache_path_.clear();
   driver_cache_generation_ = 0;
   driver_cache_saved_generation_ = 0;
+  driver_cache_write_state_ = {};
   driver_cache_limit_logged_ = false;
   driver_cache_reused_ = 0;
   driver_cache_compiled_ = 0;
@@ -724,12 +725,13 @@ void VulkanPipelineCache::SaveDriverPipelineCache() {
   std::sort(entries.begin(), entries.end(),
             [](const auto& a, const auto& b) { return a.key < b.key; });
   // Encoding and writing run outside the lock, on the storage writer thread during play.
-  const auto result = driver_cache_file::Write(path, entries, identity);
+  const auto result = driver_cache_file::Write(
+      path, entries, identity, driver_cache_file::kMaxFileSize, &driver_cache_write_state_);
   bool log_limit = false;
   {
     std::lock_guard lock(driver_cache_mutex_);
     // A bounded subset is a completed save; retry I/O failures on the next save.
-    if (result.written && path == driver_cache_path_) {
+    if ((result.written || result.unchanged) && path == driver_cache_path_) {
       driver_cache_saved_generation_ = generation;
     }
     if (result.written && result.skipped && !driver_cache_limit_logged_) {
@@ -740,7 +742,7 @@ void VulkanPipelineCache::SaveDriverPipelineCache() {
   if (result.written) {
     REXGPU_INFO("Vulkan driver pipeline cache: saved {} bytes for {} pipelines", result.bytes,
                 result.entries);
-  } else {
+  } else if (!result.unchanged) {
     REXGPU_WARN("Could not save Vulkan driver pipeline cache; existing cache retained");
   }
   if (log_limit) {
