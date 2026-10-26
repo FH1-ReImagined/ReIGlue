@@ -248,7 +248,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 
   if (auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system())) {
     input_sys->SetActiveCallback([this]() {
-      if (window_ && !window_->HasFocus())
+      // Patch 0392: pads may stay active without focus (the keyboard and mouse driver checks
+      // the focus itself).
+      if (window_ && !window_->HasFocus() && !rex::input::PadsWithoutFocus())
         return false;
       if (!imgui_drawer_ ||
           (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_))

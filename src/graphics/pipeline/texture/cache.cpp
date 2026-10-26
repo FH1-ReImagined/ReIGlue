@@ -412,6 +412,17 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   if (!base_outdated && !mips_outdated) {
     return false;
   }
+  // Patch 0396: in VR true stereo's right eye pass, a texture is loaded again only from what
+  // that pass has written (as the left eye's pass did); any other keeps what the left eye's pass
+  // drew with (the CPU or the rest of the frame may have rewritten its memory since) and stays
+  // outdated for the next frame.
+  if (shared_memory().fh1_keep_uploaded() &&
+      !(base_outdated && shared_memory().Fh1WrittenInReplay(
+                             texture.key().base_page << 12, uint32_t(texture.GetGuestBaseSize()))) &&
+      !(mips_outdated && shared_memory().Fh1WrittenInReplay(
+                             texture.key().mip_page << 12, uint32_t(texture.GetGuestMipsSize())))) {
+    return false;
+  }
 
   pending_load_out.texture = &texture;
   pending_load_out.load_base = base_outdated;

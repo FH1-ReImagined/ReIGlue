@@ -288,6 +288,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
     return;
   }
   length = std::min(length, kBufferSize - start);
+  if (fh1_keep_uploaded_) fh1_replay_writes_.emplace_back(start, length);  // patch 0396
   uint32_t end = start + length - 1;
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
@@ -424,6 +425,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       return false;
     }
   }
+  if (fh1_keep_uploaded_) {
+    return true;  // patch 0396
+  }
 
   // Nothing to upload if every page is valid already, the common case for data
   // drawn from again. Check that without the global critical region, which the
@@ -532,6 +536,22 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 
   if (upload_ranges_.empty()) {
     return true;
+  }
+
+  // Patch 0396: the data as uploaded now, for VR true stereo's right eye pass.
+  if (fh1_upload_position_source_ && !fh1_upload_log_overflow_) {
+    for (const std::pair<uint32_t, uint32_t>& range : upload_ranges_) {
+      const uint32_t start = range.first << page_size_log2_;
+      const uint32_t length = range.second << page_size_log2_;
+      if (fh1_upload_data_.size() + length > (size_t(256) << 20)) {
+        fh1_upload_log_overflow_ = true;
+        break;
+      }
+      const size_t offset = fh1_upload_data_.size();
+      fh1_upload_data_.resize(offset + length);
+      std::memcpy(fh1_upload_data_.data() + offset, memory().TranslatePhysical(start), length);
+      fh1_uploads_.push_back({fh1_upload_position_source_->size(), start, length, offset});
+    }
   }
 
   return UploadRanges(upload_ranges_);

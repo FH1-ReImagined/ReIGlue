@@ -22,6 +22,8 @@
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
 
+#include "vulkan_creation_hooks.h"
+
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
@@ -778,8 +780,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   // Create the device.
 
+  // patch 0390: a client (an OpenXR runtime) may create the device with its own extensions.
+  const RexVulkanCreationHooks* const creation_hooks = GetVulkanCreationHooks();
   const VkResult device_create_result =
-      ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
+      creation_hooks && creation_hooks->create_device
+          ? creation_hooks->create_device(creation_hooks->user, ifn.vkGetInstanceProcAddr,
+                                          physical_device, &device_create_info, &device->device_)
+          : ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
   if (device_create_result != VK_SUCCESS) {
     REXLOG_ERROR(
         "Failed to create a Vulkan logical device from the physical device "

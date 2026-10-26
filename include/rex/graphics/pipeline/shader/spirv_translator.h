@@ -314,8 +314,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // ZW: inverse of that ratio for generated guest pixel coordinates.
     float fh1_native[4];
     uint32_t fh1_native_textures;
+    uint32_t fh1_padding[3];
+    // Patch 0396: VR true stereo: subtracted from the guest's clip-space position (the eye's
+    // offset for the main view's 3D draws; zero for every other draw).
+    float fh1_vr_eye[4];
   };
   static_assert(offsetof(SystemConstants, fh1_native) % 16 == 0);
+  static_assert(offsetof(SystemConstants, fh1_vr_eye) % 16 == 0);
 
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
@@ -897,6 +902,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramBlendConstant,
     kSystemConstantFh1Native,
     kSystemConstantFh1NativeTextures,
+    kSystemConstantFh1VrEye,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;

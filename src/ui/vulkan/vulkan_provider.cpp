@@ -19,6 +19,8 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 
+#include "vulkan_creation_hooks.h"
+
 REXCVAR_DEFINE_BOOL(vulkan_validation_enabled, false, "UI/Vulkan",
                     "Enable Vulkan validation layers")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -83,7 +85,29 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     REXLOG_WARN("* {}: {}", physical_device_index, physical_device_properties.deviceName);
   }
 
-  if (REXCVAR_GET(vulkan_device) >= 0 &&
+  // patch 0390: a client (an OpenXR runtime) may name the GPU; it is tried first and alone.
+  if (const RexVulkanCreationHooks* hooks = GetVulkanCreationHooks();
+      hooks && hooks->physical_device) {
+    const VkPhysicalDevice wanted =
+        hooks->physical_device(hooks->user, provider->vulkan_instance_->instance());
+    if (wanted != VK_NULL_HANDLE) {
+      VkPhysicalDeviceProperties wanted_properties;
+      ifn.vkGetPhysicalDeviceProperties(wanted, &wanted_properties);
+      REXLOG_INFO("Vulkan device chosen by the creation hook (OpenXR runtime): {}",
+                  wanted_properties.deviceName);
+      if (REXCVAR_GET(vulkan_device) >= 0 || !REXCVAR_GET(gpu_vendor).empty()) {
+        REXLOG_WARN("vulkan_device / gpu_vendor are ignored: the OpenXR runtime picks the GPU");
+      }
+      provider->vulkan_device_ = VulkanDevice::CreateIfSupported(
+          provider->vulkan_instance_.get(), wanted, with_gpu_emulation, with_presentation);
+      if (!provider->vulkan_device_) {
+        REXLOG_WARN("The OpenXR runtime's Vulkan device '{}' cannot run the game; choosing another",
+                    wanted_properties.deviceName);
+      }
+    }
+  }
+
+  if (!provider->vulkan_device_ && REXCVAR_GET(vulkan_device) >= 0 &&
       uint32_t(REXCVAR_GET(vulkan_device)) < physical_devices.size()) {
     provider->vulkan_device_ = VulkanDevice::CreateIfSupported(
         provider->vulkan_instance_.get(), physical_devices[REXCVAR_GET(vulkan_device)],

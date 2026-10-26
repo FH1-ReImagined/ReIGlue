@@ -36,6 +36,8 @@ class ByteStream;
 
 namespace rex::graphics {
 
+class SharedMemory;
+
 class GraphicsSystem;
 class Shader;
 
@@ -225,6 +227,31 @@ class CommandProcessor {
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
   virtual bool IssueCopy() = 0;
 
+  // Patch 0396 (VR true stereo): the main view drawn for both eyes from one frame's commands.
+  // The packets from the clear before the main view's scene up to the first HUD draw are
+  // executed as usual (the left eye) and logged; before that HUD draw the register state of the
+  // segment's start is put back and the log is executed again (the right eye), then the HUD draw
+  // continues with the state it had. The backend says which draws start and end the segment,
+  // applies each eye's offset and keeps the left eye's picture.
+  enum class Fh1StereoState : uint8_t { kOff, kSpeculative, kRecording, kReplaying };
+  enum class Fh1StereoDraw : uint8_t { kOther, kClear, kSegmentStart, kSegmentEnd };
+  // Whether this frame should be drawn for both eyes (the client asks, the path supports it).
+  virtual bool Fh1StereoWanted() { return false; }
+  // Before a draw (registers set, not issued yet) while the segment may start or end.
+  virtual Fh1StereoDraw Fh1StereoClassify() { return Fh1StereoDraw::kOther; }
+  // The left eye's pass starts (from the segment's first draw on, eye 0).
+  virtual void Fh1StereoBegin() {}
+  // At the segment's end: the left eye is complete; keep its picture. False: no right eye.
+  virtual bool Fh1StereoLeftDone() { return false; }
+  // The right eye's pass starts (eye 1) / is over (true: complete; false: dropped).
+  virtual void Fh1StereoReplayBegin() {}
+  virtual void Fh1StereoEnd(bool right_eye_done) { (void)right_eye_done; }
+  // The register file was replaced wholesale: every value derived from it is stale.
+  virtual void Fh1StereoRegistersReplaced() {}
+  // The GPU's copy of guest memory, whose uploads the left eye's pass logs.
+  virtual SharedMemory* Fh1StereoSharedMemory() { return nullptr; }
+  bool fh1_stereo_replaying() const { return fh1_stereo_state_ == Fh1StereoState::kReplaying; }
+
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const { return swap_post_effect_actual_; }
@@ -278,6 +305,22 @@ class CommandProcessor {
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
+
+  // Patch 0396: the stereo segment's log (guest-endian packet words; LOAD_ALU_CONSTANT made
+  // into register writes, indirect buffers flattened, fences and waits left out) and the state
+  // at its start.
+  Fh1StereoState fh1_stereo_state_ = Fh1StereoState::kOff;
+  bool fh1_stereo_frame_done_ = false;
+  std::vector<uint32_t> fh1_stereo_log_;
+  std::vector<uint32_t> fh1_stereo_registers_start_;
+  std::vector<uint32_t> fh1_stereo_registers_end_;
+  Shader* fh1_stereo_shaders_start_[2] = {};
+  uint64_t fh1_stereo_bins_start_[2] = {};
+  uint64_t fh1_stereo_replays_ = 0, fh1_stereo_dropped_ = 0;
+  void Fh1StereoOnDraw();
+  void Fh1StereoLogPacket(memory::RingBuffer* reader, uint32_t start_offset, uint32_t packet);
+  void Fh1StereoReplay();
+  void Fh1StereoOnSwap();
 
   bool paused_ = false;
 
