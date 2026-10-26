@@ -11,6 +11,7 @@ else()
   target_compile_options(controller_disconnect_test PRIVATE -UNDEBUG)
 endif()
 if(WIN32)
+  target_compile_definitions(controller_disconnect_test PRIVATE NOMINMAX)
   add_custom_command(TARGET controller_disconnect_test POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rex::runtime>"
       "$<TARGET_FILE_DIR:controller_disconnect_test>")
