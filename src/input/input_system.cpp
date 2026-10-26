@@ -554,6 +554,21 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
   return input;
 }
 
+namespace {
+std::atomic<bool> pads_without_focus{false};
+}  // namespace
+
+void SetPadsWithoutFocus(bool on) {
+  // SDL drops joystick presses while no window has keyboard focus unless this hint is set (the
+  // wheel driver sets it too). The focus check of the active callback still applies when off.
+  if (on) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+  if (pads_without_focus.exchange(on) != on)
+    REXLOG_INFO("Input: pads and wheels {}", on ? "work while the window has no focus"
+                                                : "need the window's focus again");
+}
+
+bool PadsWithoutFocus() { return pads_without_focus.load(std::memory_order_relaxed); }
+
 }  // namespace rex::input
 
 // Dynamically discovered by the opt-in FH1 bridge, so older runtimes remain
@@ -569,4 +584,10 @@ extern "C" FORZA_TRIGGER_EXPORT int ForzaInputTriggerRumble(
   if (!kernel || !kernel->emulator()) return 0;
   auto* input = dynamic_cast<rex::input::InputSystem*>(kernel->emulator()->input_system());
   return input ? input->SetTriggerRumble(user_mask & 15u, left, right, duration) : 0;
+}
+
+// Patch 0392: found at run time by the game (its OpenXR session), so the game still starts on a
+// runtime without it.
+extern "C" FORZA_TRIGGER_EXPORT void rexinput_SetPadsWithoutFocus(int on) {
+  rex::input::SetPadsWithoutFocus(on != 0);
 }
