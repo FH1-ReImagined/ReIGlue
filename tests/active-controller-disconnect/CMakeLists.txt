@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.25)
+project(active_controller_disconnect LANGUAGES CXX)
+find_package(rexglue 0.10.0 REQUIRED CONFIG)
+enable_testing()
+add_executable(controller_disconnect_test controller_disconnect_test.cpp)
+target_compile_features(controller_disconnect_test PRIVATE cxx_std_23)
+target_link_libraries(controller_disconnect_test PRIVATE rex::runtime)
+if(MSVC)
+  target_compile_options(controller_disconnect_test PRIVATE /UNDEBUG)
+else()
+  target_compile_options(controller_disconnect_test PRIVATE -UNDEBUG)
+endif()
+if(WIN32)
+  add_custom_command(TARGET controller_disconnect_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rex::runtime>"
+      "$<TARGET_FILE_DIR:controller_disconnect_test>")
+endif()
+add_test(NAME active_controller_disconnect COMMAND controller_disconnect_test)
+set_tests_properties(active_controller_disconnect PROPERTIES TIMEOUT 30
+  PASS_REGULAR_EXPRESSION "SDK disconnect probe: active loss")

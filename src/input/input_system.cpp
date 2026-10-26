@@ -50,6 +50,10 @@ namespace {
 // flag and never reads this value.
 constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
 
+// 0399: only loss of the physical device last used by a guest user counts. Keyboard/NOP
+// emulation may keep the merged connected-user mask set after that controller is gone.
+std::array<std::atomic<uint32_t>, kMaxGuestUsers> physical_disconnects{};
+
 // XN_SYS_INPUTDEVICESCHANGED
 constexpr uint32_t kXNotificationSystemInputDevicesChanged = 0x00000012;
 
@@ -156,6 +160,13 @@ void InputSystem::RefreshDevices() {
   for (const auto& old : devices_) {
     if (std::none_of(seen.begin(), seen.end(),
                      [&](const DeviceInfo& d) { return d.id == old.id; })) {
+      if (!old.synthetic) {
+        for (uint32_t user = 0; user < kMaxGuestUsers; ++user) {
+          if (active_devices_.Active(user) == old.id) {
+            physical_disconnects[user].fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      }
       active_devices_.Forget(old.id);
       changed = true;
     }
@@ -590,4 +601,15 @@ extern "C" FORZA_TRIGGER_EXPORT int ForzaInputTriggerRumble(
 // runtime without it.
 extern "C" FORZA_TRIGGER_EXPORT void rexinput_SetPadsWithoutFocus(int on) {
   rex::input::SetPadsWithoutFocus(on != 0);
+}
+
+// Optional, read-only bridge: no class layout/vtable change and no enumeration on its caller.
+extern "C" FORZA_TRIGGER_EXPORT uint32_t ForzaInputDisconnectSequence(uint32_t user_mask) {
+  uint32_t sequence = 0;
+  for (uint32_t user = 0; user < rex::input::kMaxGuestUsers; ++user) {
+    if (user_mask & (1u << user)) {
+      sequence += rex::input::physical_disconnects[user].load(std::memory_order_relaxed);
+    }
+  }
+  return sequence;
 }
