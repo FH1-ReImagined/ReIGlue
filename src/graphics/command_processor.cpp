@@ -11,10 +11,14 @@
 
 #include "fh1_command_cursor.h"
 #include "fh1_frame_cost.h"
+#include "fh1_vr_stereo.h"
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -28,6 +32,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
+#include <rex/graphics/shared_memory.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -124,6 +129,9 @@ REXCVAR_DEFINE_BOOL(sync_pipeline_creation, false, "GPU",
                     "is made once and read back (a car's picture), which would otherwise lose "
                     "the skipped draws for good.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Patch 0391 (src/ui/vulkan/vulkan_presenter.cpp, the runtime): the next guest output's tag.
+extern "C" void rexui_SetNextGuestOutputTag(uint32_t tag);
 
 namespace rex::graphics {
 
@@ -444,6 +452,11 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+  // Patch 0396: the right eye's pass repeats state, not the signals to the CPU (scratch
+  // write-back) or the gamma ramp's sequential writes, which the left eye's pass did.
+  if (fh1_stereo_state_ == Fh1StereoState::kReplaying) [[unlikely]] {
+    return;
+  }
   if (!known_registers.IsKnown(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
@@ -821,6 +834,37 @@ __attribute__((noinline, cold)) void WarnUninitializedPacket() {
 }
 }  // namespace
 
+
+namespace fh1_frame_trace {
+// Patch 0396 (VR true stereo): FORZA_GPU_FRAME_TRACE=<file> writes one whole guest frame's packets
+// and draws to <file> each time <file>.trigger appears (the trigger is removed): the frame's
+// structure (passes, resolves, fences) that the stereo replay builds on. A test aid.
+FILE* file = nullptr;
+bool armed = false;
+uint32_t draws = 0;
+inline const char* Path() {
+  static const char* path = std::getenv("FORZA_GPU_FRAME_TRACE");
+  return path && *path ? path : nullptr;
+}
+// At a swap: ends a traced frame, or starts one when the trigger file is there.
+inline void OnSwap() {
+  if (file) {
+    std::fprintf(file, "E frame end, %u draws\n", draws);
+    std::fclose(file);
+    file = nullptr;
+  }
+  const char* path = Path();
+  if (!path) return;
+  std::string trigger = std::string(path) + ".trigger";
+  if (FILE* t = std::fopen(trigger.c_str(), "rb")) {
+    std::fclose(t);
+    std::remove(trigger.c_str());
+    file = std::fopen(path, "wb");
+    draws = 0;
+  }
+}
+}  // namespace fh1_frame_trace
+
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   uint32_t packet = reader->ReadAndSwap<uint32_t>();
   // Zero words and type-2 packets do nothing. The D3D library pads its command
@@ -838,14 +882,27 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     WarnUninitializedPacket();
   }
 
+  // Patch 0396: where the packet starts, for the stereo log.
+  const uint32_t packet_start =
+      (reader->read_offset() + reader->capacity() - sizeof(uint32_t)) % reader->capacity();
+  bool result;
   switch (packet >> 30) {
     case 0x03:
-      return ExecutePacketType3(reader, packet);
+      result = ExecutePacketType3(reader, packet);
+      break;
     case 0x00:
-      return ExecutePacketType0(reader, packet);
+      result = ExecutePacketType0(reader, packet);
+      break;
     default:
-      return ExecutePacketType1(reader, packet);
+      result = ExecutePacketType1(reader, packet);
+      break;
   }
+  if ((fh1_stereo_state_ == Fh1StereoState::kSpeculative ||
+       fh1_stereo_state_ == Fh1StereoState::kRecording) &&
+      result) [[unlikely]] {
+    Fh1StereoLogPacket(reader, packet_start, packet);
+  }
+  return result;
 }
 
 bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
@@ -932,6 +989,16 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
   }
 
+  if (fh1_frame_trace::file && opcode != PM4_SET_CONSTANT && opcode != PM4_SET_CONSTANT2 &&
+      opcode != PM4_SET_SHADER_CONSTANTS && opcode != PM4_DRAW_INDX && opcode != PM4_DRAW_INDX_2 &&
+      opcode != PM4_NOP) {
+    memory::RingBuffer peek = *reader;
+    std::fprintf(fh1_frame_trace::file, "P %02X n=%u pred=%u", opcode, count, packet & 1);
+    for (uint32_t i = 0; i < std::min<uint32_t>(count, 4); ++i)
+      std::fprintf(fh1_frame_trace::file, " %08X", peek.ReadAndSwap<uint32_t>());
+    std::fprintf(fh1_frame_trace::file, " binsel=%llX binmask=%llX\n",
+                 (unsigned long long)bin_select_, (unsigned long long)bin_mask_);
+  }
   bool result = false;
   switch (opcode) {
     case PM4_ME_INIT:
@@ -1071,6 +1138,173 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   return result;
 }
 
+// Patch 0396: VR true stereo by executing the main view's segment of the frame twice
+// (fh1_vr_stereo.h).
+
+void CommandProcessor::Fh1StereoLogPacket(memory::RingBuffer* reader, uint32_t start_offset,
+                                          uint32_t packet) {
+  const uint32_t words = fh1_vr_stereo::PacketWords(packet);
+  if (!words) return;
+  if ((packet >> 30) == 0x03) {
+    const uint32_t opcode = (packet >> 8) & 0x7F;
+    if (fh1_vr_stereo::SkipsOpcode(opcode)) return;
+    if (opcode == PM4_LOAD_ALU_CONSTANT) {
+      // The constants as they were loaded: the CPU may rewrite their memory before the right
+      // eye's pass. A type-0 packet with the registers' values now.
+      memory::RingBuffer peek = *reader;
+      peek.set_read_offset(start_offset + sizeof(uint32_t));
+      peek.ReadAndSwap<uint32_t>();  // address
+      const uint32_t offset_type = peek.ReadAndSwap<uint32_t>();
+      const uint32_t size = peek.ReadAndSwap<uint32_t>() & 0xFFF;
+      uint32_t first = 0;
+      const uint32_t header = fh1_vr_stereo::LoadedConstantsHeader(
+          offset_type, size, RegisterFile::kRegisterCount, &first);
+      if (!header) return;
+      fh1_stereo_log_.push_back(rex::byte_swap(header));
+      for (uint32_t i = 0; i < size; ++i)
+        fh1_stereo_log_.push_back(rex::byte_swap(register_file_->values[first + i]));
+      return;
+    }
+  }
+  const size_t at = fh1_stereo_log_.size();
+  fh1_stereo_log_.resize(at + words);
+  memory::RingBuffer peek = *reader;
+  peek.set_read_offset(start_offset);
+  peek.Read(reinterpret_cast<uint8_t*>(fh1_stereo_log_.data() + at), words * sizeof(uint32_t));
+}
+
+void CommandProcessor::Fh1StereoOnDraw() {
+  const Fh1StereoDraw kind = Fh1StereoClassify();
+  auto snapshot = [&]() {
+    fh1_stereo_log_.clear();
+    if (SharedMemory* shared_memory = Fh1StereoSharedMemory())
+      shared_memory->Fh1StartUploadLog(&fh1_stereo_log_);
+    fh1_stereo_registers_start_.assign(register_file_->values,
+                                       register_file_->values + RegisterFile::kRegisterCount);
+    fh1_stereo_shaders_start_[0] = active_vertex_shader_;
+    fh1_stereo_shaders_start_[1] = active_pixel_shader_;
+    fh1_stereo_bins_start_[0] = bin_select_;
+    fh1_stereo_bins_start_[1] = bin_mask_;
+  };
+  switch (fh1_stereo_state_) {
+    case Fh1StereoState::kOff:
+      // A clear of a main-view-sized depth buffer may start the scene: log from it on.
+      if (kind == Fh1StereoDraw::kClear) {
+        snapshot();
+        fh1_stereo_state_ = Fh1StereoState::kSpeculative;
+      }
+      break;
+    case Fh1StereoState::kSpeculative:
+      if (kind == Fh1StereoDraw::kSegmentStart) {
+        fh1_stereo_state_ = Fh1StereoState::kRecording;
+        Fh1StereoBegin();
+      } else if (kind == Fh1StereoDraw::kClear) {
+        snapshot();
+      } else {
+        fh1_stereo_state_ = Fh1StereoState::kOff;
+        fh1_stereo_log_.clear();
+        if (SharedMemory* shared_memory = Fh1StereoSharedMemory())
+          shared_memory->Fh1StopUploadLog();
+      }
+      break;
+    case Fh1StereoState::kRecording:
+      if (kind == Fh1StereoDraw::kSegmentEnd) Fh1StereoReplay();
+      break;
+    default:
+      break;
+  }
+}
+
+void CommandProcessor::Fh1StereoReplay() {
+  fh1_stereo_frame_done_ = true;
+  SharedMemory* shared_memory = Fh1StereoSharedMemory();
+  if (shared_memory) shared_memory->Fh1StopUploadLog();
+  if ((shared_memory && shared_memory->fh1_upload_log_overflow()) || !Fh1StereoLeftDone()) {
+    fh1_stereo_state_ = Fh1StereoState::kOff;
+    fh1_stereo_log_.clear();
+    ++fh1_stereo_dropped_;
+    Fh1StereoEnd(false);
+    return;
+  }
+  RegisterFile& regs = *register_file_;
+  // The state this draw has, to continue with after the right eye.
+  fh1_stereo_registers_end_.assign(regs.values, regs.values + RegisterFile::kRegisterCount);
+  Shader* const shaders_end[2] = {active_vertex_shader_, active_pixel_shader_};
+  const uint64_t bins_end[2] = {bin_select_, bin_mask_};
+
+  std::memcpy(regs.values, fh1_stereo_registers_start_.data(),
+              sizeof(uint32_t) * RegisterFile::kRegisterCount);
+  active_vertex_shader_ = fh1_stereo_shaders_start_[0];
+  active_pixel_shader_ = fh1_stereo_shaders_start_[1];
+  bin_select_ = fh1_stereo_bins_start_[0];
+  bin_mask_ = fh1_stereo_bins_start_[1];
+  Fh1StereoRegistersReplaced();
+  fh1_stereo_state_ = Fh1StereoState::kReplaying;
+  Fh1StereoReplayBegin();
+  bool complete = !fh1_stereo_log_.empty();
+  if (complete) {
+    memory::RingBuffer log(reinterpret_cast<uint8_t*>(fh1_stereo_log_.data()),
+                           fh1_stereo_log_.size() * sizeof(uint32_t));
+    log.set_write_offset(fh1_stereo_log_.size() * sizeof(uint32_t));
+    fh1_command_cursor::Scope cursor_scope(&log);
+    // The left eye's uploads, each before the packet it was made for.
+    static const std::vector<SharedMemory::Fh1Upload> no_uploads;
+    const std::vector<SharedMemory::Fh1Upload>& uploads =
+        shared_memory ? shared_memory->fh1_uploads() : no_uploads;
+    size_t next_upload = 0;
+    do {
+      const size_t position = log.read_offset() / sizeof(uint32_t);
+      while (next_upload < uploads.size() && uploads[next_upload].position <= position) {
+        const SharedMemory::Fh1Upload& upload = uploads[next_upload++];
+        shared_memory->Fh1UploadData(upload.start, shared_memory->fh1_upload_data() + upload.data_offset,
+                                     upload.length);
+      }
+      if (!ExecutePacket(&log)) {
+        REXGPU_WARN("VR stereo: the right eye's pass failed at a packet");
+        complete = false;
+        break;
+      }
+    } while (log.read_count());
+  }
+
+  std::memcpy(regs.values, fh1_stereo_registers_end_.data(),
+              sizeof(uint32_t) * RegisterFile::kRegisterCount);
+  active_vertex_shader_ = shaders_end[0];
+  active_pixel_shader_ = shaders_end[1];
+  bin_select_ = bins_end[0];
+  bin_mask_ = bins_end[1];
+  Fh1StereoRegistersReplaced();
+  fh1_stereo_state_ = Fh1StereoState::kOff;
+  if (complete) {
+    ++fh1_stereo_replays_;
+  } else {
+    ++fh1_stereo_dropped_;
+  }
+  Fh1StereoEnd(complete);
+  static uint64_t logged_at = 0;
+  if (fh1_stereo_replays_ == 1 || fh1_stereo_replays_ >= logged_at + 3600) {
+    logged_at = fh1_stereo_replays_;
+    REXGPU_INFO("VR stereo: right eye replayed from {} logged words and {} uploads of {} KB "
+                "({} frames, {} dropped)",
+                fh1_stereo_log_.size(), shared_memory ? shared_memory->fh1_uploads().size() : 0,
+                shared_memory ? shared_memory->fh1_upload_bytes() >> 10 : 0, fh1_stereo_replays_,
+                fh1_stereo_dropped_);
+  }
+  fh1_stereo_log_.clear();
+}
+
+void CommandProcessor::Fh1StereoOnSwap() {
+  if (SharedMemory* shared_memory = Fh1StereoSharedMemory()) shared_memory->Fh1StopUploadLog();
+  if (fh1_stereo_state_ == Fh1StereoState::kRecording) {
+    // The frame ended without a HUD draw: only the left eye was drawn.
+    ++fh1_stereo_dropped_;
+    Fh1StereoEnd(false);
+  }
+  fh1_stereo_state_ = Fh1StereoState::kOff;
+  fh1_stereo_log_.clear();
+  fh1_stereo_frame_done_ = false;
+}
+
 bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   // initialize CP's micro-engine
@@ -1136,9 +1370,21 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+  // Patch 0391: a client may lengthen the packet by one dword, a tag for the frame (the game's
+  // OpenXR path pairs each guest output with the head pose it was drawn with).
+  uint32_t frame_tag = 0;
+  if (count >= 5) {
+    frame_tag = reader->ReadAndSwap<uint32_t>();
+    reader->AdvanceRead((count - 5) * sizeof(uint32_t));
+  } else {
+    reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+  }
 
+  rexui_SetNextGuestOutputTag(frame_tag);
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  rexui_SetNextGuestOutputTag(0);
+  fh1_frame_trace::OnSwap();  // patch 0396
+  Fh1StereoOnSwap();
 
   ++counter_;
   return true;
@@ -1570,6 +1816,14 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
+    // Patch 0396: the stereo segment's start and end (may replay the segment for the right eye
+    // before this draw).
+    if (fh1_stereo_state_ == Fh1StereoState::kSpeculative ||
+        fh1_stereo_state_ == Fh1StereoState::kRecording ||
+        (fh1_stereo_state_ == Fh1StereoState::kOff && !fh1_stereo_frame_done_ &&
+         Fh1StereoWanted())) [[unlikely]] {
+      Fh1StereoOnDraw();
+    }
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
@@ -1577,6 +1831,36 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       // TODO(Triang3l || JoelLinn): Handle this properly in the render
       // backends.
 
+      if (fh1_frame_trace::file) {
+        const RegisterFile& r = *register_file_;
+        auto f = [&](uint32_t reg) { return r.Get<float>(reg); };
+        std::fprintf(
+            fh1_frame_trace::file,
+            "D %u prim=%u n=%u src=%u vs=%016llX ps=%016llX surf=%08X mode=%08X c0=%08X c1=%08X "
+            "c2=%08X c3=%08X mask=%08X depth=%08X dctl=%08X vte=%08X vp=%g,%g,%g,%g,%g,%g "
+            "woff=%08X wsc=%08X,%08X ssc=%08X,%08X sc=%08X copy=%08X dest=%08X dpitch=%08X "
+            "dinfo=%08X binsel=%llX binmask=%llX tf0=%08X,%08X,%08X dma=%08X\n",
+            fh1_frame_trace::draws++, uint32_t(vgt_draw_initiator.prim_type),
+            uint32_t(vgt_draw_initiator.num_indices), uint32_t(vgt_draw_initiator.source_select),
+            (unsigned long long)(active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0),
+            (unsigned long long)(active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0),
+            r[XE_GPU_REG_RB_SURFACE_INFO], r[XE_GPU_REG_RB_MODECONTROL],
+            r[XE_GPU_REG_RB_COLOR_INFO], r[XE_GPU_REG_RB_COLOR1_INFO], r[XE_GPU_REG_RB_COLOR2_INFO],
+            r[XE_GPU_REG_RB_COLOR3_INFO], r[XE_GPU_REG_RB_COLOR_MASK], r[XE_GPU_REG_RB_DEPTH_INFO],
+            r[XE_GPU_REG_RB_DEPTHCONTROL], r[XE_GPU_REG_PA_CL_VTE_CNTL],
+            f(XE_GPU_REG_PA_CL_VPORT_XSCALE), f(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+            f(XE_GPU_REG_PA_CL_VPORT_YSCALE), f(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+            f(XE_GPU_REG_PA_CL_VPORT_ZSCALE), f(XE_GPU_REG_PA_CL_VPORT_ZOFFSET),
+            r[XE_GPU_REG_PA_SC_WINDOW_OFFSET], r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+            r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], r[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL],
+            r[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR], r[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
+            r[XE_GPU_REG_RB_COPY_CONTROL], r[XE_GPU_REG_RB_COPY_DEST_BASE],
+            r[XE_GPU_REG_RB_COPY_DEST_PITCH], r[XE_GPU_REG_RB_COPY_DEST_INFO],
+            (unsigned long long)bin_select_, (unsigned long long)bin_mask_,
+            r[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], r[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1],
+            r[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 2],
+            is_indexed ? index_buffer_info.guest_base : 0u);
+      }
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,

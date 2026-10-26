@@ -340,6 +340,7 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
       {"fh1_native", offsetof(SystemConstants, fh1_native), type_float4_},
       {"fh1_native_textures", offsetof(SystemConstants, fh1_native_textures), type_uint_},
+      {"fh1_vr_eye", offsetof(SystemConstants, fh1_vr_eye), type_float4_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -2631,6 +2632,27 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
                                                         id_vector_temp_));
       ++user_clip_plane_next_component;
     }
+  }
+
+  // Patch 0396: VR true stereo's eye offset, in the guest's clip space (after the user clip
+  // planes, which belong to the game's own view; zero outside the main view's 3D draws).
+  {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantFh1VrEye));
+    spv::Id vr_eye = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    uint_vector_temp_.clear();
+    uint_vector_temp_.push_back(0);
+    uint_vector_temp_.push_back(1);
+    uint_vector_temp_.push_back(2);
+    position_xyz = builder_->createNoContractionBinOp(
+        spv::OpFSub, type_float3_, position_xyz,
+        builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, vr_eye, uint_vector_temp_));
+    position_w = builder_->createNoContractionBinOp(
+        spv::OpFSub, type_float_, position_w,
+        builder_->createCompositeExtract(vr_eye, type_float_, 3));
   }
 
   // Apply the NDC scale and offset for guest to host viewport transformation.

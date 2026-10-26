@@ -7,12 +7,13 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 - **Forza**: only makes sense for Forza Horizon 1 (or an engine like it): it relies on the game's
   shaders (matched by hash), its scene and HUD render targets, its formats or its input layouts.
   Scene/HUD upscalers (DLSS, FSR 3, MetalFX, SMAA), HDR with HUD coverage, ultrawide, texture packs,
-  shader-hash effects, car thumbnails. Another game needs its own hooks for these.
+  shader-hash effects, car thumbnails, VR (the scene and HUD layers, true stereo). Another game
+  needs its own hooks for these.
 - **General**: Xenos GPU accuracy (most are Xenia fixes the SDK did not have), performance, input,
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-130 commits: 104 general (Performance 34, Xenos GPU 26, Input 16, Runtime and platform 12, Diagnostics 7, Codegen and build 6, Workarounds and defaults 3) and 26 Forza-specific (Upscaling and HUD 17, Game-specific fixes 3, Input 3, Texture packs 2, Shader-hash effects 1).
+138 commits: 104 general (Performance 34, Xenos GPU 26, Input 16, Runtime and platform 12, Diagnostics 7, Codegen and build 6, Workarounds and defaults 3) and 34 Forza-specific (Upscaling and HUD 17, VR 8, Game-specific fixes 3, Input 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147); see the README. Issue numbers
 (`#45`) in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
 
@@ -148,3 +149,11 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0361 | `5cdee7a` | Command processor calls into the runtime library ([#45](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/45)) | General | Performance | Dyotson |
 | 0362 | `edf21bf` | Shader translation memo ([#45](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/45)) | General | Performance | Dyotson |
 | 0363 | `6b45bc1` | Cockpit instrument textures retain integer coordinates in native ultrawide ([#419](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/419)) | **Forza** | Upscaling and HUD | Sean O’Connor |
+| 0390 | `e5f33a7` | VR: Vulkan created through the OpenXR runtime ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
+| 0391 | `461ae0d` | VR: the guest output for a second consumer, with a frame tag ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
+| 0392 | `b6aba71` | VR: pads without window focus ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
+| 0393 | `0fc4a4b` | VR: the scene before the HUD and the HUD alone ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
+| 0394 | `09122a0` | VR: both eyes from the scene and its depth ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
+| 0395 | `5d9c03b` | VR: the headset's picture sharpened ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
+| 0396 | `f20eb4c` | VR: true stereo, the scene executed once per eye ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
+| 0397 | `4d66d72` | VR: when each guest output frame was published ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |

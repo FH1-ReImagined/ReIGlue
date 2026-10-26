@@ -28,6 +28,50 @@ class SharedMemory {
   static constexpr uint32_t kBufferSizeLog2 = 29;
   static constexpr uint32_t kBufferSize = 1 << kBufferSizeLog2;
 
+  // Patch 0396: while VR true stereo's right eye repeats the frame's main view, requests upload
+  // nothing: the GPU copy keeps what the left eye's pass read, even if the CPU has written the
+  // memory since (it may already reuse what the left eye's pass was done with).
+  void Fh1SetKeepUploaded(bool keep) {
+    fh1_keep_uploaded_ = keep;
+    fh1_replay_writes_.clear();
+  }
+  bool fh1_keep_uploaded() const { return fh1_keep_uploaded_; }
+  // What the GPU wrote (resolves, memory export) since the right eye's pass began: the only
+  // memory a texture is loaded again from in that pass. The rest keeps what the left eye's pass
+  // drew with, though the frame may have reused it since (the sun's shadow maps' memory holds
+  // the shadow mask and post-processing later in the frame).
+  bool Fh1WrittenInReplay(uint32_t start, uint32_t length) const {
+    for (const auto& range : fh1_replay_writes_) {
+      if (start < range.first + range.second && range.first < start + length) return true;
+    }
+    return false;
+  }
+  // The left eye's pass's uploads, with the data the CPU had written then, at their place in
+  // the command processor's log (its size in words when the upload was made): the right eye's
+  // pass repeats them in order, so a buffer the frame refills (a ring of per-object data) holds
+  // for each draw what it held for that draw in the left eye's pass.
+  struct Fh1Upload {
+    size_t position;
+    uint32_t start, length;
+    size_t data_offset;
+  };
+  void Fh1StartUploadLog(const std::vector<uint32_t>* position_source) {
+    fh1_upload_position_source_ = position_source;
+    fh1_uploads_.clear();
+    fh1_upload_data_.clear();
+    fh1_upload_log_overflow_ = false;
+  }
+  void Fh1StopUploadLog() { fh1_upload_position_source_ = nullptr; }
+  const std::vector<Fh1Upload>& fh1_uploads() const { return fh1_uploads_; }
+  const uint8_t* fh1_upload_data() const { return fh1_upload_data_.data(); }
+  size_t fh1_upload_bytes() const { return fh1_upload_data_.size(); }
+  bool fh1_upload_log_overflow() const { return fh1_upload_log_overflow_; }
+  // Copies `data` into the GPU copy of guest memory at `start` without changing what is valid.
+  virtual bool Fh1UploadData(uint32_t start, const uint8_t* data, uint32_t length) {
+    (void)start, (void)data, (void)length;
+    return false;
+  }
+
   virtual ~SharedMemory();
   // Call in the implementation-specific ClearCache.
   virtual void ClearCache();
@@ -157,6 +201,12 @@ class SharedMemory {
   // on it is not hard - the access callback takes a range as an argument, and
   // touched pages of the buffer of this size will be invalidated).
   uint32_t page_size_log2_;
+  bool fh1_keep_uploaded_ = false;  // patch 0396
+  std::vector<std::pair<uint32_t, uint32_t>> fh1_replay_writes_;  // patch 0396
+  const std::vector<uint32_t>* fh1_upload_position_source_ = nullptr;  // patch 0396
+  std::vector<Fh1Upload> fh1_uploads_;
+  std::vector<uint8_t> fh1_upload_data_;
+  bool fh1_upload_log_overflow_ = false;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;

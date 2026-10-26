@@ -64,3 +64,17 @@ but supplies no new evidence about the roof's texture consumers. Issue 419 must
 remain open. A maintainer tag and a later client pin update are still required
 to distribute this SDK change. Remote lint/nightly workflows were manually
 disabled; these results are local validation, not green CI checks.
+
+## Integration with the VR SDK changes
+
+The PR integrates SDK main `7d7ad2b` (the OpenXR/VR merge). The command-processor
+code merged automatically; the two documentation conflicts retained both the
+instrument correction and all eight VR entries. The focused raster regression
+was rebuilt with Clang 23.1.3 in release mode against the merged header and
+passed. The remaining code delta from that main is the instrument classifier,
+its call site, and the existing regression target.
+
+This integration has not had a new full-SDK build or in-game qualification.
+The Windows runtime evidence above is specifically for `6b45bc1`; it must not
+be presented as a test of the later VR integration. The roof symptom remains
+open and the private roof diagnostics are separate from this production PR.

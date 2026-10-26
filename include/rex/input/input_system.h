@@ -109,4 +109,10 @@ class InputSystem : public system::IInputSystem {
 /// In tool mode, only the NOP driver is added.
 std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode);
 
+/// Patch 0392: pads and wheels keep working while the window lacks focus (a client that shows
+/// the game somewhere else, such as a VR headset, turns this on). Keyboard and mouse stay
+/// focus-bound. Also exported as the C function rexinput_SetPadsWithoutFocus.
+void SetPadsWithoutFocus(bool on);
+bool PadsWithoutFocus();
+
 }  // namespace rex::input

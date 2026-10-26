@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -24,12 +26,23 @@
 #if REX_PLATFORM_MAC
 #include "vulkan_moltenvk.h"
 #endif
+#include "vulkan_creation_hooks.h"
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
 
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+namespace {
+// patch 0390: set once by a client before the graphics provider is created.
+RexVulkanCreationHooks creation_hooks;
+bool creation_hooks_set = false;
+}  // namespace
+
+const RexVulkanCreationHooks* GetVulkanCreationHooks() {
+  return creation_hooks_set ? &creation_hooks : nullptr;
+}
 
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                                                        const bool try_enable_validation) {
@@ -363,8 +376,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   instance_create_info.ppEnabledLayerNames = enabled_layers.data();
   instance_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
   instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
-  VkResult instance_create_result =
-      ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
+  // patch 0390: a client (an OpenXR runtime) may create the instance with its own extensions.
+  const RexVulkanCreationHooks* const hooks = GetVulkanCreationHooks();
+  const auto create_instance = [&]() {
+    if (hooks && hooks->create_instance) {
+      return hooks->create_instance(hooks->user, ifn.vkGetInstanceProcAddr, &instance_create_info,
+                                    &vulkan_instance->instance_);
+    }
+    return ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
+  };
+  VkResult instance_create_result = create_instance();
 
   if (instance_create_result == VK_ERROR_LAYER_NOT_PRESENT ||
       instance_create_result == VK_ERROR_EXTENSION_NOT_PRESENT) {
@@ -377,8 +398,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     }
     instance_create_info.enabledLayerCount = 0;
     instance_create_info.enabledExtensionCount = uint32_t(enabled_implementation_extension_count);
-    instance_create_result =
-        ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
+    instance_create_result = create_instance();
   }
 
   if (instance_create_result != VK_SUCCESS) {
@@ -634,3 +654,22 @@ VkBool32 VulkanInstance::DebugUtilsMessengerCallback(
 }  // namespace vulkan
 }  // namespace ui
 }  // namespace rex
+
+// patch 0390: registers (or, with null, removes) the Vulkan creation hooks; copied, so the
+// caller's structure need not outlive the call. Call before the graphics provider is created.
+#ifdef _WIN32
+extern "C" __declspec(dllexport)
+#else
+extern "C" __attribute__((visibility("default")))
+#endif
+void rexui_SetVulkanCreationHooks(const RexVulkanCreationHooks* hooks) {
+  using namespace rex::ui::vulkan;
+  creation_hooks = {};
+  creation_hooks_set = false;
+  if (!hooks || hooks->size < sizeof(uint32_t) + sizeof(void*)) {
+    return;
+  }
+  std::memcpy(&creation_hooks, hooks, std::min<size_t>(hooks->size, sizeof(creation_hooks)));
+  creation_hooks.size = sizeof(creation_hooks);
+  creation_hooks_set = true;
+}
