@@ -83,6 +83,9 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/vulkan/guest_output_export.h>
+
+#include "fh1_world_ao.h"
+
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -3378,6 +3381,7 @@ struct VulkanCommandProcessor::Fh1VrSlot {
     VkImageView view = VK_NULL_HANDLE;
   };
   Image scene, hud;
+  Image stereo, keys;  // patch 0394: both eyes side by side, and the splat's depth keys
   uint32_t width = 0, height = 0;
   uint64_t submission = 0;
 };
@@ -3385,6 +3389,95 @@ struct VulkanCommandProcessor::Fh1VrSlot {
 namespace {
 constexpr uint32_t kFh1VrHudWidth = 1280, kFh1VrHudHeight = 720;
 constexpr size_t kFh1VrMaxSlots = 6;
+
+// Patch 0394: the depth pre-pass as view distance in metres (0: the sky), with the shadow
+// passes' own constants (fh1_world_ao.h, Projection).
+constexpr char kFh1VrDepthShader[] = R"glsl(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform Params { vec4 proj; uvec4 size; } pc;
+layout(set = 0, binding = 0) uniform texture2DArray depth;  // the pre-pass, 0 far .. 1 near
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D z;
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(uvec2(p), pc.size.xy))) return;
+  float d = texelFetch(depth, ivec3(p, 0), 0).r;
+  float den = 1.0 - pc.proj.x - d;
+  float v = abs(pc.proj.y / (abs(den) > 1e-20 ? den : 1e-20));
+  imageStore(z, p, vec4(d <= 0.0 || isinf(v) || isnan(v) ? 0.0 : v));
+}
+)glsl";
+
+// Patch 0394: each eye from the one (centre) view and its depth. Splat: every scene pixel moves
+// by its disparity to each eye, the nearest per target pixel winning (a 20-bit log depth over
+// 12 bits of the move). Resolve: a pixel no scene pixel reached (behind a nearer object as seen
+// from the centre) takes the background beside the hole, continued with its own move.
+constexpr char kFh1VrStereoCommon[] = R"glsl(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+// eye: half the eyes' distance (m), the focal length (pixels), the most a pixel moves (pixels);
+// size: scene width, height.
+layout(push_constant) uniform Params { vec4 eye; uvec4 size; } pc;
+layout(set = 0, binding = 0) uniform texture2D z;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D keys;  // 2W x H
+layout(set = 0, binding = 2) uniform texture2D scene;
+layout(set = 0, binding = 3, rgb10_a2) uniform writeonly image2D stereo;  // 2W x H
+const uint kEmpty = 0xFFFFFFFFu;
+float Move(float d) { return d <= 0.0 ? 0.0 : min(pc.eye.x * pc.eye.y / d, pc.eye.z); }
+uint Key(float d, int move) {
+  float t = d <= 0.0 ? 1.0 : clamp(log2(max(d, 0.01) / 0.01) / 20.0, 0.0, 1.0);
+  return (uint(t * 1048575.0) << 12) | uint(clamp(move + 2048, 0, 4095));
+}
+)glsl";
+
+constexpr char kFh1VrStereoSplat[] = R"glsl(
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  int w = int(pc.size.x);
+  if (p.x >= w || p.y >= int(pc.size.y)) return;
+  float d = texelFetch(z, p, 0).r;
+  int m = int(round(Move(d)));
+  // The left eye sees a point further right than the centre does, the right eye further left.
+  int xl = p.x + m, xr = p.x - m;
+  if (xl < w) imageAtomicMin(keys, ivec2(xl, p.y), Key(d, m));
+  if (xr >= 0) imageAtomicMin(keys, ivec2(w + xr, p.y), Key(d, -m));
+}
+)glsl";
+
+constexpr char kFh1VrStereoResolve[] = R"glsl(
+void main() {
+  ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+  int w = int(pc.size.x);
+  if (q.x >= 2 * w || q.y >= int(pc.size.y)) return;
+  int base = q.x >= w ? w : 0;
+  int x = q.x - base;
+  uint k = imageLoad(keys, q).r;
+  if (k == kEmpty) {
+    // A hole: the farther of the nearest reached pixels on either side is the background.
+    uint best = 0u;
+    int reach = int(pc.eye.z) + 2;
+    for (int i = 1; i <= reach; ++i) {
+      if (x - i >= 0) {
+        uint l = imageLoad(keys, ivec2(base + x - i, q.y)).r;
+        if (l != kEmpty) { best = max(best, l); break; }
+      }
+    }
+    for (int i = 1; i <= reach; ++i) {
+      if (x + i < w) {
+        uint r = imageLoad(keys, ivec2(base + x + i, q.y)).r;
+        if (r != kEmpty) {
+          if ((r >> 12) > (best >> 12) || best == 0u) best = r;
+          break;
+        }
+      }
+    }
+    k = best == 0u ? (2048u) : best;
+  }
+  int move = int(k & 4095u) - 2048;
+  int src = clamp(x - move, 0, w - 1);
+  imageStore(stereo, q, vec4(texelFetch(scene, ivec2(src, q.y), 0).rgb, 1.0));
+}
+)glsl";
 
 // The HUD alone from the frame with it (`frame`) and the same frame before it (`scene`), both
 // after the gamma ramp. The game blends the HUD over the scene: frame = scene * (1 - a) + c * a.
@@ -3524,7 +3617,7 @@ std::shared_ptr<VulkanCommandProcessor::Fh1VrSlot> VulkanCommandProcessor::Fh1Vr
     return slot.use_count() == 1 && slot->submission <= completed;
   };
   auto destroy = [&](Fh1VrSlot& slot) {
-    for (Fh1VrSlot::Image* image : {&slot.scene, &slot.hud}) {
+    for (Fh1VrSlot::Image* image : {&slot.scene, &slot.hud, &slot.stereo, &slot.keys}) {
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, image->view);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, image->image);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, image->memory);
@@ -3570,8 +3663,11 @@ std::shared_ptr<VulkanCommandProcessor::Fh1VrSlot> VulkanCommandProcessor::Fh1Vr
     view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     return dfn.vkCreateImageView(device, &view, nullptr, &out.view) == VK_SUCCESS;
   };
+  const bool stereo = Fh1VrStereoWanted();
   if (!make(slot->scene, VK_FORMAT_A2B10G10R10_UNORM_PACK32, width, height) ||
-      !make(slot->hud, VK_FORMAT_R8G8B8A8_UNORM, kFh1VrHudWidth, kFh1VrHudHeight)) {
+      !make(slot->hud, VK_FORMAT_R8G8B8A8_UNORM, kFh1VrHudWidth, kFh1VrHudHeight) ||
+      (stereo && (!make(slot->stereo, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 2 * width, height) ||
+                  !make(slot->keys, VK_FORMAT_R32_UINT, 2 * width, height)))) {
     destroy(*slot);
     REXGPU_WARN("VR layers: no memory for a {}x{} slot", width, height);
     return nullptr;
@@ -3620,6 +3716,7 @@ void VulkanCommandProcessor::Fh1VrLayers(VkImage guest_output, VkImageView guest
   }
   dfn.vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
 
+  Fh1VrEnsureDepthImages();
   const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
   PushImageMemoryBarrier(guest_output, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
@@ -3665,6 +3762,9 @@ void VulkanCommandProcessor::Fh1VrLayers(VkImage guest_output, VkImageView guest
   BindExternalComputePipeline(fh1_vr_hud_pipeline_);
   deferred_command_buffer_.CmdVkDispatch((kFh1VrHudWidth + 7) / 8, (kFh1VrHudHeight + 7) / 8, 1);
 
+  // Patch 0394: both eyes, when the client asks and this frame's depth was captured.
+  const bool stereo = Fh1VrStereo(*slot, width, height, frame_index);
+
   // Handed over like the guest output: shader-read-only, last written before the fragment
   // shader and transfer stages the client starts from.
   for (VkImage image : {slot->scene.image, slot->hud.image}) {
@@ -3684,6 +3784,12 @@ void VulkanCommandProcessor::Fh1VrLayers(VkImage guest_output, VkImageView guest
   layers.hud_width = kFh1VrHudWidth;
   layers.hud_height = kFh1VrHudHeight;
   layers.hud = slot->hud.image;
+  if (stereo) {
+    layers.layers |= REX_GUEST_OUTPUT_LAYER_STEREO;
+    layers.stereo_width = 2 * width;
+    layers.stereo_height = height;
+    layers.stereo = slot->stereo.image;
+  }
   const std::shared_ptr<void> keep = slot;
   rexui_SetNextGuestOutputLayers(&keep, &layers);
 }
@@ -3693,7 +3799,7 @@ void VulkanCommandProcessor::Fh1VrDestroy() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   for (auto& slot : fh1_vr_slots_) {
-    for (Fh1VrSlot::Image* image : {&slot->scene, &slot->hud}) {
+    for (Fh1VrSlot::Image* image : {&slot->scene, &slot->hud, &slot->stereo, &slot->keys}) {
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, image->view);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, image->image);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, image->memory);
@@ -3707,6 +3813,340 @@ void VulkanCommandProcessor::Fh1VrDestroy() {
                                          fh1_vr_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          fh1_vr_hud_set_layout_);
+  for (Fh1VrDepth& depth : fh1_vr_depths_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, depth.view);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, depth.image);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth.memory);
+  }
+  for (VkPipeline* pipeline : {&fh1_vr_depth_pipeline_, &fh1_vr_stereo_splat_pipeline_,
+                               &fh1_vr_stereo_resolve_pipeline_}) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, *pipeline);
+  }
+  for (VkPipelineLayout* layout : {&fh1_vr_depth_pipeline_layout_, &fh1_vr_stereo_pipeline_layout_}) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device, *layout);
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         fh1_vr_stereo_descriptor_pool_);
+  for (VkDescriptorSetLayout* layout : {&fh1_vr_depth_set_layout_, &fh1_vr_stereo_set_layout_}) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device, *layout);
+  }
+}
+
+bool VulkanCommandProcessor::Fh1VrStereoWanted() const {
+  return !fh1_vr_stereo_failed_ && Fh1VrLayersWanted() &&
+         (rexui_GuestOutputExportFlags() & REX_GUEST_OUTPUT_EXPORT_STEREO) != 0;
+}
+
+bool VulkanCommandProcessor::Fh1VrStereoEnsurePipelines() {
+  if (fh1_vr_stereo_resolve_pipeline_ != VK_NULL_HANDLE) return true;
+  if (fh1_vr_stereo_failed_) return false;
+  fh1_vr_stereo_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  auto set_layout = [&](std::initializer_list<VkDescriptorType> types, VkDescriptorSetLayout& out) {
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    for (VkDescriptorType type : types) {
+      VkDescriptorSetLayoutBinding b = {};
+      b.binding = uint32_t(bindings.size());
+      b.descriptorType = type;
+      b.descriptorCount = 1;
+      b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings.push_back(b);
+    }
+    VkDescriptorSetLayoutCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = uint32_t(bindings.size());
+    info.pBindings = bindings.data();
+    return dfn.vkCreateDescriptorSetLayout(device, &info, nullptr, &out) == VK_SUCCESS;
+  };
+  auto pipeline_layout = [&](VkDescriptorSetLayout set, uint32_t push, VkPipelineLayout& out) {
+    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, push};
+    VkPipelineLayoutCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    info.setLayoutCount = 1;
+    info.pSetLayouts = &set;
+    info.pushConstantRangeCount = 1;
+    info.pPushConstantRanges = &range;
+    return dfn.vkCreatePipelineLayout(device, &info, nullptr, &out) == VK_SUCCESS;
+  };
+  auto pipeline = [&](std::string source, VkPipelineLayout layout, VkPipeline& out) {
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (!CompileFh1Compute(source, spirv, error)) {
+      REXGPU_WARN("VR stereo: a shader did not compile ({})", error);
+      return false;
+    }
+    out = ui::vulkan::util::CreateComputePipeline(vulkan_device, layout, spirv.data(),
+                                                  spirv.size() * sizeof(uint32_t));
+    return out != VK_NULL_HANDLE;
+  };
+  if (!set_layout({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                  fh1_vr_depth_set_layout_) ||
+      !set_layout({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                   VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                  fh1_vr_stereo_set_layout_) ||
+      !pipeline_layout(fh1_vr_depth_set_layout_, 32, fh1_vr_depth_pipeline_layout_) ||
+      !pipeline_layout(fh1_vr_stereo_set_layout_, 32, fh1_vr_stereo_pipeline_layout_)) {
+    REXGPU_WARN("VR stereo: no layouts; off");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = 2 * kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &fh1_vr_stereo_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("VR stereo: no descriptor pool; off");
+    return false;
+  }
+  auto allocate = [&](VkDescriptorSetLayout layout,
+                      std::array<VkDescriptorSet, kMaxFramesInFlight>& sets) {
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts;
+    layouts.fill(layout);
+    VkDescriptorSetAllocateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    info.descriptorPool = fh1_vr_stereo_descriptor_pool_;
+    info.descriptorSetCount = kMaxFramesInFlight;
+    info.pSetLayouts = layouts.data();
+    return dfn.vkAllocateDescriptorSets(device, &info, sets.data()) == VK_SUCCESS;
+  };
+  if (!allocate(fh1_vr_depth_set_layout_, fh1_vr_depth_sets_) ||
+      !allocate(fh1_vr_stereo_set_layout_, fh1_vr_stereo_sets_) ||
+      !pipeline(kFh1VrDepthShader, fh1_vr_depth_pipeline_layout_, fh1_vr_depth_pipeline_) ||
+      !pipeline(std::string(kFh1VrStereoCommon) + kFh1VrStereoSplat,
+                fh1_vr_stereo_pipeline_layout_, fh1_vr_stereo_splat_pipeline_) ||
+      !pipeline(std::string(kFh1VrStereoCommon) + kFh1VrStereoResolve,
+                fh1_vr_stereo_pipeline_layout_, fh1_vr_stereo_resolve_pipeline_)) {
+    REXGPU_WARN("VR stereo: no pipelines; off");
+    return false;
+  }
+  fh1_vr_stereo_failed_ = false;
+  REXGPU_INFO("VR stereo: on (each eye from the scene and the depth pre-pass)");
+  return true;
+}
+
+// At the swap (outside any draw): the depth images at the size the last capture asked for.
+void VulkanCommandProcessor::Fh1VrEnsureDepthImages() {
+  if (!Fh1VrStereoWanted() || !fh1_vr_depth_width_ || !Fh1VrStereoEnsurePipelines()) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (Fh1VrDepth& depth : fh1_vr_depths_) {
+    if (depth.image && depth.width == fh1_vr_depth_width_ && depth.height == fh1_vr_depth_height_)
+      continue;
+    if (depth.image) {
+      if (depth.submission) CheckSubmissionFenceAndDeviceLoss(depth.submission);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, depth.view);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, depth.image);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth.memory);
+    }
+    depth = {};
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R32_SFLOAT;
+    info.extent = {fh1_vr_depth_width_, fh1_vr_depth_height_, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, depth.image,
+            depth.memory))
+      return;
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = depth.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = info.format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &view, nullptr, &depth.view) != VK_SUCCESS) return;
+    depth.width = fh1_vr_depth_width_;
+    depth.height = fh1_vr_depth_height_;
+    depth.fresh = true;
+  }
+}
+
+// At the frame's first shadow pass: the main view's depth pre-pass (the shadow pass's texture
+// 0, as the AO finds it) as view distance into this frame's depth image.
+void VulkanCommandProcessor::Fh1VrDepthBeforeDraw(const Shader* pixel_shader,
+                                                  uint32_t used_texture_mask) {
+  if (!pixel_shader || !Fh1VrStereoWanted() ||
+      !fh1_world_ao::IsShadowPass(pixel_shader->ucode_data_hash()))
+    return;
+  const uint64_t frame = GetCurrentFrame();
+  Fh1VrDepth& depth = fh1_vr_depths_[frame % kMaxFramesInFlight];
+  if (depth.frame == frame) return;
+  const RegisterFile& regs = *register_file_;
+  const auto fetch = regs.GetTextureFetch(0);
+  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+  if (!(used_texture_mask & 1u) || fetch.format != xenos::TextureFormat::k_24_8_FLOAT ||
+      uint32_t(fetch.size_2d.width) + 1 != uint32_t(surface.surface_pitch) ||
+      surface.msaa_samples != xenos::MsaaSamples::k1X)
+    return;
+  fh1_vr_depth_width_ =
+      (uint32_t(fetch.size_2d.width) + 1) * texture_cache_->draw_resolution_scale_x();
+  fh1_vr_depth_height_ =
+      (uint32_t(fetch.size_2d.height) + 1) * texture_cache_->draw_resolution_scale_y();
+  if (!depth.image || depth.width != fh1_vr_depth_width_ || depth.height != fh1_vr_depth_height_)
+    return;  // made at the next swap
+  float projection[4];
+  auto constant = [&](uint32_t index, uint32_t component) {
+    return regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * index + component);
+  };
+  if (!fh1_world_ao::Projection(constant(0, 0), constant(1, 1), constant(25, 0), constant(25, 1),
+                                projection))
+    return;
+  const VkImageView view =
+      texture_cache_->GetActiveBindingOrNullImageView(0, xenos::FetchOpDimension::k2D, false);
+  if (!view) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  // The frame index's set was last used kMaxFramesInFlight frames ago.
+  const VkDescriptorSet set = fh1_vr_depth_sets_[frame % kMaxFramesInFlight];
+  const VkDescriptorImageInfo images[2] = {
+      {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+      {VK_NULL_HANDLE, depth.view, VK_IMAGE_LAYOUT_GENERAL}};
+  VkWriteDescriptorSet writes[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[i].pImageInfo = &images[i];
+  }
+  dfn.vkUpdateDescriptorSets(vulkan_device->device(), 2, writes, 0, nullptr);
+  EndRenderPass();
+  SubmitBarriers(true);
+  // Whatever wrote the depth texture, and the last frame's reads of this image, first.
+  VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  memory.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+  memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  VkImageMemoryBarrier layout{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  layout.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  layout.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  layout.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  layout.srcQueueFamilyIndex = layout.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  layout.image = depth.image;
+  layout.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory, 0,
+      nullptr, depth.fresh ? 1 : 0, &layout);
+  depth.fresh = false;
+  struct {
+    float proj[4];
+    uint32_t size[4];
+  } constants = {{projection[0], projection[1], projection[2], projection[3]},
+                 {depth.width, depth.height, 0, 0}};
+  BindExternalComputePipeline(fh1_vr_depth_pipeline_);
+  deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                   fh1_vr_depth_pipeline_layout_, 0, 1, &set, 0,
+                                                   nullptr);
+  deferred_command_buffer_.CmdVkPushConstants(fh1_vr_depth_pipeline_layout_,
+                                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                                              &constants);
+  deferred_command_buffer_.CmdVkDispatch((depth.width + 7) / 8, (depth.height + 7) / 8, 1);
+  memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                                &memory, 0, nullptr, 0, nullptr);
+  std::memcpy(depth.projection, projection, sizeof(projection));
+  depth.frame = frame;
+  depth.submission = GetCurrentSubmission();
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXGPU_INFO("VR stereo: depth {}x{}, view z = {} / (1 - {} - depth), tan of half the view "
+                "{:.3f} x {:.3f}",
+                depth.width, depth.height, projection[1], projection[0], projection[2],
+                projection[3]);
+  }
+}
+
+// In the swap refresher after the scene's gamma pass: both eyes into the slot.
+bool VulkanCommandProcessor::Fh1VrStereo(Fh1VrSlot& slot, uint32_t width, uint32_t height,
+                                         uint32_t frame_index) {
+  if (!Fh1VrStereoWanted() || !slot.stereo.image || !Fh1VrStereoEnsurePipelines()) return false;
+  const Fh1VrDepth& depth = fh1_vr_depths_[frame_current_ % kMaxFramesInFlight];
+  if (depth.frame != frame_current_ || depth.width != width || depth.height != height)
+    return false;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDescriptorSet set = fh1_vr_stereo_sets_[frame_index];
+  const VkDescriptorImageInfo images[4] = {
+      {VK_NULL_HANDLE, depth.view, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, slot.keys.view, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, slot.scene.view, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, slot.stereo.view, VK_IMAGE_LAYOUT_GENERAL}};
+  VkWriteDescriptorSet writes[4] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = i & 1 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                     : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[i].pImageInfo = &images[i];
+  }
+  dfn.vkUpdateDescriptorSets(vulkan_device->device(), 4, writes, 0, nullptr);
+  const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
+  for (VkImage image : {slot.keys.image, slot.stereo.image}) {
+    PushImageMemoryBarrier(image, range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+  }
+  SubmitBarriers(true);
+  VkClearColorValue empty = {};
+  empty.uint32[0] = 0xFFFFFFFFu;
+  deferred_command_buffer_.CmdVkClearColorImage(slot.keys.image, VK_IMAGE_LAYOUT_GENERAL, &empty, 1,
+                                                &range);
+  PushImageMemoryBarrier(slot.keys.image, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+  SubmitBarriers(true);
+  float eye_distance = 0.064f, max_shift = 0.03f;
+  rexui_GuestOutputStereoParams(&eye_distance, &max_shift);
+  const float focal = 0.5f * float(width) / std::max(depth.projection[2], 1e-3f);
+  struct {
+    float eye[4];
+    uint32_t size[4];
+  } constants = {{0.5f * eye_distance, focal, std::max(1.0f, max_shift * float(width)), 0},
+                 {width, height, 0, 0}};
+  deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                   fh1_vr_stereo_pipeline_layout_, 0, 1, &set, 0,
+                                                   nullptr);
+  deferred_command_buffer_.CmdVkPushConstants(fh1_vr_stereo_pipeline_layout_,
+                                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                                              &constants);
+  BindExternalComputePipeline(fh1_vr_stereo_splat_pipeline_);
+  deferred_command_buffer_.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
+  PushImageMemoryBarrier(slot.keys.image, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL);
+  SubmitBarriers(true);
+  BindExternalComputePipeline(fh1_vr_stereo_resolve_pipeline_);
+  deferred_command_buffer_.CmdVkDispatch((2 * width + 7) / 8, (height + 7) / 8, 1);
+  PushImageMemoryBarrier(slot.stereo.image, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  return true;
 }
 
 void VulkanCommandProcessor::CaptureHdrScene() {
@@ -5846,6 +6286,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // FH1 (#380): may record the world AO compute passes (outside the render pass).
+  // Patch 0394: the main view's depth for VR stereo (the AO's hook point).
+  Fh1VrDepthBeforeDraw(pixel_shader, used_texture_mask);
   if (!Fh1WorldAoBeforeDraw(pixel_shader, used_texture_mask)) {
     return draw_fail("world_ao_submission");
   }

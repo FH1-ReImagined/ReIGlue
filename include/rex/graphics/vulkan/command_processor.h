@@ -794,6 +794,36 @@ class VulkanCommandProcessor : public CommandProcessor {
                    uint32_t height, VkImageView snapshot_view, VkPipeline gamma_pipeline,
                    VkDescriptorSet gamma_ramp_set, uint32_t frame_index);
   void Fh1VrDestroy();
+  // Patch 0394: stereo from the scene and the depth pre-pass. The main view's depth, as view
+  // distance, captured at the first shadow pass of the frame (the AO's hook point), per frame in
+  // flight; the eyes made at the swap by splatting the scene to each eye and filling the holes.
+  struct Fh1VrDepth {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t width = 0, height = 0;
+    uint64_t frame = UINT64_MAX, submission = 0;
+    float projection[4] = {};  // A, B, tan of half the field of view in x and y
+    bool fresh = true;  // not transitioned yet
+  };
+  std::array<Fh1VrDepth, kMaxFramesInFlight> fh1_vr_depths_{};
+  uint32_t fh1_vr_depth_width_ = 0, fh1_vr_depth_height_ = 0;  // wanted by the last capture
+  VkDescriptorSetLayout fh1_vr_depth_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout fh1_vr_depth_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline fh1_vr_depth_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout fh1_vr_stereo_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout fh1_vr_stereo_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline fh1_vr_stereo_splat_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline fh1_vr_stereo_resolve_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool fh1_vr_stereo_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_vr_depth_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_vr_stereo_sets_{};
+  bool fh1_vr_stereo_failed_ = false;
+  bool Fh1VrStereoWanted() const;
+  bool Fh1VrStereoEnsurePipelines();
+  void Fh1VrDepthBeforeDraw(const Shader* pixel_shader, uint32_t used_texture_mask);
+  void Fh1VrEnsureDepthImages();
+  bool Fh1VrStereo(Fh1VrSlot& slot, uint32_t width, uint32_t height, uint32_t frame_index);
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
