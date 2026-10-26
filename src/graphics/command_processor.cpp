@@ -125,6 +125,9 @@ REXCVAR_DEFINE_BOOL(sync_pipeline_creation, false, "GPU",
                     "the skipped draws for good.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Patch 0391 (src/ui/vulkan/vulkan_presenter.cpp, the runtime): the next guest output's tag.
+extern "C" void rexui_SetNextGuestOutputTag(uint32_t tag);
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
@@ -1136,9 +1139,19 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+  // Patch 0391: a client may lengthen the packet by one dword, a tag for the frame (the game's
+  // OpenXR path pairs each guest output with the head pose it was drawn with).
+  uint32_t frame_tag = 0;
+  if (count >= 5) {
+    frame_tag = reader->ReadAndSwap<uint32_t>();
+    reader->AdvanceRead((count - 5) * sizeof(uint32_t));
+  } else {
+    reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+  }
 
+  rexui_SetNextGuestOutputTag(frame_tag);
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  rexui_SetNextGuestOutputTag(0);
 
   ++counter_;
   return true;
