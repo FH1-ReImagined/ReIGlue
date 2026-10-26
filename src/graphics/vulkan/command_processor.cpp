@@ -164,6 +164,13 @@ REXCVAR_DEFINE_UINT32(vulkan_render_target_trim_percent, 90, "GPU/Vulkan",
                       "keeps every render target for the session")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_plain_register_ranges, true, "GPU/Vulkan",
+                    "Write a range of render state registers that only store their value (no "
+                    "side effect, outside the shader constants) in the command processor's "
+                    "packet loop, without the backend's register write calls (read at each frame "
+                    "start)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -3053,7 +3060,16 @@ class PlainRegisters {
                          i == XE_GPU_REG_COHER_STATUS_HOST || i == XE_GPU_REG_DC_LUT_RW_INDEX ||
                          i == XE_GPU_REG_DC_LUT_SEQ_COLOR || i == XE_GPU_REG_DC_LUT_PWL_DATA ||
                          i == XE_GPU_REG_DC_LUT_30_COLOR;
-      if (!side_effect && RegisterFile::GetRegisterInfo(i)) {
+      // FH1 (#45, patch 0360): not the shader constant blocks either (WriteRegistersFromMem
+      // takes those first and never asks for them; the packet loop's own writes,
+      // CommandProcessor::fh1_plain_registers_, must not skip their handling).
+      bool constant = (i >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+                       i <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+                      (i >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+                       i <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+                      (i >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+                       i <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+      if (!side_effect && !constant && RegisterFile::GetRegisterInfo(i)) {
         bits_[i >> 6] |= uint64_t(1) << (i & 63);
       }
     }
@@ -3061,6 +3077,7 @@ class PlainRegisters {
   bool IsPlain(uint32_t index) const {
     return index < RegisterFile::kRegisterCount && ((bits_[index >> 6] >> (index & 63)) & 1);
   }
+  const uint64_t* bits() const { return bits_; }
 
  private:
   uint64_t bits_[(RegisterFile::kRegisterCount + 63) / 64] = {};
@@ -7213,6 +7230,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+    // FH1 (#45, patch 0360): the packet loop stores the plain registers itself (the same
+    // stores WriteRegistersFromMem and WriteRegister do for them).
+    fh1_plain_registers_ = REXCVAR_GET(gpu_plain_register_ranges) ? plain_registers.bits() : nullptr;
     if (fh1_other_render_targets_) Fh1SelectNativeHud(false);
     if (fh1_dlss_) fh1_dlss_->BeginFrame(frame_current_);
     fh1_scene_composited_ = false;

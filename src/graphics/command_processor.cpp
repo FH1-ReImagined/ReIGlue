@@ -606,7 +606,8 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
   if (read_offset + range_bytes < ring->capacity()) {
     WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(ring->buffer() + read_offset),
                           num_registers);
-    ring->set_read_offset(read_offset + range_bytes);
+    // FH1 (#45, patch 0360): inside the buffer, so no division.
+    ring->set_read_offset_within(read_offset + range_bytes);
     return;
   }
   memory::RingBuffer::ReadRange range = ring->BeginRead(size_t(num_registers) * sizeof(uint32_t));
@@ -621,6 +622,36 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
                           uint32_t(range.second_length / sizeof(uint32_t)));
   }
   ring->EndRead(range);
+}
+
+bool CommandProcessor::Fh1WritePlainRangeFromRing(memory::RingBuffer* ring, uint32_t base,
+                                                  uint32_t count) {
+  // Only a range that does not reach the end of the ring (as WriteRegisterRangeFromRing's
+  // direct path), and only if every register in it is in the backend's list: then the
+  // backend would only store the values (fh1_plain_registers_). Otherwise nothing is read.
+  const uint64_t* const plain = fh1_plain_registers_;
+  const uint32_t end = base + count;
+  if (!count || end > RegisterFile::kRegisterCount) {
+    return false;
+  }
+  const size_t range_bytes = size_t(count) * sizeof(uint32_t);
+  const size_t read_offset = ring->read_offset();
+  if (read_offset + range_bytes >= ring->capacity()) {
+    return false;
+  }
+  for (uint32_t i = base; i < end; ++i) {
+    if (!((plain[i >> 6] >> (i & 63)) & 1)) {
+      return false;
+    }
+  }
+  const uint32_t* source = reinterpret_cast<const uint32_t*>(ring->buffer() + read_offset);
+  uint32_t* values = register_file_->values;
+  for (uint32_t i = 0; i < count; ++i) {
+    // Volatile like CommandProcessor::WriteRegister's store (WAIT_REG_MEM polls).
+    const_cast<volatile uint32_t&>(values[base + i]) = memory::load_and_swap<uint32_t>(source + i);
+  }
+  ring->set_read_offset_within(read_offset + range_bytes);
+  return true;
 }
 
 void CommandProcessor::WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base,
@@ -832,10 +863,24 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
   if (!write_one_reg) {
+    // FH1 (#45, patch 0360): render state the backend only stores, straight from the ring.
+    if (fh1_plain_registers_ && Fh1WritePlainRangeFromRing(reader, base_index, count)) {
+      return true;
+    }
     // Consecutive registers: as a range, so the backend can take the constant
     // blocks (most of these packets) in one go rather than one virtual
     // WriteRegister call per register.
     WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
+  // FH1 (#45, patch 0360): every word to one register the backend only stores (the last one
+  // stays), without a virtual call for each.
+  if (fh1_plain_registers_ && base_index < RegisterFile::kRegisterCount &&
+      ((fh1_plain_registers_[base_index >> 6] >> (base_index & 63)) & 1)) {
+    volatile uint32_t& value = const_cast<volatile uint32_t&>(register_file_->values[base_index]);
+    for (uint32_t m = 0; m < count; m++) {
+      value = reader->ReadAndSwap<uint32_t>();
+    }
     return true;
   }
   for (uint32_t m = 0; m < count; m++) {
@@ -1607,6 +1652,11 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reade
       WriteLoopRangeFromRing(reader, index, count_registers);
       break;
     case 4:  // REGISTERS
+      // FH1 (#45, patch 0360): as in ExecutePacketType0.
+      if (fh1_plain_registers_ &&
+          Fh1WritePlainRangeFromRing(reader, index + 0x2000, count_registers)) {
+        break;
+      }
       WriteREGISTERSRangeFromRing(reader, index, count_registers);
       break;
     default:
@@ -1621,6 +1671,10 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
                                                         uint32_t count) {
   uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
   uint32_t index = offset_type & 0xFFFF;
+  // FH1 (#45, patch 0360): as in ExecutePacketType0.
+  if (fh1_plain_registers_ && Fh1WritePlainRangeFromRing(reader, index, count - 1)) {
+    return true;
+  }
   WriteRegisterRangeFromRing(reader, index, count - 1);
   return true;
 }

@@ -176,6 +176,8 @@ class CommandProcessor {
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
+  // FH1 (#45, patch 0360): see fh1_plain_registers_.
+  bool Fh1WritePlainRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t count);
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet);
@@ -287,6 +289,14 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+
+  // FH1 (#45, patch 0360): a bitmap (RegisterFile::kRegisterCount bits) of the registers outside
+  // the shader constant blocks whose write the backend only stores: its WriteRegistersFromMem
+  // and WriteRegister store them and do nothing else. While set, the packet loop writes a range
+  // (type-0 packet, SET_CONSTANT of registers, SET_CONSTANT2) made only of such registers from
+  // the ring itself, without the two virtual calls and the backend's sorting of the range (most
+  // of the render state writes, about 9 ranges a draw). Null: every write takes the backend.
+  const uint64_t* fh1_plain_registers_ = nullptr;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

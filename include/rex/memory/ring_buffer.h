@@ -38,6 +38,12 @@ class RingBuffer {
   void set_read_offset(size_t offset) {
     read_offset_ = static_cast<ring_size_t>(offset) % capacity_;
   }
+  // FH1 (#45, patch 0360): set_read_offset for an offset known to be inside the buffer, without
+  // its division (the command processor's register ranges: about 20 a draw).
+  void set_read_offset_within(size_t offset) {
+    assert_true(offset < capacity_);
+    read_offset_ = static_cast<ring_size_t>(offset);
+  }
   ring_size_t read_count() const {
     ring_size_t read_offs = read_offset_;
     ring_size_t write_offs = write_offset_;
