@@ -39,3 +39,28 @@ The standalone `tests/fh1_screen_raster_test.cpp` target exercises the exact
 family, Y sign, viewport/scissor disagreement, padded bloom, cinematic display,
 software viewports, square reflection faces and unsupported pitches. It uses
 explicit checks so release builds do not disable the regression assertions.
+
+## Current-stack qualification
+
+The canonical GPU plugin, runtime and code generator at `6b45bc1` built and
+installed on Windows with Clang 23.1.3. The release-mode regression passed,
+including 4,320 cases matching the private causal control. Game main `260ae0f`
+was rebuilt against that installation: all game-authored units, SDK entry
+sources, resources and generated precompiled headers were rebuilt. Only 313
+verified generated guest objects were reused; 13 critical PPC ABI headers
+matched exactly. The input-only capture derivative and read-only trace plugin
+have separate hashes from the production binaries.
+
+The corrected-DPI run on RTX 5060 Ti driver 617.14 confirmed an actual
+3440x1440 swapchain and drawing image, with 3840x1440 padded storage. Its live
+local car was model 1544. The inspected stationary cockpit capture at native
+time 284.40 seconds showed the dashboard aligned and the cyan roof artifact
+still present. The owned process closed at 290.47 seconds under its 290-second
+guard, with zero owned job processes and an unchanged source fixture.
+
+The material trace request came too late: no gate-open event or material/resolve
+records were recorded before the guard. That run validates dashboard alignment,
+but supplies no new evidence about the roof's texture consumers. Issue 419 must
+remain open. A maintainer tag and a later client pin update are still required
+to distribute this SDK change. Remote lint/nightly workflows were manually
+disabled; these results are local validation, not green CI checks.

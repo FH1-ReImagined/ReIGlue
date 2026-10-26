@@ -147,4 +147,4 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0360 | `04882d9` | Command processor register ranges ([#45](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/45)) | General | Performance | Dyotson |
 | 0361 | `5cdee7a` | Command processor calls into the runtime library ([#45](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/45)) | General | Performance | Dyotson |
 | 0362 | `edf21bf` | Shader translation memo ([#45](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/45)) | General | Performance | Dyotson |
-| 0363 | this change | Cockpit instrument textures retain integer coordinates in native ultrawide ([#419](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/419)) | **Forza** | Upscaling and HUD | Sean O’Connor |
+| 0363 | `6b45bc1` | Cockpit instrument textures retain integer coordinates in native ultrawide ([#419](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/419)) | **Forza** | Upscaling and HUD | Sean O’Connor |
