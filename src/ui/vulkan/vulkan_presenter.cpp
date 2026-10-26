@@ -138,6 +138,9 @@ struct RexGuestOutputFrame {
   // same layout and stages as `image`, held with it. A client passing the version 0391 size gets
   // the fields above only.
   RexGuestOutputLayers vr;
+  // Patch 0397: when the frame was published (its commands in the queue), std::chrono::steady_clock
+  // nanoseconds. A client passing a smaller size does not get it.
+  int64_t ready_ns;
 };
 }
 
@@ -1273,6 +1276,9 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
       frame.view = image_instance.image->view();
       // Patch 0393: the layers the refresher made for this frame, if any.
       frame.vr = guest_output_export::next_layers;
+      frame.ready_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
       guest_output_export::latest_layers = guest_output_export::next_layers_keep;
     }
   }
