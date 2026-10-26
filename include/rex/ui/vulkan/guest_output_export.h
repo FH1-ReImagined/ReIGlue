@@ -43,6 +43,10 @@ uint32_t rexui_GuestOutputExportFlags(void);
 // Stereo (patch 0394): the eyes' distance in metres and the most a pixel may shift, a fraction of
 // the picture's width.
 void rexui_GuestOutputStereoParams(float* eye_distance, float* max_shift);
+// Patch 0395: how much the scene layer is sharpened, 0 (not at all) to 1 (the most): a
+// contrast-adaptive sharpening pass on the scene before it is handed over (the desktop window's
+// FSR/CAS present effect never reaches the headset's picture).
+float rexui_GuestOutputSharpen(void);
 // Command processor thread, inside the guest output refresher: the layers of the frame being
 // refreshed. `keep` (a const std::shared_ptr<void>*) holds their images while the frame is the
 // newest or held by the client. The export forgets them after this refresh.

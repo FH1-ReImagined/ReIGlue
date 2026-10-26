@@ -824,6 +824,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   void Fh1VrDepthBeforeDraw(const Shader* pixel_shader, uint32_t used_texture_mask);
   void Fh1VrEnsureDepthImages();
   bool Fh1VrStereo(Fh1VrSlot& slot, uint32_t width, uint32_t height, uint32_t frame_index);
+  // Patch 0395: contrast-adaptive sharpening of the VR scene layer.
+  VkDescriptorSetLayout fh1_vr_sharpen_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout fh1_vr_sharpen_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline fh1_vr_sharpen_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool fh1_vr_sharpen_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_vr_sharpen_sets_{};
+  bool fh1_vr_sharpen_failed_ = false;
+  bool Fh1VrSharpenEnsurePipeline();
+  void Fh1VrSharpen(Fh1VrSlot& slot, uint32_t width, uint32_t height, uint32_t frame_index);
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;

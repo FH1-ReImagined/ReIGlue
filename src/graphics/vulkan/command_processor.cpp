@@ -3382,6 +3382,7 @@ struct VulkanCommandProcessor::Fh1VrSlot {
   };
   Image scene, hud;
   Image stereo, keys;  // patch 0394: both eyes side by side, and the splat's depth keys
+  Image sharp;         // patch 0395: the sharpened scene (then swapped with `scene`)
   uint32_t width = 0, height = 0;
   uint64_t submission = 0;
 };
@@ -3617,7 +3618,7 @@ std::shared_ptr<VulkanCommandProcessor::Fh1VrSlot> VulkanCommandProcessor::Fh1Vr
     return slot.use_count() == 1 && slot->submission <= completed;
   };
   auto destroy = [&](Fh1VrSlot& slot) {
-    for (Fh1VrSlot::Image* image : {&slot.scene, &slot.hud, &slot.stereo, &slot.keys}) {
+    for (Fh1VrSlot::Image* image : {&slot.scene, &slot.hud, &slot.stereo, &slot.keys, &slot.sharp}) {
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, image->view);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, image->image);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, image->memory);
@@ -3667,7 +3668,9 @@ std::shared_ptr<VulkanCommandProcessor::Fh1VrSlot> VulkanCommandProcessor::Fh1Vr
   if (!make(slot->scene, VK_FORMAT_A2B10G10R10_UNORM_PACK32, width, height) ||
       !make(slot->hud, VK_FORMAT_R8G8B8A8_UNORM, kFh1VrHudWidth, kFh1VrHudHeight) ||
       (stereo && (!make(slot->stereo, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 2 * width, height) ||
-                  !make(slot->keys, VK_FORMAT_R32_UINT, 2 * width, height)))) {
+                  !make(slot->keys, VK_FORMAT_R32_UINT, 2 * width, height))) ||
+      (rexui_GuestOutputSharpen() > 0.0f &&
+       !make(slot->sharp, VK_FORMAT_A2B10G10R10_UNORM_PACK32, width, height))) {
     destroy(*slot);
     REXGPU_WARN("VR layers: no memory for a {}x{} slot", width, height);
     return nullptr;
@@ -3762,6 +3765,9 @@ void VulkanCommandProcessor::Fh1VrLayers(VkImage guest_output, VkImageView guest
   BindExternalComputePipeline(fh1_vr_hud_pipeline_);
   deferred_command_buffer_.CmdVkDispatch((kFh1VrHudWidth + 7) / 8, (kFh1VrHudHeight + 7) / 8, 1);
 
+  // Patch 0395: the scene sharpened (after the HUD pass, which needs it as the game drew it).
+  Fh1VrSharpen(*slot, width, height, frame_index);
+
   // Patch 0394: both eyes, when the client asks and this frame's depth was captured.
   const bool stereo = Fh1VrStereo(*slot, width, height, frame_index);
 
@@ -3794,18 +3800,179 @@ void VulkanCommandProcessor::Fh1VrLayers(VkImage guest_output, VkImageView guest
   rexui_SetNextGuestOutputLayers(&keep, &layers);
 }
 
+// Patch 0395: contrast-adaptive sharpening (after AMD FidelityFX CAS, MIT) of the VR scene
+// layer: each pixel against its 3 x 3 neighbourhood, the weight of the negative lobe scaled down
+// where the neighbourhood already has contrast (no halos on edges), in the picture's own gamma
+// encoding. The desktop window's FSR/CAS present effect works on the window's picture, which the
+// headset never sees.
+namespace {
+constexpr char kFh1VrSharpenShader[] = R"glsl(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform Params { uvec2 size; float sharpness; } pc;
+layout(set = 0, binding = 0) uniform texture2D src;
+layout(set = 0, binding = 1, rgb10_a2) uniform writeonly image2D dst;
+vec3 at(ivec2 p) { return texelFetch(src, clamp(p, ivec2(0), ivec2(pc.size) - 1), 0).rgb; }
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(uvec2(p), pc.size))) return;
+  vec3 a = at(p + ivec2(-1, -1)), b = at(p + ivec2(0, -1)), c = at(p + ivec2(1, -1));
+  vec3 d = at(p + ivec2(-1, 0)), f = at(p + ivec2(1, 0));
+  vec3 g = at(p + ivec2(-1, 1)), h = at(p + ivec2(0, 1)), i = at(p + ivec2(1, 1));
+  vec4 e4 = texelFetch(src, p, 0);
+  vec3 e = e4.rgb;
+  vec3 mn = min(min(min(d, e), min(f, b)), h);
+  mn += min(mn, min(min(a, c), min(g, i)));
+  vec3 mx = max(max(max(d, e), max(f, b)), h);
+  mx += max(mx, max(max(a, c), max(g, i)));
+  vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-5)), 0.0, 1.0));
+  vec3 w = amp * (-1.0 / mix(8.0, 5.0, clamp(pc.sharpness, 0.0, 1.0)));
+  imageStore(dst, p, vec4(clamp(((b + d + f + h) * w + e) / (1.0 + 4.0 * w), 0.0, 1.0), e4.a));
+}
+)glsl";
+}  // namespace
+
+bool VulkanCommandProcessor::Fh1VrSharpenEnsurePipeline() {
+  if (fh1_vr_sharpen_pipeline_ != VK_NULL_HANDLE) return true;
+  if (fh1_vr_sharpen_failed_) return false;
+  fh1_vr_sharpen_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkDescriptorSetLayoutBinding bindings[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 2;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &fh1_vr_sharpen_set_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("VR sharpening: no descriptor set layout; off");
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 3};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &fh1_vr_sharpen_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &fh1_vr_sharpen_pipeline_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("VR sharpening: no pipeline layout; off");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight}};
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &fh1_vr_sharpen_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("VR sharpening: no descriptor pool; off");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts;
+  layouts.fill(fh1_vr_sharpen_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = fh1_vr_sharpen_descriptor_pool_;
+  set_info.descriptorSetCount = kMaxFramesInFlight;
+  set_info.pSetLayouts = layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, fh1_vr_sharpen_sets_.data()) != VK_SUCCESS) {
+    REXGPU_WARN("VR sharpening: no descriptor sets; off");
+    return false;
+  }
+  std::vector<uint32_t> spirv;
+  std::string error;
+  if (!CompileFh1Compute(kFh1VrSharpenShader, spirv, error)) {
+    REXGPU_WARN("VR sharpening: the shader did not compile ({}); off", error);
+    return false;
+  }
+  fh1_vr_sharpen_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, fh1_vr_sharpen_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
+  if (fh1_vr_sharpen_pipeline_ == VK_NULL_HANDLE) {
+    REXGPU_WARN("VR sharpening: no pipeline; off");
+    return false;
+  }
+  fh1_vr_sharpen_failed_ = false;
+  REXGPU_INFO("VR sharpening: on ({:.2f}, contrast-adaptive, on the headset's scene layer)",
+              rexui_GuestOutputSharpen());
+  return true;
+}
+
+void VulkanCommandProcessor::Fh1VrSharpen(Fh1VrSlot& slot, uint32_t width, uint32_t height,
+                                          uint32_t frame_index) {
+  const float sharpness = rexui_GuestOutputSharpen();
+  if (sharpness <= 0.0f || !slot.sharp.image || !Fh1VrSharpenEnsurePipeline()) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const VkDescriptorImageInfo images[2] = {
+      {VK_NULL_HANDLE, slot.scene.view, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, slot.sharp.view, VK_IMAGE_LAYOUT_GENERAL},
+  };
+  VkWriteDescriptorSet writes[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = fh1_vr_sharpen_sets_[frame_index];
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[i].pImageInfo = &images[i];
+  }
+  dfn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+  const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
+  // Fully overwritten; its last readers (the client's copy of an earlier frame) are complete.
+  PushImageMemoryBarrier(slot.sharp.image, range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+  SubmitBarriers(true);
+  deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                   fh1_vr_sharpen_pipeline_layout_, 0, 1,
+                                                   &fh1_vr_sharpen_sets_[frame_index], 0, nullptr);
+  uint32_t constants[3] = {width, height, 0};
+  std::memcpy(&constants[2], &sharpness, sizeof(float));
+  deferred_command_buffer_.CmdVkPushConstants(fh1_vr_sharpen_pipeline_layout_,
+                                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                                              constants);
+  BindExternalComputePipeline(fh1_vr_sharpen_pipeline_);
+  deferred_command_buffer_.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
+  PushImageMemoryBarrier(slot.sharp.image, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL);
+  SubmitBarriers(true);
+  // From here on (stereo, the hand-over) the sharpened picture is the scene.
+  std::swap(slot.scene, slot.sharp);
+}
+
 void VulkanCommandProcessor::Fh1VrDestroy() {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   for (auto& slot : fh1_vr_slots_) {
-    for (Fh1VrSlot::Image* image : {&slot->scene, &slot->hud, &slot->stereo, &slot->keys}) {
+    for (Fh1VrSlot::Image* image : {&slot->scene, &slot->hud, &slot->stereo, &slot->keys, &slot->sharp}) {
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, image->view);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, image->image);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, image->memory);
     }
   }
   fh1_vr_slots_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, fh1_vr_sharpen_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         fh1_vr_sharpen_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         fh1_vr_sharpen_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         fh1_vr_sharpen_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, fh1_vr_hud_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          fh1_vr_hud_pipeline_layout_);

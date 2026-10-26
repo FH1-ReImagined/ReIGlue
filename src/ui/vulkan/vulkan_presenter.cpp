@@ -149,6 +149,7 @@ namespace guest_output_export {
 std::atomic<bool> enabled{false};
 std::atomic<uint32_t> flags{0};  // patch 0393: REX_GUEST_OUTPUT_EXPORT_*
 std::atomic<float> stereo_eye_distance{0.064f}, stereo_max_shift{0.03f};
+std::atomic<float> sharpen{0.0f};  // patch 0395
 std::atomic<uint32_t> next_tag{0};
 std::mutex mutex;
 std::shared_ptr<void> latest;  // keeps the image alive while it is the newest
@@ -3421,6 +3422,15 @@ REX_GUEST_OUTPUT_EXPORT void rexui_SetGuestOutputStereo(float eye_distance, floa
   namespace e = rex::ui::vulkan::guest_output_export;
   e::stereo_eye_distance.store(eye_distance, std::memory_order_relaxed);
   e::stereo_max_shift.store(max_shift, std::memory_order_relaxed);
+}
+
+// Patch 0395: the client's sharpening of the scene layer, 0 (off) to 1.
+REX_GUEST_OUTPUT_EXPORT float rexui_GuestOutputSharpen(void) {
+  return rex::ui::vulkan::guest_output_export::sharpen.load(std::memory_order_relaxed);
+}
+REX_GUEST_OUTPUT_EXPORT void rexui_SetGuestOutputSharpen(float amount) {
+  rex::ui::vulkan::guest_output_export::sharpen.store(amount < 0.0f ? 0.0f : amount > 1.0f ? 1.0f : amount,
+                                                      std::memory_order_relaxed);
 }
 
 REX_GUEST_OUTPUT_EXPORT void rexui_SetNextGuestOutputLayers(const void* keep,
