@@ -18,6 +18,7 @@
 #include <rex/filesystem.h>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/pipeline/shader/shader.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/string.h>
@@ -95,18 +96,40 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::Translation::Dum
 }
 
 Shader::Translation* Shader::GetOrCreateTranslation(uint64_t modification, bool* is_new) {
+  // FH1 (#45, patch 0362): the same modification as last time (the memo is emptied when its
+  // translation is destroyed).
+  if (fh1_translation_memo_enabled && fh1_memo_translation_ &&
+      fh1_memo_modification_ == modification) {
+    if (fh1_translation_memo_verify) {
+      auto it = translations_.find(modification);
+      if (it == translations_.end() || it->second != fh1_memo_translation_) {
+        ++fh1_translation_memo_mismatches;
+        REXGPU_WARN("Shader translation memo: shader {:016X} modification {:016X} differs from "
+                    "the map ({} so far)",
+                    ucode_data_hash(), modification, fh1_translation_memo_mismatches);
+      }
+    }
+    if (is_new) {
+      *is_new = false;
+    }
+    return fh1_memo_translation_;
+  }
+  Translation* translation;
   auto it = translations_.find(modification);
   if (it != translations_.end()) {
     if (is_new) {
       *is_new = false;
     }
-    return it->second;
+    translation = it->second;
+  } else {
+    translation = CreateTranslationInstance(modification);
+    translations_.emplace(modification, translation);
+    if (is_new) {
+      *is_new = true;
+    }
   }
-  Translation* translation = CreateTranslationInstance(modification);
-  translations_.emplace(modification, translation);
-  if (is_new) {
-    *is_new = true;
-  }
+  fh1_memo_translation_ = translation;
+  fh1_memo_modification_ = modification;
   return translation;
 }
 
@@ -114,6 +137,9 @@ void Shader::DestroyTranslation(uint64_t modification) {
   auto it = translations_.find(modification);
   if (it == translations_.end()) {
     return;
+  }
+  if (fh1_memo_translation_ == it->second) {
+    fh1_memo_translation_ = nullptr;
   }
   delete it->second;
   translations_.erase(it);

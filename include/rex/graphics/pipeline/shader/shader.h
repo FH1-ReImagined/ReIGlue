@@ -963,6 +963,14 @@ class Shader {
   // failure. Not thread-safe.
   void DestroyTranslation(uint64_t modification);
 
+  // FH1 (#45, patch 0362): GetOrCreateTranslation answers a repeat of the modification it was
+  // last asked for from a memo (the map lookup, two a draw, was about 1% of the command
+  // processor); the backend sets these from gpu_shader_translation_memo(_verify) at each frame
+  // start. Verify: also look the map up and log a difference.
+  static inline bool fh1_translation_memo_enabled = false;
+  static inline bool fh1_translation_memo_verify = false;
+  static inline uint64_t fh1_translation_memo_mismatches = 0;
+
   // An externally managed identifier of the shader storage the microcode of the
   // shader was last written to, or was loaded from, to only write the shader
   // microcode to the storage once. UINT32_MAX by default.
@@ -1030,6 +1038,9 @@ class Shader {
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;
+  // FH1 (#45, patch 0362): the last translation GetOrCreateTranslation returned, and for what.
+  Translation* fh1_memo_translation_ = nullptr;
+  uint64_t fh1_memo_modification_ = 0;
 
   uint32_t ucode_storage_index_ = UINT32_MAX;
 

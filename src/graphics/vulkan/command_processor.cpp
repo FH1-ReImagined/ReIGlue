@@ -171,6 +171,17 @@ REXCVAR_DEFINE_BOOL(gpu_plain_register_ranges, true, "GPU/Vulkan",
                     "start)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_shader_translation_memo, true, "GPU/Vulkan",
+                    "Each shader answers a draw that needs the same translation (modification) "
+                    "as the last draw that used it without looking its translations up (read at "
+                    "each frame start)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_shader_translation_memo_verify, false, "GPU/Vulkan",
+                    "With gpu_shader_translation_memo, still look each translation up and log a "
+                    "difference (testing)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -7235,6 +7246,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // FH1 (#45, patch 0360): the packet loop stores the plain registers itself (the same
     // stores WriteRegistersFromMem and WriteRegister do for them).
     fh1_plain_registers_ = REXCVAR_GET(gpu_plain_register_ranges) ? plain_registers.bits() : nullptr;
+    // FH1 (#45, patch 0362).
+    Shader::fh1_translation_memo_enabled = REXCVAR_GET(gpu_shader_translation_memo);
+    Shader::fh1_translation_memo_verify = REXCVAR_GET(gpu_shader_translation_memo_verify);
     if (fh1_other_render_targets_) Fh1SelectNativeHud(false);
     if (fh1_dlss_) fh1_dlss_->BeginFrame(frame_current_);
     fh1_scene_composited_ = false;
