@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <filesystem>
+#include <rex/ui/vulkan/guest_output_export.h>
 #include <fstream>
 #include <utility>
 #include <vector>
@@ -133,6 +134,10 @@ struct RexGuestOutputFrame {
   // reads in VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, or a barrier back to that stage and layout.
   VkImage image;
   VkImageView view;
+  // Patch 0393: the frame's VR layers (rexui_SetGuestOutputExport flag 2, 4), when it has them;
+  // same layout and stages as `image`, held with it. A client passing the version 0391 size gets
+  // the fields above only.
+  RexGuestOutputLayers vr;
 };
 }
 
@@ -142,11 +147,19 @@ namespace vulkan {
 
 namespace guest_output_export {
 std::atomic<bool> enabled{false};
+std::atomic<uint32_t> flags{0};  // patch 0393: REX_GUEST_OUTPUT_EXPORT_*
+std::atomic<float> stereo_eye_distance{0.064f}, stereo_max_shift{0.03f};
 std::atomic<uint32_t> next_tag{0};
 std::mutex mutex;
 std::shared_ptr<void> latest;  // keeps the image alive while it is the newest
 RexGuestOutputFrame latest_frame = {};
 std::shared_ptr<void> held[8];  // what the consumer holds, by handle - 1
+// Patch 0393: the layers of the frame being refreshed (command processor thread), and those of
+// the newest and the held frames.
+std::shared_ptr<void> next_layers_keep;
+RexGuestOutputLayers next_layers = {};
+std::shared_ptr<void> latest_layers;
+std::shared_ptr<void> held_layers[8];
 }  // namespace guest_output_export
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -326,6 +339,11 @@ VulkanPresenter::~VulkanPresenter() {
     std::lock_guard<std::mutex> lock(guest_output_export::mutex);
     guest_output_export::latest.reset();
     for (auto& hold : guest_output_export::held) {
+      hold.reset();
+    }
+    guest_output_export::latest_layers.reset();
+    guest_output_export::next_layers_keep.reset();
+    for (auto& hold : guest_output_export::held_layers) {
       hold.reset();
     }
   }
@@ -1250,7 +1268,16 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
       frame.height = image_instance.image->extent().height;
       frame.image = image_instance.image->image();
       frame.view = image_instance.image->view();
+      // Patch 0393: the layers the refresher made for this frame, if any.
+      frame.vr = guest_output_export::next_layers;
+      guest_output_export::latest_layers = guest_output_export::next_layers_keep;
     }
+  }
+  // Patch 0393: the next refresh brings its own layers.
+  if (guest_output_export::enabled.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(guest_output_export::mutex);
+    guest_output_export::next_layers = {};
+    guest_output_export::next_layers_keep.reset();
   }
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the image. It's better to put an excessive
@@ -3354,9 +3381,13 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffec
 #define REX_GUEST_OUTPUT_EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 
-// Starts or stops publishing the newest guest output (off: nothing is kept or held).
+// Starts or stops publishing the newest guest output (off: nothing is kept or held). Patch 0393:
+// the value is a set of REX_GUEST_OUTPUT_EXPORT_* flags (patch 0391's 1 is the frames alone): 2
+// adds the scene before the HUD and the HUD alone, 4 both eyes (patch 0394).
 REX_GUEST_OUTPUT_EXPORT void rexui_SetGuestOutputExport(int enabled) {
   namespace e = rex::ui::vulkan::guest_output_export;
+  e::flags.store(enabled ? uint32_t(enabled) | REX_GUEST_OUTPUT_EXPORT_FRAMES : 0,
+                 std::memory_order_relaxed);
   e::enabled.store(enabled != 0, std::memory_order_relaxed);
   if (!enabled) {
     std::lock_guard<std::mutex> lock(e::mutex);
@@ -3364,7 +3395,40 @@ REX_GUEST_OUTPUT_EXPORT void rexui_SetGuestOutputExport(int enabled) {
     for (auto& hold : e::held) {
       hold.reset();
     }
+    e::latest_layers.reset();
+    e::next_layers_keep.reset();
+    e::next_layers = {};
+    for (auto& hold : e::held_layers) {
+      hold.reset();
+    }
   }
+}
+
+// Patch 0393 (rex/ui/vulkan/guest_output_export.h): what the command processor reads and hands in.
+REX_GUEST_OUTPUT_EXPORT uint32_t rexui_GuestOutputExportFlags(void) {
+  return rex::ui::vulkan::guest_output_export::flags.load(std::memory_order_relaxed);
+}
+
+REX_GUEST_OUTPUT_EXPORT void rexui_GuestOutputStereoParams(float* eye_distance, float* max_shift) {
+  namespace e = rex::ui::vulkan::guest_output_export;
+  if (eye_distance) *eye_distance = e::stereo_eye_distance.load(std::memory_order_relaxed);
+  if (max_shift) *max_shift = e::stereo_max_shift.load(std::memory_order_relaxed);
+}
+
+// The client's stereo settings (patch 0394): the eyes' distance in metres (the headset's IPD) and
+// the most a pixel may shift, a fraction of the picture's width.
+REX_GUEST_OUTPUT_EXPORT void rexui_SetGuestOutputStereo(float eye_distance, float max_shift) {
+  namespace e = rex::ui::vulkan::guest_output_export;
+  e::stereo_eye_distance.store(eye_distance, std::memory_order_relaxed);
+  e::stereo_max_shift.store(max_shift, std::memory_order_relaxed);
+}
+
+REX_GUEST_OUTPUT_EXPORT void rexui_SetNextGuestOutputLayers(const void* keep,
+                                                           const RexGuestOutputLayers* layers) {
+  namespace e = rex::ui::vulkan::guest_output_export;
+  std::lock_guard<std::mutex> lock(e::mutex);
+  e::next_layers_keep = keep ? *static_cast<const std::shared_ptr<void>*>(keep) : nullptr;
+  e::next_layers = layers ? *layers : RexGuestOutputLayers{};
 }
 
 // The tag of the frame the next IssueSwap refreshes (the command processor, before and after it).
@@ -3377,9 +3441,11 @@ REX_GUEST_OUTPUT_EXPORT void rexui_SetNextGuestOutputTag(uint32_t tag) {
 REX_GUEST_OUTPUT_EXPORT int rexui_AcquireGuestOutputFrame(RexGuestOutputFrame* frame,
                                                           uint64_t newer_than) {
   namespace e = rex::ui::vulkan::guest_output_export;
-  if (!frame || frame->size < sizeof(RexGuestOutputFrame)) {
+  // Patch 0393: clients of patch 0391 pass the smaller size and get its fields.
+  if (!frame || frame->size < offsetof(RexGuestOutputFrame, vr)) {
     return 0;
   }
+  const uint32_t size = std::min<uint32_t>(frame->size, sizeof(RexGuestOutputFrame));
   std::lock_guard<std::mutex> lock(e::mutex);
   if (!e::latest || e::latest_frame.serial <= newer_than) {
     return 0;
@@ -3387,8 +3453,9 @@ REX_GUEST_OUTPUT_EXPORT int rexui_AcquireGuestOutputFrame(RexGuestOutputFrame* f
   for (uint32_t i = 0; i < std::size(e::held); ++i) {
     if (!e::held[i]) {
       e::held[i] = e::latest;
-      *frame = e::latest_frame;
-      frame->size = sizeof(RexGuestOutputFrame);
+      e::held_layers[i] = e::latest_layers;
+      std::memcpy(frame, &e::latest_frame, size);
+      frame->size = size;
       frame->handle = i + 1;
       return 1;
     }
@@ -3402,5 +3469,6 @@ REX_GUEST_OUTPUT_EXPORT void rexui_ReleaseGuestOutputFrame(uint32_t handle) {
   std::lock_guard<std::mutex> lock(e::mutex);
   if (handle >= 1 && handle <= std::size(e::held)) {
     e::held[handle - 1].reset();
+    e::held_layers[handle - 1].reset();
   }
 }

@@ -82,6 +82,7 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/types.h>
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/vulkan/guest_output_export.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -2835,6 +2836,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
   for (auto& scene : hdr_scenes_)
     DestroyHdrScene(scene);
+  Fh1VrDestroy();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_hud_mask_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          swap_hud_mask_pipeline_layout_);
@@ -3363,6 +3365,350 @@ void VulkanCommandProcessor::DestroyHdrScene(HdrScene& scene) {
   scene = {};
 }
 
+// Patch 0393: VR layers. The HDR path's pre-HUD snapshot (CaptureHdrScene, also taken while a VR
+// client asks for layers) goes through the swap's own gamma pipeline into a slot's scene image, so
+// it matches the guest output (gamma ramp, fades, channel order); then the HUD alone is recovered
+// from the two pictures at the HUD's 1280 x 720. Both are recorded in the swap refresher, in the
+// guest output's submission, and handed to the export with the frame. A slot is reused once the
+// export and its client have let go of it and this processor's last use of it is complete.
+struct VulkanCommandProcessor::Fh1VrSlot {
+  struct Image {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+  };
+  Image scene, hud;
+  uint32_t width = 0, height = 0;
+  uint64_t submission = 0;
+};
+
+namespace {
+constexpr uint32_t kFh1VrHudWidth = 1280, kFh1VrHudHeight = 720;
+constexpr size_t kFh1VrMaxSlots = 6;
+
+// The HUD alone from the frame with it (`frame`) and the same frame before it (`scene`), both
+// after the gamma ramp. The game blends the HUD over the scene: frame = scene * (1 - a) + c * a.
+// Per pixel the least coverage a that explains the change with a colour c in [0, 1] (a dark
+// translucent backdrop gives black at its own opacity, white text white), then a box filter down
+// to the HUD's own size in premultiplied colour. Unchanged pixels (and changes within 10-bit
+// rounding) are transparent.
+constexpr char kFh1VrHudShader[] = R"glsl(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform Params { uvec4 size; } pc;  // frame width, height; HUD width, height
+layout(set = 0, binding = 0) uniform texture2D frame;
+layout(set = 0, binding = 1) uniform texture2D scene;
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D hud;
+void main() {
+  uvec2 p = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(p, pc.size.zw))) return;
+  uvec2 lo = p * pc.size.xy / pc.size.zw;
+  uvec2 hi = max((p + 1u) * pc.size.xy / pc.size.zw, lo + 1u);
+  vec4 sum = vec4(0.0);
+  for (uint y = lo.y; y < hi.y; ++y) {
+    for (uint x = lo.x; x < hi.x; ++x) {
+      vec3 f = texelFetch(frame, ivec2(x, y), 0).rgb;
+      vec3 s = texelFetch(scene, ivec2(x, y), 0).rgb;
+      vec3 d = f - s;
+      if (max(abs(d.r), max(abs(d.g), abs(d.b))) < 0.004) continue;
+      vec3 darker = -d / max(s, vec3(1e-3));
+      vec3 lighter = d / max(vec3(1.0) - s, vec3(1e-3));
+      vec3 a3 = max(darker, lighter);
+      float a = clamp(max(a3.r, max(a3.g, a3.b)), 0.0, 1.0);
+      sum += vec4(clamp(f - s * (1.0 - a), 0.0, 1.0), a);
+    }
+  }
+  sum /= float((hi.x - lo.x) * (hi.y - lo.y));
+  vec3 colour = sum.a > 0.0 ? clamp(sum.rgb / sum.a, 0.0, 1.0) : vec3(0.0);
+  imageStore(hud, ivec2(p), vec4(colour, sum.a));
+}
+)glsl";
+}  // namespace
+
+bool VulkanCommandProcessor::Fh1VrLayersWanted() const {
+  return !fh1_vr_failed_ &&
+         (rexui_GuestOutputExportFlags() & REX_GUEST_OUTPUT_EXPORT_LAYERS) != 0;
+}
+
+bool VulkanCommandProcessor::Fh1VrEnsurePipelines() {
+  if (fh1_vr_hud_pipeline_ != VK_NULL_HANDLE) return true;
+  if (fh1_vr_failed_) return false;
+  fh1_vr_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType =
+        i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 3;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &fh1_vr_hud_set_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("VR layers: no descriptor set layout; off");
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 4};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &fh1_vr_hud_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &fh1_vr_hud_pipeline_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("VR layers: no pipeline layout; off");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = 3 * kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &fh1_vr_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("VR layers: no descriptor pool; off");
+    return false;
+  }
+  auto allocate = [&](VkDescriptorSetLayout layout,
+                      std::array<VkDescriptorSet, kMaxFramesInFlight>& sets) {
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts;
+    layouts.fill(layout);
+    VkDescriptorSetAllocateInfo set_info = {};
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = fh1_vr_descriptor_pool_;
+    set_info.descriptorSetCount = kMaxFramesInFlight;
+    set_info.pSetLayouts = layouts.data();
+    return dfn.vkAllocateDescriptorSets(device, &set_info, sets.data()) == VK_SUCCESS;
+  };
+  if (!allocate(swap_descriptor_set_layout_sampled_image_, fh1_vr_gamma_source_sets_) ||
+      !allocate(swap_descriptor_set_layout_storage_image_, fh1_vr_gamma_destination_sets_) ||
+      !allocate(fh1_vr_hud_set_layout_, fh1_vr_hud_sets_)) {
+    REXGPU_WARN("VR layers: no descriptor sets; off");
+    return false;
+  }
+  std::vector<uint32_t> spirv;
+  std::string error;
+  if (!CompileFh1Compute(kFh1VrHudShader, spirv, error)) {
+    REXGPU_WARN("VR layers: the HUD shader did not compile ({}); off", error);
+    return false;
+  }
+  fh1_vr_hud_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, fh1_vr_hud_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
+  if (fh1_vr_hud_pipeline_ == VK_NULL_HANDLE) {
+    REXGPU_WARN("VR layers: no HUD pipeline; off");
+    return false;
+  }
+  fh1_vr_failed_ = false;
+  REXGPU_INFO("VR layers: on (the scene before the HUD and the HUD alone, for the OpenXR client)");
+  return true;
+}
+
+std::shared_ptr<VulkanCommandProcessor::Fh1VrSlot> VulkanCommandProcessor::Fh1VrTakeSlot(
+    uint32_t width, uint32_t height) {
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const uint64_t completed = GetCompletedSubmission();
+  auto is_free = [&](const std::shared_ptr<Fh1VrSlot>& slot) {
+    return slot.use_count() == 1 && slot->submission <= completed;
+  };
+  auto destroy = [&](Fh1VrSlot& slot) {
+    for (Fh1VrSlot::Image* image : {&slot.scene, &slot.hud}) {
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, image->view);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, image->image);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, image->memory);
+    }
+  };
+  for (auto& slot : fh1_vr_slots_) {
+    if (is_free(slot) && slot->width == width && slot->height == height) return slot;
+  }
+  // Free slots of another size (the render scale changed) go.
+  for (auto it = fh1_vr_slots_.begin(); it != fh1_vr_slots_.end();) {
+    if (is_free(*it) && ((*it)->width != width || (*it)->height != height)) {
+      destroy(**it);
+      it = fh1_vr_slots_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (fh1_vr_slots_.size() >= kFh1VrMaxSlots) return nullptr;
+  auto slot = std::make_shared<Fh1VrSlot>();
+  auto make = [&](Fh1VrSlot::Image& out, VkFormat format, uint32_t w, uint32_t h) {
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {w, h, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, out.image,
+            out.memory))
+      return false;
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = out.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    return dfn.vkCreateImageView(device, &view, nullptr, &out.view) == VK_SUCCESS;
+  };
+  if (!make(slot->scene, VK_FORMAT_A2B10G10R10_UNORM_PACK32, width, height) ||
+      !make(slot->hud, VK_FORMAT_R8G8B8A8_UNORM, kFh1VrHudWidth, kFh1VrHudHeight)) {
+    destroy(*slot);
+    REXGPU_WARN("VR layers: no memory for a {}x{} slot", width, height);
+    return nullptr;
+  }
+  slot->width = width;
+  slot->height = height;
+  fh1_vr_slots_.push_back(slot);
+  if (fh1_vr_slots_.size() == 1)
+    REXGPU_INFO("VR layers: {}x{} scene and {}x{} HUD", width, height, kFh1VrHudWidth,
+                kFh1VrHudHeight);
+  return slot;
+}
+
+void VulkanCommandProcessor::Fh1VrLayers(VkImage guest_output, VkImageView guest_output_view,
+                                         uint32_t width, uint32_t height,
+                                         VkImageView snapshot_view, VkPipeline gamma_pipeline,
+                                         VkDescriptorSet gamma_ramp_set, uint32_t frame_index) {
+  if (gamma_pipeline == VK_NULL_HANDLE || !Fh1VrEnsurePipelines()) return;
+  std::shared_ptr<Fh1VrSlot> slot = Fh1VrTakeSlot(width, height);
+  if (!slot) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // This frame index's sets were last used kMaxFramesInFlight frames ago, like the swap's own.
+  const VkDescriptorImageInfo images[5] = {
+      {VK_NULL_HANDLE, snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+      {VK_NULL_HANDLE, slot->scene.view, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, guest_output_view, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, slot->scene.view, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, slot->hud.view, VK_IMAGE_LAYOUT_GENERAL},
+  };
+  const VkDescriptorSet sets[5] = {fh1_vr_gamma_source_sets_[frame_index],
+                                   fh1_vr_gamma_destination_sets_[frame_index],
+                                   fh1_vr_hud_sets_[frame_index], fh1_vr_hud_sets_[frame_index],
+                                   fh1_vr_hud_sets_[frame_index]};
+  const uint32_t binding[5] = {0, 0, 0, 1, 2};
+  VkWriteDescriptorSet writes[5] = {};
+  for (uint32_t i = 0; i < 5; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = sets[i];
+    writes[i].dstBinding = binding[i];
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = i == 1 || i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[i].pImageInfo = &images[i];
+  }
+  dfn.vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+
+  const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
+  PushImageMemoryBarrier(guest_output, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL);
+  for (VkImage image : {slot->scene.image, slot->hud.image}) {
+    // Contents are fully overwritten; the last readers (the client's copy, this processor's
+    // earlier frame) are complete.
+    PushImageMemoryBarrier(image, range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+  }
+  SubmitBarriers(true);
+
+  // The scene through the swap's gamma pipeline (its ramp, its channel order).
+  std::array<VkDescriptorSet, kSwapApplyGammaComputeDescriptorSetCount> gamma_sets{};
+  gamma_sets[kSwapApplyGammaComputeDescriptorSetRamp] = gamma_ramp_set;
+  gamma_sets[kSwapApplyGammaComputeDescriptorSetSource] = sets[0];
+  gamma_sets[kSwapApplyGammaComputeDescriptorSetDestination] = sets[1];
+  deferred_command_buffer_.CmdVkBindDescriptorSets(
+      VK_PIPELINE_BIND_POINT_COMPUTE, swap_apply_gamma_compute_pipeline_layout_, 0,
+      uint32_t(gamma_sets.size()), gamma_sets.data(), 0, nullptr);
+  SwapApplyGammaConstants gamma_constants = {{width, height}};
+  deferred_command_buffer_.CmdVkPushConstants(swap_apply_gamma_compute_pipeline_layout_,
+                                              VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                              sizeof(gamma_constants), &gamma_constants);
+  BindExternalComputePipeline(gamma_pipeline);
+  deferred_command_buffer_.CmdVkDispatch((width + 15) / 16, (height + 7) / 8, 1);
+  PushImageMemoryBarrier(slot->scene.image, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL);
+  SubmitBarriers(true);
+
+  // The HUD alone.
+  deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                   fh1_vr_hud_pipeline_layout_, 0, 1, &sets[2],
+                                                   0, nullptr);
+  const uint32_t hud_constants[4] = {width, height, kFh1VrHudWidth, kFh1VrHudHeight};
+  deferred_command_buffer_.CmdVkPushConstants(fh1_vr_hud_pipeline_layout_,
+                                              VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                              sizeof(hud_constants), hud_constants);
+  BindExternalComputePipeline(fh1_vr_hud_pipeline_);
+  deferred_command_buffer_.CmdVkDispatch((kFh1VrHudWidth + 7) / 8, (kFh1VrHudHeight + 7) / 8, 1);
+
+  // Handed over like the guest output: shader-read-only, last written before the fragment
+  // shader and transfer stages the client starts from.
+  for (VkImage image : {slot->scene.image, slot->hud.image}) {
+    PushImageMemoryBarrier(image, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                           VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+  slot->submission = GetCurrentSubmission();
+
+  RexGuestOutputLayers layers = {};
+  layers.layers = REX_GUEST_OUTPUT_LAYER_SCENE | REX_GUEST_OUTPUT_LAYER_HUD;
+  layers.scene_width = width;
+  layers.scene_height = height;
+  layers.scene = slot->scene.image;
+  layers.hud_width = kFh1VrHudWidth;
+  layers.hud_height = kFh1VrHudHeight;
+  layers.hud = slot->hud.image;
+  const std::shared_ptr<void> keep = slot;
+  rexui_SetNextGuestOutputLayers(&keep, &layers);
+}
+
+void VulkanCommandProcessor::Fh1VrDestroy() {
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (auto& slot : fh1_vr_slots_) {
+    for (Fh1VrSlot::Image* image : {&slot->scene, &slot->hud}) {
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, image->view);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, image->image);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, image->memory);
+    }
+  }
+  fh1_vr_slots_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, fh1_vr_hud_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         fh1_vr_hud_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         fh1_vr_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         fh1_vr_hud_set_layout_);
+}
+
 void VulkanCommandProcessor::CaptureHdrScene() {
   const auto& regs = *register_file_;
   const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
@@ -3611,11 +3957,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           ? hdr_scene.view
           : VK_NULL_HANDLE;
 
+  // Patch 0393: this frame's pre-HUD snapshot for the VR layers.
+  const VkImageView vr_snapshot_view =
+      Fh1VrLayersWanted() && hdr_scene.frame == frame_current_ &&
+              hdr_scene.width == guest_output_width && hdr_scene.height == guest_output_height
+          ? hdr_scene.view
+          : VK_NULL_HANDLE;
+
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
-       swap_post_effect, swap_source_needs_rb_swap,
-       hud_snapshot_view](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       swap_post_effect, swap_source_needs_rb_swap, hud_snapshot_view,
+       vr_snapshot_view](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -3992,6 +4345,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                                         sizeof(hud_mask_size), hud_mask_size);
             BindExternalComputePipeline(swap_hud_mask_pipeline_);
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          }
+
+          if (vr_snapshot_view != VK_NULL_HANDLE) {
+            Fh1VrLayers(vulkan_context.image(), vulkan_context.image_view(), guest_output_width,
+                        guest_output_height, vr_snapshot_view,
+                        select_swap_apply_gamma_compute_pipeline(use_pwl_gamma_ramp, false),
+                        swap_descriptors_gamma_ramp_[2 * gamma_ramp_frame_index_ref +
+                                                     uint32_t(use_pwl_gamma_ramp)],
+                        swap_frame_index);
           }
 
           // Insert the release barrier.
@@ -5507,7 +5869,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   bool hdr_menu_background = false;
-  if (is_rasterization_done && normalized_color_mask && ui::vulkan::GetHdrOutputState().active) {
+  // Patch 0393: the pre-HUD snapshot also feeds a VR client's layers.
+  if (is_rasterization_done && normalized_color_mask &&
+      (ui::vulkan::GetHdrOutputState().active || Fh1VrLayersWanted())) {
     const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
     const auto color = regs.Get<reg::RB_COLOR_INFO>();
     const bool ui_target = surface.surface_pitch == 1280 &&

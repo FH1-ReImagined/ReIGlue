@@ -775,6 +775,26 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
   bool swap_hud_mask_failed_ = false;
 
+  // Patch 0393: VR layers for the guest output export (rex/ui/vulkan/guest_output_export.h): the
+  // HDR path's pre-HUD snapshot through the swap's gamma ramp, and the HUD alone.
+  struct Fh1VrSlot;
+  std::vector<std::shared_ptr<Fh1VrSlot>> fh1_vr_slots_;
+  VkDescriptorSetLayout fh1_vr_hud_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout fh1_vr_hud_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline fh1_vr_hud_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool fh1_vr_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_vr_gamma_source_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_vr_gamma_destination_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> fh1_vr_hud_sets_{};
+  bool fh1_vr_failed_ = false;
+  bool Fh1VrLayersWanted() const;
+  bool Fh1VrEnsurePipelines();
+  std::shared_ptr<Fh1VrSlot> Fh1VrTakeSlot(uint32_t width, uint32_t height);
+  void Fh1VrLayers(VkImage guest_output, VkImageView guest_output_view, uint32_t width,
+                   uint32_t height, VkImageView snapshot_view, VkPipeline gamma_pipeline,
+                   VkDescriptorSet gamma_ramp_set, uint32_t frame_index);
+  void Fh1VrDestroy();
+
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
 
