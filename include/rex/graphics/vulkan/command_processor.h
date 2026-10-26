@@ -144,6 +144,12 @@ class VulkanCommandProcessor : public CommandProcessor {
                                bool blocking) override;
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
+    // FH1 (#45, patch 0361): the provider made the device before this processor and keeps it
+    // until after it; the constructor keeps the pointer (the virtual provider() call, several
+    // times a draw, was about 1% of the command processor).
+    if (fh1_vulkan_device_) [[likely]] {
+      return fh1_vulkan_device_;
+    }
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
         ->vulkan_device();
   }
@@ -322,6 +328,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueCopy() override;
 
  private:
+  // GetVulkanDevice's pointer, set in the constructor (null while the members are made).
+  ui::vulkan::VulkanDevice* fh1_vulkan_device_ = nullptr;
+
   struct CommandBuffer {
     VkCommandPool pool;
     VkCommandBuffer buffer;

@@ -165,6 +165,9 @@ target_include_directories(rexgpu-xenos PRIVATE
 )
 
 target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
+# FH1 (#45, patch 0361): rex::bit_scan_forward, tzcnt and lzcnt inline in the plugin
+# (include/rex/math.h) instead of calls into the runtime library.
+target_compile_definitions(rexgpu-xenos PRIVATE REX_INLINE_BIT_SCANS=1)
 
 rex_target_pch(rexgpu-xenos
     <mutex>

@@ -831,6 +831,8 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           kDescriptorPoolSizeTextures, uint32_t(rex::countof(kDescriptorPoolSizeTextures)),
           kLinkedTypeDescriptorPoolSetCount) {
   legacy_readback_memexport_cvar_name_ = "vulkan_readback_memexport";
+  fh1_vulkan_device_ =
+      static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())->vulkan_device();
 }
 
 VulkanCommandProcessor::~VulkanCommandProcessor() = default;

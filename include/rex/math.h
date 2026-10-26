@@ -126,6 +126,38 @@ constexpr uint32_t bit_count(T v) {
   return static_cast<uint32_t>(std::popcount(v));
 }
 
+#if defined(REX_INLINE_BIT_SCANS)
+// FH1 (#45, patch 0361): a module built with REX_INLINE_BIT_SCANS (the GPU plugin) gets these
+// as inline functions of its own (an inline namespace, so they do not clash with the runtime's
+// exported ones, which the runtime and the game keep calling). Each was a call into the runtime
+// library for one instruction, many times a draw. Same results as the runtime's for every input.
+inline namespace fh1_inline_bit_scans {
+inline uint8_t lzcnt(uint8_t v) {
+  return static_cast<uint8_t>(std::countl_zero(v));
+}
+inline uint8_t lzcnt(uint16_t v) {
+  return static_cast<uint8_t>(std::countl_zero(v));
+}
+inline uint8_t lzcnt(uint32_t v) {
+  return static_cast<uint8_t>(std::countl_zero(v));
+}
+inline uint8_t lzcnt(uint64_t v) {
+  return static_cast<uint8_t>(std::countl_zero(v));
+}
+inline uint8_t tzcnt(uint8_t v) {
+  return static_cast<uint8_t>(std::countr_zero(v));
+}
+inline uint8_t tzcnt(uint16_t v) {
+  return static_cast<uint8_t>(std::countr_zero(v));
+}
+inline uint8_t tzcnt(uint32_t v) {
+  return static_cast<uint8_t>(std::countr_zero(v));
+}
+inline uint8_t tzcnt(uint64_t v) {
+  return static_cast<uint8_t>(std::countr_zero(v));
+}
+}  // namespace fh1_inline_bit_scans
+#else
 // lzcnt - count leading zeros.
 // Returns the size of the input operand if value is zero.
 uint8_t lzcnt(uint8_t v);
@@ -138,6 +170,7 @@ uint8_t tzcnt(uint8_t v);
 uint8_t tzcnt(uint16_t v);
 uint8_t tzcnt(uint32_t v);
 uint8_t tzcnt(uint64_t v);
+#endif
 inline uint8_t lzcnt(int8_t v) {
   return lzcnt(static_cast<uint8_t>(v));
 }
@@ -167,8 +200,22 @@ inline uint8_t tzcnt(int64_t v) {
 // Search the value from least significant bit (LSB) to the most significant bit
 // (MSB) for a set bit (1).
 // Returns false if no bits are set and the output index is invalid.
+#if defined(REX_INLINE_BIT_SCANS)
+inline namespace fh1_inline_bit_scans {
+// The output for 0 is UINT32_MAX, as the runtime's Linux version gives.
+inline bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+  *out_first_set_index = v ? static_cast<uint32_t>(std::countr_zero(v)) : UINT32_MAX;
+  return v != 0;
+}
+inline bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
+  *out_first_set_index = v ? static_cast<uint32_t>(std::countr_zero(v)) : UINT32_MAX;
+  return v != 0;
+}
+}  // namespace fh1_inline_bit_scans
+#else
 bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index);
 bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index);
+#endif
 inline bool bit_scan_forward(int32_t v, uint32_t* out_first_set_index) {
   return bit_scan_forward(static_cast<uint32_t>(v), out_first_set_index);
 }
