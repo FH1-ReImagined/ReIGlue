@@ -80,6 +80,12 @@ constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x
 // Bounds the queue for titles that never call XamInputGetKeystroke.
 constexpr size_t kMaxQueuedKeystrokes = 256;
 
+int64_t TapTime() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 // Bind values are a comma-separated list of alternatives, each optionally
 // carrying modifier prefixes: "Q,I" or "Shift+W". Modifier matching is exact,
 // so "Up" stays silent while Shift is held and "Shift+Up" stays silent without
@@ -385,6 +391,10 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 }
 
 void MnkInputDriver::OnClosing(rex::ui::UIEvent&) {
+  {
+    std::lock_guard lock(state_mutex_);
+    digital_taps_.Reset();
+  }
   DetachFromWindow();
 }
 
@@ -439,6 +449,10 @@ static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_v
 void MnkInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   // Disabled means no device at all, so it never occupies a guest user slot.
   if (!IsEnabled()) {
+    std::lock_guard lock(state_mutex_);
+    digital_taps_.Reset();
+    std::memset(key_down_, 0, sizeof(key_down_));
+    bound_pressed_ = 0;
     return;
   }
   DeviceInfo info;
@@ -480,12 +494,22 @@ X_RESULT MnkInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
 
 X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (!IsEnabled() || id != kMnkDevice) {
+    if (!IsEnabled()) {
+      std::lock_guard lock(state_mutex_);
+      digital_taps_.Reset();
+      std::memset(key_down_, 0, sizeof(key_down_));
+      bound_pressed_ = 0;
+    }
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
   // Keys reach the guest through GetDeviceKeystroke only, leaving the guest
   // user free for a real controller.
   if (IsPassthroughEnabled()) {
+    std::lock_guard lock(state_mutex_);
+    digital_taps_.Reset();
+    std::memset(key_down_, 0, sizeof(key_down_));
+    bound_pressed_ = 0;
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
@@ -495,6 +519,10 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
                           has_focus_ && is_active());
 
   if (!is_active() || !has_focus_) {
+    {
+      std::lock_guard lock(state_mutex_);
+      digital_taps_.Reset();
+    }
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
       out_state->packet_number = packet_number_;
@@ -504,36 +532,44 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   std::lock_guard lock(state_mutex_);
 
+  const auto binds = PadBinds();
+  uint32_t live_binds = 0;
+  for (size_t i = 0; i < binds.size(); ++i) {
+    if (IsBindPressed(key_down_, binds[i].keys))
+      live_binds |= uint32_t(1) << i;
+  }
+  const uint32_t sampled_binds = digital_taps_.Sample(live_binds, TapTime());
+
   uint16_t buttons = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+  if ((sampled_binds & (uint32_t(1) << 0)))
     buttons |= X_INPUT_GAMEPAD_A;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
+  if ((sampled_binds & (uint32_t(1) << 1)))
     buttons |= X_INPUT_GAMEPAD_B;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
+  if ((sampled_binds & (uint32_t(1) << 2)))
     buttons |= X_INPUT_GAMEPAD_X;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
+  if ((sampled_binds & (uint32_t(1) << 3)))
     buttons |= X_INPUT_GAMEPAD_Y;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
+  if ((sampled_binds & (uint32_t(1) << 4)))
     buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
+  if ((sampled_binds & (uint32_t(1) << 5)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
+  if ((sampled_binds & (uint32_t(1) << 8)))
     buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
+  if ((sampled_binds & (uint32_t(1) << 9)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
+  if ((sampled_binds & (uint32_t(1) << 10)))
     buttons |= X_INPUT_GAMEPAD_BACK;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
+  if ((sampled_binds & (uint32_t(1) << 11)))
     buttons |= X_INPUT_GAMEPAD_START;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
     buttons |= X_INPUT_GAMEPAD_GUIDE;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
+  if ((sampled_binds & (uint32_t(1) << 12)))
     buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
+  if ((sampled_binds & (uint32_t(1) << 13)))
     buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
+  if ((sampled_binds & (uint32_t(1) << 14)))
     buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+  if ((sampled_binds & (uint32_t(1) << 15)))
     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
   uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
@@ -692,6 +728,11 @@ void MnkInputDriver::RefreshBoundKeystrokesLocked() {
 
   // The whole table is diffed rather than the key that moved: binds carry
   // modifiers, so Shift alone can flip several of them at once.
+  if (is_active() && has_focus_ && IsEnabled() && !IsPassthroughEnabled()) {
+    digital_taps_.Observe(pressed, TapTime());
+  } else {
+    digital_taps_.Reset();
+  }
   const uint32_t changed = pressed ^ bound_pressed_;
   bound_pressed_ = pressed;
   if (!changed) {
@@ -794,6 +835,9 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
     return;
   std::lock_guard lock(state_mutex_);
   if (IsPassthroughEnabled()) {
+    digital_taps_.Reset();
+    std::memset(key_down_, 0, sizeof(key_down_));
+    bound_pressed_ = 0;
     EnqueueRawKeystroke(e, true);
     return;
   }
@@ -906,6 +950,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
     std::lock_guard lock(state_mutex_);
     std::memset(key_down_, 0, sizeof(key_down_));
     // Releases landing on another window never arrive here as key-ups.
+    digital_taps_.Reset();
     RefreshBoundKeystrokesLocked();
     mouse_dx_ = 0.0f;
     mouse_dy_ = 0.0f;
