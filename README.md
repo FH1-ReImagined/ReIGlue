@@ -28,7 +28,10 @@ message says what changes and why.
   graphics settings, ultrawide, HDR with HUD coverage, VR through OpenXR with true stereo), texture
   packs, shader-hash effects such as world ambient occlusion, car thumbnails and FH1's wheel
   layouts. They rely on Forza Horizon 1's shaders, render targets or controls; another game needs
-  its own hooks for them.
+  its own hooks for them. Change 0399 adds the optional active physical controller-disconnect
+  sequence for FH1 auto-pause; its [actual SDK fixture](tests/active-controller-disconnect/) distinguishes
+  that event from merged keyboard input and idle spare devices. It requires a new maintainer revision
+  tag before a client can pin it; the production r2 tag is unchanged.
 
 Issue numbers (`#45`) in commit messages are Forza Horizon 1: ReImagined's issues.
 

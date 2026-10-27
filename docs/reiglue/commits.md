@@ -157,3 +157,4 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0395 | `5d9c03b` | VR: the headset's picture sharpened ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
 | 0396 | `f20eb4c` | VR: true stereo, the scene executed once per eye ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
 | 0397 | `4d66d72` | VR: when each guest output frame was published ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
+| 0399 | This branch | Read-only active physical controller disconnect sequence ([#331](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/pull/331)) | **Forza** | Input | Sean O’Connor |
