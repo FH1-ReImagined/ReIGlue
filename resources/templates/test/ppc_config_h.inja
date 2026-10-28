@@ -73,7 +73,12 @@
 #endif
 #endif
 
-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+// As in codegen/pch_h.inja: 0x1000 only where the runtime maps the 0xE0000000
+// view 4 KB short.
+#ifndef REX_WIN32_ROUNDED_PHYSICAL_VIEW
+#define REX_WIN32_ROUNDED_PHYSICAL_VIEW 0
+#endif
+#if (REX_PLATFORM_WIN32 && REX_WIN32_ROUNDED_PHYSICAL_VIEW) || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define REX_PHYS_HOST_OFFSET(addr) 0u
