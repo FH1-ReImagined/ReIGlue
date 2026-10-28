@@ -21,6 +21,7 @@ review and replacement. Historical source in the game repository is separate.
 | `src/ui/shaders/hdr_ui_mask.ps.glsl` | New alpha-only coverage sampling shader. |
 | `src/graphics/shaders/hdr_hud_mask.cs.glsl` | New shared-memory tile implementation: each workgroup loads an 18x10 image tile, then performs 3x3 dilation from shared memory. Channel permutations are compared without sorting. |
 | `src/ui/shaders/vulkan_spirv/hdr_output_ps.h`, `hdr_ui_mask_ps.h`, `src/graphics/shaders/vulkan_spirv/hdr_hud_mask_cs.h` | Regenerated from the replacement shader sources; no retained binary from the former shaders. |
+| `include/rex/ui/vulkan/hdr_format.h`, `hdr_output_pass.h` | New exact format/color-space selection, output render-pass construction, shader module setup and command recording. |
 | `include/rex/ui/vulkan/hdr_surface.h` | New move-only owner for per-image HDR resources. Partial construction cleans itself up. |
 | `include/rex/ui/vulkan/presenter.h`, `src/ui/vulkan/vulkan_presenter.cpp` | Replace per-image allocation/cleanup with the resource owner and batch descriptor allocation; publish frame resources only after all allocations succeed. Replace HDR settings packing. Other HDR presenter portions remain adapted. |
 
@@ -39,14 +40,22 @@ Windows clang 23.1.3 standalone tests, C++20 with `-Wall -Wextra -Werror`:
   idempotence, excluded stages/depth/exports, malformed input without mutation.
 - `hdr_color_test`: every 8-bit sRGB round trip, gamma conversion, bounded
   monotonic highlight output, paper-white HUD and disabled expansion.
+- `hdr_format_test`: HDR available/requested/disabled, extension absence, wrong
+  format/color-space pair and empty capability list.
 - `hdr_parameters_test`: normal settings, below-paper peak, range clamps,
   nonfinite defaults and comparison/calibration settings.
 
 The changed SPIR-V builder, translator, Vulkan and D3D12 command processors and
 Vulkan presenter pass production Windows syntax checks against SDK headers.
-The three GLSL shaders compile with glslangValidator. No full link, HDR display
-readback, Vulkan validation run, VR run or macOS visual test has yet qualified
-these replacements. Do not treat this branch as ready to remove notices or ship.
+The three GLSL shaders compile with glslangValidator. At `5d8a02e`, six changed
+production translation units were rebuilt without a PCH and both runtime/GPU
+DLLs linked in a private directory in 27 seconds, serially. Baseline object and
+library hashes stayed unchanged. Windows loaded both DLLs; all 135 GPU imports
+resolved. The ABI version returned 1 and the factory rejected incompatible ABI,
+null configuration and unknown backend without constructing a graphics system.
+Later output-pass/format-selection replacements pass syntax and contract checks
+but have not yet repeated that link qualification. No HDR display readback,
+Vulkan validation run, VR run or macOS visual test has qualified the branch. Do not treat this branch as ready to remove notices or ship.
 
 Shader regeneration, from the repository root:
 

@@ -1,4 +1,3 @@
-#include <rex/ui/vulkan/hdr_surface.h>
 #pragma once
 /**
  ******************************************************************************
@@ -23,6 +22,7 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/hdr_surface.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>

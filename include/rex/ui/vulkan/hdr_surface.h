@@ -17,21 +17,21 @@ class HdrSurface {
   HdrSurface& operator=(const HdrSurface&) = delete;
   HdrSurface(HdrSurface&& other) noexcept
       : owner_(std::exchange(other.owner_, nullptr)),
-        sdr_image(std::exchange(other.sdr_image, VK_NULL_HANDLE)),
+        image_(std::exchange(other.image_, VK_NULL_HANDLE)),
         memory_(std::exchange(other.memory_, VK_NULL_HANDLE)),
-        linear_view(std::exchange(other.linear_view, VK_NULL_HANDLE)),
+        linear_view_(std::exchange(other.linear_view_, VK_NULL_HANDLE)),
         target_view_(std::exchange(other.target_view_, VK_NULL_HANDLE)),
-        framebuffer(std::exchange(other.framebuffer, VK_NULL_HANDLE)),
-        sample_set(other.sample_set) {}
+        framebuffer_(std::exchange(other.framebuffer_, VK_NULL_HANDLE)),
+        sample_set_(other.sample_set_) {}
 
   ~HdrSurface() {
     if (!owner_) return;
     const auto& api = owner_->functions();
     const auto device = owner_->device();
-    if (framebuffer) api.vkDestroyFramebuffer(device, framebuffer, nullptr);
+    if (framebuffer_) api.vkDestroyFramebuffer(device, framebuffer_, nullptr);
     if (target_view_) api.vkDestroyImageView(device, target_view_, nullptr);
-    if (linear_view) api.vkDestroyImageView(device, linear_view, nullptr);
-    if (sdr_image) api.vkDestroyImage(device, sdr_image, nullptr);
+    if (linear_view_) api.vkDestroyImageView(device, linear_view_, nullptr);
+    if (image_) api.vkDestroyImage(device, image_, nullptr);
     if (memory_) api.vkFreeMemory(device, memory_, nullptr);
   }
 
@@ -41,7 +41,7 @@ class HdrSurface {
     if (!owner || !extent.width || !extent.height || !target || !output_pass || !samples)
       return std::nullopt;
     HdrSurface pending(owner);
-    pending.sample_set = samples;
+    pending.sample_set_ = samples;
     const auto& api = owner->functions();
     const auto device = owner->device();
     VkImageCreateInfo image{};
@@ -56,7 +56,7 @@ class HdrSurface {
     image.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (!util::CreateDedicatedAllocationImage(owner, image, util::MemoryPurpose::kDeviceLocal,
-                                              pending.sdr_image, pending.memory_))
+                                              pending.image_, pending.memory_))
       return std::nullopt;
 
     auto view = [&](VkImage source, VkFormat format, VkImageView& output) {
@@ -68,7 +68,7 @@ class HdrSurface {
       description.subresourceRange = util::InitializeSubresourceRange();
       return api.vkCreateImageView(device, &description, nullptr, &output) == VK_SUCCESS;
     };
-    if (!view(pending.sdr_image, VK_FORMAT_B8G8R8A8_SRGB, pending.linear_view) ||
+    if (!view(pending.image_, VK_FORMAT_B8G8R8A8_SRGB, pending.linear_view_) ||
         !view(target, target_format, pending.target_view_)) return std::nullopt;
 
     VkFramebufferCreateInfo framebuffer_info{};
@@ -78,10 +78,10 @@ class HdrSurface {
     framebuffer_info.pAttachments = &pending.target_view_;
     framebuffer_info.width = extent.width;
     framebuffer_info.height = extent.height;
-    if (api.vkCreateFramebuffer(device, &framebuffer_info, nullptr, &pending.framebuffer) != VK_SUCCESS)
+    if (api.vkCreateFramebuffer(device, &framebuffer_info, nullptr, &pending.framebuffer_) != VK_SUCCESS)
       return std::nullopt;
 
-    const VkDescriptorImageInfo sampled{VK_NULL_HANDLE, pending.linear_view,
+    const VkDescriptorImageInfo sampled{VK_NULL_HANDLE, pending.linear_view_,
                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet descriptor{};
     descriptor.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -93,19 +93,18 @@ class HdrSurface {
     return pending;
   }
 
+  VkImage image() const { return image_; }
+  VkFramebuffer target() const { return framebuffer_; }
+  VkDescriptorSet samples() const { return sample_set_; }
+
  private:
   explicit HdrSurface(const VulkanDevice* owner) : owner_(owner) {}
   const VulkanDevice* owner_;
- public:
-  VkImage sdr_image = VK_NULL_HANDLE;
- private:
+  VkImage image_ = VK_NULL_HANDLE;
   VkDeviceMemory memory_ = VK_NULL_HANDLE;
- public:
-  VkImageView linear_view = VK_NULL_HANDLE;
- private:
+  VkImageView linear_view_ = VK_NULL_HANDLE;
   VkImageView target_view_ = VK_NULL_HANDLE;
- public:
-  VkFramebuffer framebuffer = VK_NULL_HANDLE;
-  VkDescriptorSet sample_set = VK_NULL_HANDLE;
+  VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+  VkDescriptorSet sample_set_ = VK_NULL_HANDLE;
 };
 }  // namespace rex::ui::vulkan

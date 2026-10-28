@@ -28,3 +28,7 @@ add_test(NAME graphics.hdr_color COMMAND hdr_color_test)
 add_executable(hdr_parameters_test hdr_parameters_test.cpp)
 target_include_directories(hdr_parameters_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME graphics.hdr_parameters COMMAND hdr_parameters_test)
+
+add_executable(hdr_format_test hdr_format_test.cpp)
+target_include_directories(hdr_format_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME graphics.hdr_format COMMAND hdr_format_test)
