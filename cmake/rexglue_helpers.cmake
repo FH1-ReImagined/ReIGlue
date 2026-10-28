@@ -8,6 +8,20 @@
 #==========================================================
 include_guard(GLOBAL)
 
+# Code model of Linux x86-64 code: the SDK's own libraries (CMakeLists.txt) and every target
+# rexglue_apply_target_settings() sets up. small (the default): code and static data within
+# 2 GB, calls rip-relative, and the linker's relaxation turns calls and address loads through
+# the GOT into direct ones. A recompiled executable is far below that limit (Forza Horizon 1
+# with its title update: 70 MB of code). large: every call a movabs and an indirect call, for
+# a title whose code would not fit; it links with --no-relax, as it always did.
+set(REXGLUE_X86_64_CODE_MODEL "small" CACHE STRING
+    "Code model of Linux x86-64 targets: small (the default) or large (links with --no-relax)")
+set_property(CACHE REXGLUE_X86_64_CODE_MODEL PROPERTY STRINGS small large)
+if(NOT REXGLUE_X86_64_CODE_MODEL MATCHES "^(small|large)$")
+    message(FATAL_ERROR
+        "REXGLUE_X86_64_CODE_MODEL must be small or large, not '${REXGLUE_X86_64_CODE_MODEL}'")
+endif()
+
 function(_rexglue_stage_macos_vulkan_runtime target_name)
     if(TARGET Vulkan::Loader AND TARGET MoltenVK::MoltenVK)
         set(_rexglue_vulkan_loader Vulkan::Loader)
@@ -46,10 +60,12 @@ endfunction()
 #==========================================================
 function(rexglue_apply_target_settings target_name)
     if(UNIX AND NOT APPLE)
-        # Large executable support
+        # Code model (REXGLUE_X86_64_CODE_MODEL, above)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-            target_link_options(${target_name} PRIVATE -Wl,--no-relax)
-            target_compile_options(${target_name} PRIVATE -mcmodel=large)
+            target_compile_options(${target_name} PRIVATE -mcmodel=${REXGLUE_X86_64_CODE_MODEL})
+            if(REXGLUE_X86_64_CODE_MODEL STREQUAL "large")
+                target_link_options(${target_name} PRIVATE -Wl,--no-relax)
+            endif()
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
             target_compile_options(${target_name} PRIVATE -march=armv8-a)
         endif()
