@@ -1,3 +1,4 @@
+#include <rex/ui/vulkan/hdr_surface.h>
 #pragma once
 /**
  ******************************************************************************
@@ -352,18 +353,7 @@ class VulkanPresenter final : public Presenter {
       VkSemaphore present_semaphore;
     };
 
-    // present_hdr: the swapchain is scRGB, and everything above paints into an
-    // SDR stand-in per swapchain image as it would into an SDR swapchain; one
-    // last pass decodes its sRGB and scales it to the paper white.
-    struct HdrImage {
-      VkImage image = VK_NULL_HANDLE;
-      VkDeviceMemory memory = VK_NULL_HANDLE;
-      // Sampled by the last pass, which decodes the sRGB.
-      VkImageView srgb_view = VK_NULL_HANDLE;
-      VkImageView swapchain_view = VK_NULL_HANDLE;
-      VkFramebuffer swapchain_framebuffer = VK_NULL_HANDLE;
-      VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-    };
+    using HdrImage = HdrSurface;
     static constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     static constexpr VkFormat kHdrStandInFormat = VK_FORMAT_B8G8R8A8_UNORM;
     static constexpr VkFormat kHdrStandInSrgbFormat = VK_FORMAT_B8G8R8A8_SRGB;

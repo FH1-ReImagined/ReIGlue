@@ -1,3 +1,4 @@
+#include <rex/ui/hdr_parameters.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -213,21 +214,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FfxVkGetDeviceProcAddrCompat(VkDevice d
 
 namespace {
 
-// hdr_output.ps.glsl's push constants, after the rectangle constants.
-struct HdrOutputConstants {
-  float paper_white_scale;
-  float highlight_scale;
-  float knee;
-  float knee_range_inv;
-  float gamma;
-  float max_channel_weight;
-  float compare_x;
-  uint32_t pattern;
-  float pattern_value;
-  float pad0;
-  float size[2];
-};
-static_assert(sizeof(HdrOutputConstants) == 48);
+using HdrOutputConstants = HdrParameters;
 
 // vkAcquireNextImageKHR waits without a timeout, and vkQueuePresentKHR runs while holding the
 // queue the command processor submits to: either blocking this long stalls the game, so log it.
@@ -1191,7 +1178,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   framebuffer_create_info.layers = 1;
   for (size_t image_index = 0; image_index < paint_context_.swapchain_images.size();
        ++image_index) {
-    image_view_create_info.image = hdr ? paint_context_.hdr_images[image_index].image
+    image_view_create_info.image = hdr ? paint_context_.hdr_images[image_index].sdr_image
                                        : paint_context_.swapchain_images[image_index];
     if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr, &image_view) !=
         VK_SUCCESS) {
@@ -1730,13 +1717,6 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
     dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
   }
   swapchain_framebuffers.clear();
-  for (const HdrImage& hdr_image : hdr_images) {
-    dfn.vkDestroyFramebuffer(device, hdr_image.swapchain_framebuffer, nullptr);
-    dfn.vkDestroyImageView(device, hdr_image.swapchain_view, nullptr);
-    dfn.vkDestroyImageView(device, hdr_image.srgb_view, nullptr);
-    dfn.vkDestroyImage(device, hdr_image.image, nullptr);
-    dfn.vkFreeMemory(device, hdr_image.memory, nullptr);
-  }
   hdr_images.clear();
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, hdr_descriptor_pool);
   swapchain_images.clear();
@@ -2502,7 +2482,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     VkRenderPassBeginInfo hdr_render_pass_begin_info = {};
     hdr_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     hdr_render_pass_begin_info.renderPass = paint_context_.hdr_render_pass;
-    hdr_render_pass_begin_info.framebuffer = hdr_image.swapchain_framebuffer;
+    hdr_render_pass_begin_info.framebuffer = hdr_image.framebuffer;
     hdr_render_pass_begin_info.renderArea.extent = paint_context_.swapchain_extent;
     dfn.vkCmdBeginRenderPass(draw_command_buffer, &hdr_render_pass_begin_info,
                              VK_SUBPASS_CONTENTS_INLINE);
@@ -2518,7 +2498,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     VkPipelineLayout hdr_pipeline_layout =
         guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexHdr];
     dfn.vkCmdBindDescriptorSets(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                hdr_pipeline_layout, 0, 1, &hdr_image.descriptor_set, 0, nullptr);
+                                hdr_pipeline_layout, 0, 1, &hdr_image.sample_set, 0, nullptr);
     GuestOutputPaintRectangleConstants hdr_rect_constants;
     hdr_rect_constants.x = -1.0f;
     hdr_rect_constants.y = -1.0f;
@@ -2526,32 +2506,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     hdr_rect_constants.height = 2.0f;
     dfn.vkCmdPushConstants(draw_command_buffer, hdr_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(hdr_rect_constants), &hdr_rect_constants);
-    HdrOutputConstants hdr_constants = {};
-    const auto finite_setting = [](double value, double fallback, double low, double high) {
-      return std::isfinite(value) ? std::clamp(value, low, high) : fallback;
-    };
-    const double paper_white_nits =
-        finite_setting(REXCVAR_GET(present_hdr_paper_white_nits), 200.0, 80.0, 1000.0);
-    const double peak_nits =
-        finite_setting(REXCVAR_GET(present_hdr_peak_nits), 1000.0, 80.0, 10000.0);
-    hdr_constants.paper_white_scale = float(paper_white_nits / 80.0);
-    // SDR white in the scene goes this far from the paper white to the peak.
-    hdr_constants.highlight_scale =
-        float(std::max(peak_nits / paper_white_nits - 1.0, 0.0) *
-              finite_setting(REXCVAR_GET(present_hdr_highlights), 0.5, 0.0, 1.0));
-    // Linear SDR brightness where the expansion starts (0.5 is 73 % in sRGB).
-    hdr_constants.knee = 0.5f;
-    hdr_constants.knee_range_inv = 1.0f / (1.0f - hdr_constants.knee);
-    hdr_constants.gamma = float(finite_setting(REXCVAR_GET(present_hdr_gamma), 2.2, 0.0, 3.0));
-    // Mostly the largest channel: a red brake light (luminance 0.21) expands
-    // nearly as a white one; deep colored surfaces stay below the knee.
-    hdr_constants.max_channel_weight = 0.75f;
-    hdr_constants.compare_x =
-        REXCVAR_GET(present_hdr_compare) ? float(paint_context_.swapchain_extent.width / 2) : -1.0f;
-    hdr_constants.pattern = uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
-    hdr_constants.pattern_value = float(peak_nits / 80.0);
-    hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);
-    hdr_constants.size[1] = float(paint_context_.swapchain_extent.height);
+    const auto hdr_constants = MakeHdrParameters({
+        REXCVAR_GET(present_hdr_paper_white_nits), REXCVAR_GET(present_hdr_peak_nits),
+        REXCVAR_GET(present_hdr_highlights), REXCVAR_GET(present_hdr_gamma),
+        REXCVAR_GET(present_hdr_compare), REXCVAR_GET(present_hdr_test_pattern)},
+        paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
     dfn.vkCmdPushConstants(draw_command_buffer, hdr_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            sizeof(hdr_rect_constants), sizeof(hdr_constants), &hdr_constants);
     dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
@@ -2586,7 +2545,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
               vulkan_device_, capture_pixels * 12, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
               util::MemoryPurpose::kReadback, capture_buffer, capture_memory)) {
         VkImage images[] = {paint_context_.swapchain_images[swapchain_image_index],
-                            paint_context_.hdr_images[swapchain_image_index].image};
+                            paint_context_.hdr_images[swapchain_image_index].sdr_image};
         for (uint32_t i = 0; i < 2; ++i) {
           VkImageMemoryBarrier barrier = {};
           barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -3187,100 +3146,39 @@ bool VulkanPresenter::CreateHdrSwapchainImages(VkFormat swapchain_format) {
     }
   }
 
-  const uint32_t image_count = uint32_t(context.swapchain_images.size());
-  // The sampler too, though immutable, as for guest_output_descriptor_pool.
-  VkDescriptorPoolSize pool_sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, image_count},
-                                        {VK_DESCRIPTOR_TYPE_SAMPLER, image_count}};
-  VkDescriptorPoolCreateInfo pool_create_info = {};
-  pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pool_create_info.maxSets = image_count;
-  pool_create_info.poolSizeCount = uint32_t(rex::countof(pool_sizes));
-  pool_create_info.pPoolSizes = pool_sizes;
-  if (dfn.vkCreateDescriptorPool(device, &pool_create_info, nullptr,
-                                 &context.hdr_descriptor_pool) != VK_SUCCESS) {
-    REXLOG_ERROR("VulkanPresenter: Failed to create the HDR output descriptor pool");
+  const auto count = uint32_t(context.swapchain_images.size());
+  if (!count || !context.hdr_images.empty()) return false;
+  // Descriptor allocation is a batch operation. Frame resources are published
+  // only after every frame has been constructed successfully.
+  const VkDescriptorPoolSize sizes[] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLER, count}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, count}};
+  VkDescriptorPoolCreateInfo pool{};
+  pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool.maxSets = count;
+  pool.poolSizeCount = 2;
+  pool.pPoolSizes = sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool, nullptr, &context.hdr_descriptor_pool) != VK_SUCCESS)
     return false;
+  std::vector<VkDescriptorSetLayout> layouts(count, guest_output_paint_image_descriptor_set_layout_);
+  std::vector<VkDescriptorSet> sets(count);
+  VkDescriptorSetAllocateInfo allocate{};
+  allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  allocate.descriptorPool = context.hdr_descriptor_pool;
+  allocate.descriptorSetCount = count;
+  allocate.pSetLayouts = layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &allocate, sets.data()) != VK_SUCCESS) return false;
+  std::vector<HdrSurface> frames;
+  frames.reserve(count);
+  for (uint32_t index = 0; index != count; ++index) {
+    auto frame = HdrSurface::Create(vulkan_device_, context.swapchain_extent,
+        context.swapchain_images[index], swapchain_format, context.hdr_render_pass, sets[index]);
+    if (!frame) {
+      REXLOG_ERROR("HDR attachment construction failed for swapchain image {}", index);
+      return false;
+    }
+    frames.push_back(std::move(*frame));
   }
-
-  context.hdr_images.resize(image_count);
-  for (uint32_t i = 0; i < image_count; ++i) {
-    PaintContext::HdrImage& hdr_image = context.hdr_images[i];
-
-    VkImageCreateInfo image_create_info = {};
-    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    // Rendered as UNORM like an SDR swapchain image, sampled as sRGB.
-    image_create_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-    image_create_info.imageType = VK_IMAGE_TYPE_2D;
-    image_create_info.format = PaintContext::kHdrStandInFormat;
-    image_create_info.extent = {context.swapchain_extent.width, context.swapchain_extent.height, 1};
-    image_create_info.mipLevels = 1;
-    image_create_info.arrayLayers = 1;
-    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
-    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!util::CreateDedicatedAllocationImage(vulkan_device_, image_create_info,
-                                              util::MemoryPurpose::kDeviceLocal, hdr_image.image,
-                                              hdr_image.memory)) {
-      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR output stand-in image");
-      return false;
-    }
-
-    VkImageViewCreateInfo view_create_info = {};
-    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_create_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    view_create_info.image = hdr_image.image;
-    view_create_info.format = PaintContext::kHdrStandInSrgbFormat;
-    if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &hdr_image.srgb_view) !=
-        VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR output stand-in view");
-      return false;
-    }
-    view_create_info.image = context.swapchain_images[i];
-    view_create_info.format = swapchain_format;
-    if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &hdr_image.swapchain_view) !=
-        VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR swapchain image view");
-      return false;
-    }
-
-    VkFramebufferCreateInfo framebuffer_create_info = {};
-    framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    framebuffer_create_info.renderPass = context.hdr_render_pass;
-    framebuffer_create_info.attachmentCount = 1;
-    framebuffer_create_info.pAttachments = &hdr_image.swapchain_view;
-    framebuffer_create_info.width = context.swapchain_extent.width;
-    framebuffer_create_info.height = context.swapchain_extent.height;
-    framebuffer_create_info.layers = 1;
-    if (dfn.vkCreateFramebuffer(device, &framebuffer_create_info, nullptr,
-                                &hdr_image.swapchain_framebuffer) != VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to create an HDR swapchain framebuffer");
-      return false;
-    }
-
-    VkDescriptorSetAllocateInfo set_allocate_info = {};
-    set_allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    set_allocate_info.descriptorPool = context.hdr_descriptor_pool;
-    set_allocate_info.descriptorSetCount = 1;
-    set_allocate_info.pSetLayouts = &guest_output_paint_image_descriptor_set_layout_;
-    if (dfn.vkAllocateDescriptorSets(device, &set_allocate_info, &hdr_image.descriptor_set) !=
-        VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to allocate an HDR output descriptor set");
-      return false;
-    }
-    VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, hdr_image.srgb_view,
-                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet write = {};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = hdr_image.descriptor_set;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    write.pImageInfo = &image_info;
-    dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
-  }
+  context.hdr_images = std::move(frames);
   return true;
 }
 

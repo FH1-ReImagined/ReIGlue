@@ -1,54 +1,43 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
+// Copyright (c) 2026 ReIGlue contributors. SPDX-License-Identifier: BSD-3-Clause
+layout(local_size_x=16,local_size_y=8,local_size_z=1) in;
+layout(push_constant) uniform Dimensions { uvec2 extent; } grid;
+layout(set=0,binding=0) uniform texture2D finished;
+layout(set=0,binding=1) uniform texture2D background;
+layout(set=0,binding=2,rgb10_a2) uniform image2D destination;
 
-// present_hdr: writes, into the guest output's alpha, whether each pixel is
-// the HUD, from how the frame differs from the snapshot taken before the HUD
-// was drawn. The comparison does not depend on the channel order, which the
-// swap source and the render target may not share: it compares the sorted
-// channels.
-//
-// The guest output's alpha has 2 bits, so a partial coverage would band and
-// flicker where a translucent HUD element animates (the prestige meter, #442).
-// Any change above the rounding of an 8-bit copy counts as HUD instead, and
-// the mask grows by a pixel to cover the HUD's antialiased edges, whose
-// changes can be smaller.
-
-layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
-
-layout(push_constant) uniform HdrHudMaskConstants {
-  uvec2 size;
-} constants;
-
-layout(set = 0, binding = 0) uniform texture2D frame;
-layout(set = 0, binding = 1) uniform texture2D scene;
-layout(set = 0, binding = 2, rgb10_a2) uniform image2D guest_output;
-
-vec3 Sorted(vec3 v) {
-  float low = min(v.r, min(v.g, v.b));
-  float high = max(v.r, max(v.g, v.b));
-  return vec3(low, v.r + v.g + v.b - low - high, high);
+// Each workgroup loads an 18x10 tile, including the one-pixel halo. Dilation
+// then reads shared memory; it does not fetch both images nine times per pixel.
+shared uint changed[180];
+float Distance(vec3 a, vec3 b) {
+  vec3 delta = abs(a - b);
+  return max(max(delta.x, delta.y), delta.z);
 }
-
-bool Changed(ivec2 pixel) {
-  pixel = clamp(pixel, ivec2(0), ivec2(constants.size) - 1);
-  vec3 difference = abs(Sorted(texelFetch(frame, pixel, 0).rgb) -
-                        Sorted(texelFetch(scene, pixel, 0).rgb));
-  // Half an 8-bit step is 0.002.
-  return max(difference.x, max(difference.y, difference.z)) > 0.006;
+float UnorderedDistance(vec3 a, vec3 b) {
+  // Different source views can permute color channels. Find the least change
+  // among the six channel correspondences; no color-order assumption is needed.
+  return min(min(min(Distance(a,b), Distance(a,b.rbg)),
+                 min(Distance(a,b.grb), Distance(a,b.gbr))),
+             min(Distance(a,b.brg), Distance(a,b.bgr)));
 }
-
 void main() {
+  ivec2 tile_origin = ivec2(gl_WorkGroupID.xy) * ivec2(16,8) - ivec2(1);
+  for (uint i=gl_LocalInvocationIndex; i<180u; i+=128u) {
+    ivec2 sample_at = clamp(tile_origin + ivec2(i%18u,i/18u), ivec2(0), ivec2(grid.extent)-1);
+    float delta = UnorderedDistance(texelFetch(finished,sample_at,0).rgb,
+                                    texelFetch(background,sample_at,0).rgb);
+    changed[i] = delta > 0.006 ? 1u : 0u;
+  }
+  barrier();
   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-  if (any(greaterThanEqual(uvec2(pixel), constants.size))) {
-    return;
-  }
-  bool hud = false;
-  for (int y = -1; y <= 1 && !hud; ++y) {
-    for (int x = -1; x <= 1 && !hud; ++x) {
-      hud = Changed(pixel + ivec2(x, y));
-    }
-  }
-  vec4 color = imageLoad(guest_output, pixel);
-  color.a = hud ? 1.0 : 0.0;
-  imageStore(guest_output, pixel, color);
+  if (any(greaterThanEqual(uvec2(pixel),grid.extent))) return;
+  uint first = gl_LocalInvocationID.x + 18u * gl_LocalInvocationID.y;
+  uint coverage = 0u;
+  for (uint row=0u; row<3u; ++row)
+    for (uint column=0u; column<3u; ++column)
+      coverage |= changed[first + row*18u + column];
+  vec4 output_value = imageLoad(destination,pixel);
+  output_value.a = float(coverage);
+  imageStore(destination,pixel,output_value);
 }

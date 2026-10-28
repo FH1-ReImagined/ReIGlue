@@ -12,3 +12,19 @@ add_test(NAME fh1.screen_raster COMMAND fh1_screen_raster_test)
 
 # PPC instruction tests (requires PPC toolchain)
 add_subdirectory(ppc)
+
+add_executable(spirv_contraction_test spirv_contraction_test.cpp)
+target_include_directories(spirv_contraction_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME graphics.spirv_contraction COMMAND spirv_contraction_test)
+
+add_executable(presentation_transform_test presentation_transform_test.cpp)
+target_include_directories(presentation_transform_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME graphics.presentation_transform COMMAND presentation_transform_test)
+
+add_executable(hdr_color_test hdr_color_test.cpp)
+target_include_directories(hdr_color_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME graphics.hdr_color COMMAND hdr_color_test)
+
+add_executable(hdr_parameters_test hdr_parameters_test.cpp)
+target_include_directories(hdr_parameters_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME graphics.hdr_parameters COMMAND hdr_parameters_test)

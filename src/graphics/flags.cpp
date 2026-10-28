@@ -62,7 +62,7 @@ REXCVAR_DEFINE_INT32(forza_native_height, 0, "GPU",
     .range(0, 5040)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-// Built-in FH1 ultrawide presentation, adapted from Pinyon Shift (BSD-3-Clause).
+// Stable host configuration names for the FH1 presentation interface.
 REXCVAR_DEFINE_BOOL(forza_present_16_9, false, "GPU",
                     "Use FH1's 16:9 source aspect before presentation");
 REXCVAR_DEFINE_DOUBLE(forza_ultrawide_hud_x, 1.0, "GPU", "FH1 HUD X scale")

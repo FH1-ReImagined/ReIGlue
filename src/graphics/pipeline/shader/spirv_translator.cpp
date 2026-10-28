@@ -1,3 +1,4 @@
+#include <rex/graphics/pipeline/shader/spirv_contraction.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -197,13 +198,6 @@ void SpirvShaderTranslator::StartTranslation() {
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                             nullptr);
-  // Pinyon Shift's macOS pixel-math tuning also permits contraction. Retain
-  // this SDK's existing SM3 zero/NaN rules, and keep positions, depth and
-  // memory exports precise. Strict Metal color shaders showed fine grids in
-  // normally filtered vehicle materials on M4 Pro; the contracted path does not.
-  builder_->allow_contraction = is_pixel_shader() && !is_depth_only_fragment_shader_ &&
-      GetSpirvShaderModification().pixel.allow_contraction &&
-      !current_shader().writes_depth() && !IsMemoryExportUsed();
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
@@ -1297,6 +1291,11 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
   // TODO(Triang3l): Avoid copy?
   std::vector<unsigned int> module_uints;
   builder_->dump(module_uints);
+  if (is_pixel_shader() && !is_depth_only_fragment_shader_) {
+    RelaxColorContraction(module_uints, {
+        bool(GetSpirvShaderModification().pixel.allow_contraction), true, false,
+        current_shader().writes_depth(), IsMemoryExportUsed()});
+  }
   std::vector<uint8_t> module_bytes;
   module_bytes.reserve(sizeof(unsigned int) * module_uints.size());
   module_bytes.insert(module_bytes.cend(), reinterpret_cast<const uint8_t*>(module_uints.data()),

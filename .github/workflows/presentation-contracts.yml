@@ -1,0 +1,19 @@
+name: Presentation contracts
+on:
+  push:
+    paths: ['include/rex/graphics/util/presentation_transform.h', 'include/rex/graphics/pipeline/shader/spirv_contraction.h', 'tests/presentation_transform_test.cpp', 'tests/spirv_contraction_test.cpp', 'include/rex/ui/hdr_color.h', 'tests/hdr_color_test.cpp', 'include/rex/ui/hdr_parameters.h', 'tests/hdr_parameters_test.cpp', 'src/ui/shaders/hdr*', 'src/graphics/shaders/hdr*', '.github/workflows/presentation-contracts.yml']
+  pull_request:
+    paths: ['include/rex/graphics/util/presentation_transform.h', 'include/rex/graphics/pipeline/shader/spirv_contraction.h', 'tests/presentation_transform_test.cpp', 'tests/spirv_contraction_test.cpp', 'include/rex/ui/hdr_color.h', 'tests/hdr_color_test.cpp', 'include/rex/ui/hdr_parameters.h', 'tests/hdr_parameters_test.cpp', 'src/ui/shaders/hdr*', 'src/graphics/shaders/hdr*', '.github/workflows/presentation-contracts.yml']
+permissions:
+  contents: read
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check HUD geometry and shader precision
+        run: |
+          for test in presentation_transform spirv_contraction hdr_color hdr_parameters; do
+            g++ -std=c++20 -Wall -Wextra -Werror -Iinclude "tests/${test}_test.cpp" -o "$RUNNER_TEMP/$test"
+            "$RUNNER_TEMP/$test"
+          done

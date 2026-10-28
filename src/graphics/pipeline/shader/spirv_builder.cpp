@@ -42,18 +42,14 @@ spv::Id SpirvBuilder::createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id ope
 spv::Id SpirvBuilder::createNoContractionUnaryOp(spv::Op op_code, spv::Id type_id,
                                                  spv::Id operand) {
   spv::Id result = createUnaryOp(op_code, type_id, operand);
-  if (!allow_contraction) {
-    addDecoration(result, spv::DecorationNoContraction);
-  }
+  addDecoration(result, spv::DecorationNoContraction);
   return result;
 }
 
 spv::Id SpirvBuilder::createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                                spv::Id operand2) {
   spv::Id result = createBinOp(op_code, type_id, operand1, operand2);
-  if (!allow_contraction) {
-    addDecoration(result, spv::DecorationNoContraction);
-  }
+  addDecoration(result, spv::DecorationNoContraction);
   return result;
 }
 
