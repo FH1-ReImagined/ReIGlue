@@ -37,6 +37,11 @@ TEST_CASE("{{ test.name }}", "[ppc][{{ test.category }}][{{ test.stem }}]") {
     uint8_t* memory = mem.virtual_membase();
     PPCContext ctx{};
     ctx.fpscr.loadFromHost();
+## if test.needs_fma
+    if (!ppc_vfma_single_rounding()) {
+        SKIP("needs a multiply-add with one rounding: REX_PPC_FMA=0 or a CPU without FMA");
+    }
+## endif
 
 ## for reg in test.inputs.registers
 ## if reg.type == "cr"

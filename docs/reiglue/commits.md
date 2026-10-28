@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-138 commits: 104 general (Performance 34, Xenos GPU 26, Input 16, Runtime and platform 12, Diagnostics 7, Codegen and build 6, Workarounds and defaults 3) and 34 Forza-specific (Upscaling and HUD 17, VR 8, Game-specific fixes 3, Input 3, Texture packs 2, Shader-hash effects 1).
+141 commits: 107 general (Performance 34, Xenos GPU 26, Input 16, Runtime and platform 12, Codegen and build 9, Diagnostics 7, Workarounds and defaults 3) and 34 Forza-specific (Upscaling and HUD 17, VR 8, Game-specific fixes 3, Input 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147); see the README. Issue numbers
 (`#45`) in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
 
@@ -158,3 +158,6 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0396 | `f20eb4c` | VR: true stereo, the scene executed once per eye ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
 | 0397 | `4d66d72` | VR: when each guest output frame was published ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
 | 0399 | This branch | Read-only active physical controller disconnect sequence ([#331](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/pull/331)) | **Forza** | Input | Sean O’Connor |
+| 0400 | `d553c53` | Codegen: vmaddfp and vnmsubfp round once, as on Xenon ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0401 | `98c4ca0` | Codegen: vmaxfp and vminfp with Xenon's NaN, zero and denormal results ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0402 | `27131b2` | Codegen: vmsum3fp128 and vmsum4fp128 always in Xenon's order ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
