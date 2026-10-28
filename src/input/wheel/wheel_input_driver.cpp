@@ -10,7 +10,8 @@
  * sends its force feedback through the kernel's XInputdFF* calls (wheel_ff.h), played here on SDL
  * haptics; one that takes it for a gamepad only sets the vibration motors, which give an
  * approximate spring and a vibration. The rumble plays as a fine or classic vibration
- * (wheel_rumble.h). Pedals and a shifter on their own USB devices are read with the first wheel
+ * (wheel_rumble.h), updated about 30 times a second whatever the frame rate (wheel_rumble_pace.h).
+ * Pedals and a shifter on their own USB devices are read with the first wheel
  * (wheel_devices.h); steering, buttons and force feedback stay on the wheel.
  *
  * @license     BSD 3-Clause License
@@ -43,6 +44,7 @@
 #include "wheel_min_force.h"
 #include "wheel_primary.h"
 #include "wheel_rumble.h"
+#include "wheel_rumble_pace.h"
 #include "wheel_thrustmaster.h"
 
 REXCVAR_DEFINE_STRING(wheel_mode, "auto", "Input",
@@ -531,12 +533,60 @@ void PlayWave(SDL_Haptic* haptic, int fx, const RumbleWave& wave, int& sent, boo
   e.periodic.magnitude = RumbleMagnitude(wave.level);
   if (e.periodic.magnitude != sent && SDL_UpdateHapticEffect(haptic, fx, &e)) {
     sent = e.periodic.magnitude;  // a failed update is sent again
+    g_ff_log.Vibrated(wave.level);
   }
   if (e.periodic.magnitude > 0 && (!running || restart)) {
     running = SDL_RunHapticEffect(haptic, fx, SDL_HAPTIC_INFINITY);
   } else if (e.periodic.magnitude <= 0 && running) {
     SDL_StopHapticEffect(haptic, fx);
     running = false;
+  }
+}
+
+// The game's level for one vibration effect, played at the fixed pace of wheel_rumble_pace.h
+// (#467): when an update is due, or at once with `now_too` (the forces back at full strength, or
+// faded out: the vibration stops with them) and when a vibration starts from silence, which plays
+// the game's level as it is now and starts the next interval. `restart` as for PlayWave.
+void PaceWave(SDL_Haptic* haptic, int fx, RumbleWave wave, RumblePace& pace, int& sent,
+              bool& running, bool restart, bool now_too, double now) {
+  if (!haptic || fx < 0) {
+    return;
+  }
+  pace.Set(now, wave.level);
+  now_too = now_too || (!running && RumbleMagnitude(wave.level) > 0);
+  if (!now_too && !pace.Due(now)) {
+    return;
+  }
+  const float paced = pace.Take(now);
+  if (!now_too) {
+    wave.level = paced;
+  }
+  PlayWave(haptic, fx, wave, sent, running, restart);
+}
+
+// The vibration updates that came due since the game's last rumble (it sets its rumble once a
+// frame, and may stop setting it, as in a menu, after its last change), each wave at the level the
+// game asked for last. Called on every state poll (several a frame, also in menus).
+template <typename W>
+void PaceRumble(W& w, double now) {
+  if (!w.haptic) {
+    return;
+  }
+  const struct {
+    int fx;
+    uint16_t period_ms;
+    RumblePace& pace;
+    int& sent;
+    bool& running;
+  } waves[] = {{w.road_fx, kFineRoadPeriodMs, w.road_pace, w.road_magnitude, w.road_running},
+               {w.engine_fx, kFineEnginePeriodMs, w.engine_pace, w.engine_magnitude,
+                w.engine_running},
+               {w.sine_fx, kClassicPeriodMs, w.sine_pace, w.sine_magnitude, w.sine_running}};
+  for (const auto& v : waves) {
+    if (v.fx >= 0 && v.pace.Due(now)) {
+      PaceWave(w.haptic, v.fx, RumbleWave{v.period_ms, v.pace.level()}, v.pace, v.sent, v.running,
+               false, false, now);
+    }
   }
 }
 
@@ -649,6 +699,8 @@ struct WheelInputDriver::Wheel {
   int road_fx = -1, engine_fx = -1;
   bool road_running = false, engine_running = false;
   int road_magnitude = -1, engine_magnitude = -1;
+  // Each vibration effect's level, sent about 30 times a second (wheel_rumble_pace.h, #467).
+  RumblePace road_pace, engine_pace, sine_pace;
   // Pedals and shifter on their own USB devices (the first wheel only, wheel_devices.h).
   AuxDevice pedals{AuxRole::kPedals};
   AuxDevice shifter_device{AuxRole::kShifter};
@@ -1052,14 +1104,18 @@ void WheelInputDriver::ApplyRumbleLocked(Wheel& w, uint16_t left_motor, uint16_t
     return;
   }
   const float fade = game ? fade_.level : 1.0f;
+  // Paced (wheel_rumble_pace.h, #467), except when the forces come back whole or are faded out.
+  const bool now_too = w.restart_effects || fade == 0.0f;
+  const double now = FfNow();
   if (w.road_fx >= 0 && w.engine_fx >= 0) {  // fine (wheel_rumble.h)
     const FineRumble fine = FineRumbleOf(left_motor, right_motor, Strengths(), fade);
-    PlayWave(w.haptic, w.road_fx, fine.road, w.road_magnitude, w.road_running, w.restart_effects);
-    PlayWave(w.haptic, w.engine_fx, fine.engine, w.engine_magnitude, w.engine_running,
-             w.restart_effects);
+    PaceWave(w.haptic, w.road_fx, fine.road, w.road_pace, w.road_magnitude, w.road_running,
+             w.restart_effects, now_too, now);
+    PaceWave(w.haptic, w.engine_fx, fine.engine, w.engine_pace, w.engine_magnitude,
+             w.engine_running, w.restart_effects, now_too, now);
   } else {
-    PlayWave(w.haptic, w.sine_fx, ClassicRumble(left_motor, right_motor, Strengths(), fade),
-             w.sine_magnitude, w.sine_running, w.restart_effects);
+    PaceWave(w.haptic, w.sine_fx, ClassicRumble(left_motor, right_motor, Strengths(), fade),
+             w.sine_pace, w.sine_magnitude, w.sine_running, w.restart_effects, now_too, now);
   }
 }
 
@@ -1635,6 +1691,7 @@ X_RESULT WheelInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state)
   UpdateFadeLocked();
   for (auto& wheel : wheels_) {
     KeepPlaying(*wheel, game_ff_active_, FfNow());
+    PaceRumble(*wheel, FfNow());
   }
   if (game_ff_active_ && g_ff_log.SummaryDue(FfNow())) {
     // Every 10 s, what the game sent and what the wheel got (wheel_ff_log.h, #304), and whether the

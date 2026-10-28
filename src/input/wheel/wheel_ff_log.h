@@ -15,7 +15,9 @@
  *  - every 10 s while the game drives the force feedback, one summary: per block what the game
  *    sent (updates, gain and force range, starts and stops, whether it plays) and what the wheel
  *    got (SDL updates, creations, starts, restarts, stops, failures, the level or coefficient
- *    range, whether it runs and, where SDL can ask, whether the wheel says it still plays).
+ *    range, whether it runs and, where SDL can ask, whether the wheel says it still plays), then
+ *    the game's rumbles and the updates the wheel's vibration got, with how many a second and
+ *    their highest level (#467).
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
@@ -142,6 +144,11 @@ class FfLog {
   }
   // Rumble restarts that keep the vibration playing (the keep-alive, #304).
   void RumbleKept() { rumble_kept_++; }
+  // An update of a vibration effect on the wheel (wheel_rumble_pace.h, #467), to `level` (0 to 1).
+  void Vibrated(float level) {
+    vibration_updates_++;
+    vibration_max_ = std::max(vibration_max_, level);
+  }
 
   // Whether the window is kFfLogSummarySeconds old: Summary then gives its line.
   bool SummaryDue(double now) {
@@ -216,6 +223,11 @@ class FfLog {
       }
       std::snprintf(buf, sizeof(buf), " device gain %u, %u rumbles", s.device_gain(), rumbles_);
       out += buf;
+      if (vibration_updates_) {  // what the wheel's vibration got, a second (#467)
+        std::snprintf(buf, sizeof(buf), ", %u vibration updates (%.0f a second, up to %.0f%%)",
+                      vibration_updates_, vibration_updates_ / seconds, vibration_max_ * 100.0f);
+        out += buf;
+      }
       out += Count(rumble_kept_, "rumble restart");
       std::snprintf(buf, sizeof(buf), ", forces at %.0f%%", fade * 100.0f);
       out += buf;
@@ -223,7 +235,8 @@ class FfLog {
     for (Block& b : blocks_) {
       b.window = Window{};
     }
-    controls_ = rumbles_ = rumble_kept_ = events_ = 0;
+    controls_ = rumbles_ = rumble_kept_ = events_ = vibration_updates_ = 0;
+    vibration_max_ = 0.0f;
     active_ = false;
     window_start_ = now;
     return out;
@@ -266,7 +279,8 @@ class FfLog {
   }
 
   Block blocks_[kFfMaxBlocks];
-  uint32_t controls_ = 0, rumbles_ = 0, rumble_kept_ = 0, events_ = 0;
+  uint32_t controls_ = 0, rumbles_ = 0, rumble_kept_ = 0, events_ = 0, vibration_updates_ = 0;
+  float vibration_max_ = 0.0f;
   bool active_ = false;
   double window_start_ = -1;
 };
