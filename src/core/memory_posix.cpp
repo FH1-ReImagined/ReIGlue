@@ -592,5 +592,9 @@ bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) 
   return munmap(base_address, length) == 0;
 }
 
+bool MapFileViewTakesPageOffsets() {
+  return true;  // the allocation granularity is the page size
+}
+
 }  // namespace memory
 }  // namespace rex

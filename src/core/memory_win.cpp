@@ -192,9 +192,92 @@ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::pat
   CloseHandle(reinterpret_cast<HANDLE>(handle));
 }
 
+#ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+namespace {
+
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER 0x00004000
+#endif
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x00040000
+#endif
+
+// VirtualAlloc2 and MapViewOfFile3 (Windows 10 version 1803 and later): a view
+// that replaces a placeholder reservation may start at any page-aligned file
+// offset, where MapViewOfFileEx takes only multiples of the 64KB allocation
+// granularity. Looked up at run time, so that the program still starts on an
+// older Windows (where Memory::Initialize says what is missing).
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE process, PVOID base_address, SIZE_T size,
+                                       ULONG allocation_type, ULONG page_protection,
+                                       void* extended_parameters, ULONG parameter_count);
+using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE file_mapping, HANDLE process, PVOID base_address,
+                                        ULONG64 offset, SIZE_T view_size, ULONG allocation_type,
+                                        ULONG page_protection, void* extended_parameters,
+                                        ULONG parameter_count);
+
+struct PlaceholderFunctions {
+  VirtualAlloc2Fn virtual_alloc2 = nullptr;
+  MapViewOfFile3Fn map_view_of_file3 = nullptr;
+};
+
+const PlaceholderFunctions& placeholder_functions() {
+  static const PlaceholderFunctions functions = [] {
+    PlaceholderFunctions found;
+    HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    if (!kernelbase) {
+      kernelbase = LoadLibraryExW(L"kernelbase.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    if (kernelbase) {
+      found.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(
+          reinterpret_cast<void*>(GetProcAddress(kernelbase, "VirtualAlloc2")));
+      found.map_view_of_file3 = reinterpret_cast<MapViewOfFile3Fn>(
+          reinterpret_cast<void*>(GetProcAddress(kernelbase, "MapViewOfFile3")));
+    }
+    if (!found.virtual_alloc2 || !found.map_view_of_file3) {
+      found = {};
+    }
+    return found;
+  }();
+  return functions;
+}
+
+}  // namespace
+#endif  // REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+
+bool MapFileViewTakesPageOffsets() {
+#ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+  return placeholder_functions().virtual_alloc2 != nullptr;
+#else
+  return true;  // MapViewOfFile3FromApp, below
+#endif
+}
+
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
                   size_t file_offset) {
 #ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+  if (file_offset % allocation_granularity()) {
+    // Only a placeholder view starts there (the guest's 0xE0000000 view starts
+    // 4KB into physical memory); MapViewOfFileEx would fail.
+    const PlaceholderFunctions& placeholders = placeholder_functions();
+    if (!placeholders.virtual_alloc2) {
+      return nullptr;
+    }
+    HANDLE process = GetCurrentProcess();
+    void* placeholder = placeholders.virtual_alloc2(process, base_address, length,
+                                                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                                    PAGE_NOACCESS, nullptr, 0);
+    if (!placeholder) {
+      return nullptr;
+    }
+    void* view = placeholders.map_view_of_file3(
+        reinterpret_cast<HANDLE>(handle), process, placeholder, ULONG64(file_offset), length,
+        MEM_REPLACE_PLACEHOLDER, ULONG(ToWin32ProtectFlags(access)), nullptr, 0);
+    if (!view) {
+      VirtualFree(placeholder, 0, MEM_RELEASE);
+      return nullptr;
+    }
+    return view;
+  }
   DWORD target_address_low = static_cast<DWORD>(file_offset);
   DWORD target_address_high = static_cast<DWORD>(file_offset >> 32);
   DWORD file_access = 0;
