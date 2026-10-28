@@ -2415,8 +2415,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
 
+  HdrParameters hdr_parameters{};
   if (paint_context_.swapchain_hdr) {
-    const auto parameters = MakeHdrParameters({
+    hdr_parameters = MakeHdrParameters({
         REXCVAR_GET(present_hdr_paper_white_nits), REXCVAR_GET(present_hdr_peak_nits),
         REXCVAR_GET(present_hdr_highlights), REXCVAR_GET(present_hdr_gamma),
         REXCVAR_GET(present_hdr_compare), REXCVAR_GET(present_hdr_test_pattern)},
@@ -2424,7 +2425,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     RecordHdrOutput(*vulkan_device_, draw_command_buffer, paint_context_.swapchain_extent,
         paint_context_.hdr_images[swapchain_image_index], paint_context_.hdr_render_pass,
         paint_context_.hdr_pipeline,
-        guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexHdr], parameters);
+        guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexHdr], hdr_parameters);
   }
 
   // Opt-in diagnostic readback of the actual HDR attachment and its UI mask.
@@ -2598,14 +2599,18 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         auto metadata_path = capture_path;
         metadata_path += ".json";
         std::ofstream metadata(metadata_path);
-        metadata << "{\"width\":" << paint_context_.swapchain_extent.width
+        metadata.precision(9);
+        metadata << "{\"hdr_model\":\"diffuse-exp-v1\",\"width\":" << paint_context_.swapchain_extent.width
                  << ",\"height\":" << paint_context_.swapchain_extent.height
-                 << ",\"paper_white\":" << REXCVAR_GET(present_hdr_paper_white_nits)
-                 << ",\"peak\":" << REXCVAR_GET(present_hdr_peak_nits)
-                 << ",\"strength\":" << REXCVAR_GET(present_hdr_highlights)
-                 << ",\"gamma\":" << REXCVAR_GET(present_hdr_gamma)
-                 << ",\"compare\":" << (REXCVAR_GET(present_hdr_compare) ? "true" : "false")
-                 << ",\"pattern\":" << REXCVAR_GET(present_hdr_test_pattern) << "}\n";
+                 << ",\"paper_white\":" << hdr_parameters.white * 80
+                 << ",\"peak\":" << hdr_parameters.peak * 80
+                 << ",\"scene_ceiling\":" << hdr_parameters.scene_ceiling
+                 << ",\"diffuse_anchor\":" << hdr_parameters.diffuse_anchor
+                 << ",\"curve_exponent\":" << hdr_parameters.curve_exponent
+                 << ",\"curve_denominator\":" << hdr_parameters.curve_denominator
+                 << ",\"gamma\":" << hdr_parameters.source_gamma
+                 << ",\"compare\":" << (hdr_parameters.split >= 0 ? "true" : "false")
+                 << ",\"pattern\":" << hdr_parameters.calibration << "}\n";
         REXLOG_INFO("HDR readback: {}x{}, files written={}", paint_context_.swapchain_extent.width,
                     paint_context_.swapchain_extent.height, written && metadata.good());
       }

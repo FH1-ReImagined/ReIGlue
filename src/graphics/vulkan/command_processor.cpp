@@ -3291,7 +3291,7 @@ bool VulkanCommandProcessor::EnsureSwapHudMask() {
   const std::array signature{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
   auto objects = ui::vulkan::ImageComputeObjects::Create(*GetVulkanDevice(), shaders::hdr_hud_mask_cs,
-      signature, kMaxFramesInFlight, sizeof(uint32_t) * 2, ui::vulkan::BuildImageComputePipeline);
+      signature, kMaxFramesInFlight, sizeof(uint32_t) * 4, ui::vulkan::BuildImageComputePipeline);
   if (!objects) {
     REXGPU_WARN("HDR coverage pipeline construction failed; retaining paper-white output");
     return false;
@@ -5119,7 +5119,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             ui::vulkan::WriteComputeImages(*GetVulkanDevice(), set, images);
             BindExternalComputePipeline(swap_hud_mask_pipeline_);
             ui::vulkan::RecordCoverageDispatch(deferred_command_buffer_, swap_hud_mask_pipeline_layout_,
-                set, guest_output_width, guest_output_height);
+                set, guest_output_width, guest_output_height,
+                !vulkan_device->properties().imageViewFormatSwizzle && swap_source_needs_rb_swap,
+                frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
+                    frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16
+                    ? 1.0f / 1023 : 1.0f / 255);
           }
 
           if (vr_snapshot_view != VK_NULL_HANDLE) {

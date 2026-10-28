@@ -63,7 +63,7 @@ int main() {
   auto mask = Inspect(hdr_hud_mask_cs);
   assert(mask.stage == 5 && mask.x == 16 && mask.y == 8 && mask.z == 1);
   assert(mask.bindings == (std::set<unsigned>{0,1,2}));
-  assert(mask.offsets == (std::vector<unsigned>{0}) && mask.push_end == 8);
+  assert(mask.offsets == (std::vector<unsigned>{0,8,12}) && mask.push_end == 16);
   auto output = Inspect(hdr_output_ps);
   assert(output.stage == 4 && output.bindings == (std::set<unsigned>{0}));
   assert(output.offsets == (std::vector<unsigned>{16,20,24,28,32,36,40,44,48,52,56}));

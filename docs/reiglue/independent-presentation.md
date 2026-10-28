@@ -5,6 +5,12 @@ the Pinyon dependency or its notice. The remaining HDR presenter and snapshot
 integration, including any reuse in newer VR helpers, need a complete provenance
 review and replacement. Historical source in the game repository is separate.
 
+Review of checkpoint `7bb18e3` found substantive retained policies despite the
+restructured code: the highlight curve, calibration layout, coverage threshold
+and dilation, scene trigger, and render-target copy. The redesign described in
+[independent-hdr-design.md](independent-hdr-design.md) replaces the first three
+policies. The scene trigger and copy remain inherited and unresolved.
+
 ## File record
 
 | Files | Change |
@@ -19,11 +25,12 @@ review and replacement. Historical source in the game repository is separate.
 | `include/rex/ui/hdr_parameters.h` | New HDR setting validation and push-constant packing; nonfinite settings use defaults. |
 | `src/ui/shaders/hdr_output.ps.glsl` | New output/calibration implementation against the existing push-constant ABI. |
 | `src/ui/shaders/hdr_ui_mask.ps.glsl` | New alpha-only coverage sampling shader. |
-| `src/graphics/shaders/hdr_hud_mask.cs.glsl` | New shared-memory tile implementation: each workgroup loads an 18x10 image tile, then performs 3x3 dilation from shared memory. Channel permutations are compared without sorting. |
+| `include/rex/ui/hdr_calibration.h`, `hdr_coverage.h` | New photometric grid and quantization-aware compositing lower-bound contracts, shared by C++ and GLSL. |
+| `src/graphics/shaders/hdr_hud_mask.cs.glsl` | Per-pixel compositing evidence replaces the old fixed-distance threshold and neighboring dilation. Renderer state supplies channel order. The dispatch payload expands from 8 to 16 bytes. |
 | `src/ui/shaders/vulkan_spirv/hdr_output_ps.h`, `hdr_ui_mask_ps.h`, `src/graphics/shaders/vulkan_spirv/hdr_hud_mask_cs.h` | Regenerated from the replacement shader sources; no retained binary from the former shaders. |
 | `include/rex/ui/vulkan/hdr_format.h`, `hdr_output_pass.h` | New exact format/color-space selection, composition/output render-pass construction, shader module setup and coverage/output command recording. |
 | `include/rex/ui/vulkan/image_compute_transaction.h`, `image_compute.h` | New transactional compute-effect factory shared by HDR coverage and the VR HUD setup. Failure releases all partial handles; frame descriptors are published together. |
-| `include/rex/graphics/util/scene_capture.h`, `include/rex/ui/vulkan/copy_target.h` | New capture decision/extent policy and unpublished image-allocation guard. HDR, VR left-eye and VR layer image creation share the allocation helper. |
+| `include/rex/graphics/util/scene_capture.h`, `include/rex/ui/vulkan/copy_target.h` | Capture decisions still implement the inherited two-format/same-base/first-overlay policy; extraction does not establish independence. The new unpublished image-allocation guard is shared by HDR, VR left-eye and VR layer images. |
 | `include/rex/ui/vulkan/hdr_surface.h` | New move-only owner for per-image HDR resources. Partial construction cleans itself up. |
 | `include/rex/ui/vulkan/presenter.h`, `src/ui/vulkan/vulkan_presenter.cpp` | Replace per-image allocation/cleanup with the resource owner and batch descriptor allocation; publish frame resources only after all allocations succeed. Replace HDR settings packing. Other HDR presenter portions remain adapted. |
 
@@ -51,6 +58,10 @@ Windows clang 23.1.3 standalone tests, C++20 with `-Wall -Wextra -Werror`:
   format/color-space pair and empty capability list.
 - `hdr_parameters_test`: normal settings, below-paper peak, range clamps,
   nonfinite defaults and comparison/calibration settings.
+- `hdr_calibration_test`: grid interiors, surrounds, checker cells, outside bounds
+  and peak bounds for the new photometric layout.
+- `hdr_coverage_test`: compositing opacity lower bounds under 8/10-bit rounding,
+  faint overlays and independence from neighboring pixels.
 
 The changed SPIR-V builder, translator, Vulkan and D3D12 command processors and
 Vulkan presenter pass production Windows syntax checks against SDK headers.
@@ -75,11 +86,10 @@ glslangValidator -V -S frag --vn hdr_ui_mask_ps src/ui/shaders/hdr_ui_mask.ps.gl
 glslangValidator -V -S comp --vn hdr_hud_mask_cs src/graphics/shaders/hdr_hud_mask.cs.glsl -o src/graphics/shaders/vulkan_spirv/hdr_hud_mask_cs.h
 ```
 
-The subsequent compute-resource replacement passes the production Vulkan command
-processor syntax check and the failure-injection test. It has not yet been
-linked into the private validation DLLs above.
-
-The snapshot/VR image allocation, VR sharpening resource setup and HDR composition
-follow-up also pass production syntax checks and standalone policy tests. GPU
-validation is still outstanding. The existing frame-fence retirement and render
-target cache transfer interfaces remain in place.
+At `7bb18e3`, two changed production units and both DLLs were rebuilt serially in
+13.938 seconds, reusing four verified objects from the first checkpoint. Baseline
+hashes stayed unchanged and the loader/ABI checks passed. Those results describe
+the old color/coverage policies, not the subsequent redesign. The new policies
+need their own link and visual qualification. The existing frame-fence retirement,
+capture trigger, `CopyHdrScene` implementation and HDR hot-toggle fallback remain
+under provenance review; passing contracts do not clear them.

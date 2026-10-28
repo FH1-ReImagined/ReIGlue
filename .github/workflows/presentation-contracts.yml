@@ -1,9 +1,9 @@
 name: Presentation contracts
 on:
   push:
-    paths: ['include/rex/graphics/util/presentation_transform.h', 'include/rex/graphics/pipeline/shader/spirv_contraction.h', 'tests/presentation_transform_test.cpp', 'tests/spirv_contraction_test.cpp', 'include/rex/ui/hdr_color.h', 'tests/hdr_color_test.cpp', 'include/rex/ui/hdr_parameters.h', 'tests/hdr_parameters_test.cpp', 'include/rex/ui/vulkan/hdr_format.h', 'tests/hdr_format_test.cpp', 'include/rex/ui/vulkan/image_compute*', 'tests/image_compute_test.cpp', 'include/rex/graphics/util/scene_capture.h', 'tests/scene_capture_test.cpp', 'tests/hdr_shader_contract_test.cpp', 'src/ui/shaders/vulkan_spirv/hdr*', 'src/graphics/shaders/vulkan_spirv/hdr*', 'src/ui/shaders/hdr*', 'src/graphics/shaders/hdr*', '.github/workflows/presentation-contracts.yml']
+    paths: ['include/rex/graphics/util/presentation_transform.h', 'include/rex/graphics/pipeline/shader/spirv_contraction.h', 'tests/presentation_transform_test.cpp', 'tests/spirv_contraction_test.cpp', 'include/rex/ui/hdr_color.h', 'include/rex/ui/hdr_calibration.h', 'include/rex/ui/hdr_coverage.h', 'tests/hdr_calibration_test.cpp', 'tests/hdr_coverage_test.cpp', 'tests/hdr_color_test.cpp', 'include/rex/ui/hdr_parameters.h', 'tests/hdr_parameters_test.cpp', 'include/rex/ui/vulkan/hdr_format.h', 'tests/hdr_format_test.cpp', 'include/rex/ui/vulkan/image_compute*', 'tests/image_compute_test.cpp', 'include/rex/graphics/util/scene_capture.h', 'tests/scene_capture_test.cpp', 'tests/hdr_shader_contract_test.cpp', 'src/ui/shaders/vulkan_spirv/hdr*', 'src/graphics/shaders/vulkan_spirv/hdr*', 'src/ui/shaders/hdr*', 'src/graphics/shaders/hdr*', '.github/workflows/presentation-contracts.yml']
   pull_request:
-    paths: ['include/rex/graphics/util/presentation_transform.h', 'include/rex/graphics/pipeline/shader/spirv_contraction.h', 'tests/presentation_transform_test.cpp', 'tests/spirv_contraction_test.cpp', 'include/rex/ui/hdr_color.h', 'tests/hdr_color_test.cpp', 'include/rex/ui/hdr_parameters.h', 'tests/hdr_parameters_test.cpp', 'include/rex/ui/vulkan/hdr_format.h', 'tests/hdr_format_test.cpp', 'include/rex/ui/vulkan/image_compute*', 'tests/image_compute_test.cpp', 'include/rex/graphics/util/scene_capture.h', 'tests/scene_capture_test.cpp', 'tests/hdr_shader_contract_test.cpp', 'src/ui/shaders/vulkan_spirv/hdr*', 'src/graphics/shaders/vulkan_spirv/hdr*', 'src/ui/shaders/hdr*', 'src/graphics/shaders/hdr*', '.github/workflows/presentation-contracts.yml']
+    paths: ['include/rex/graphics/util/presentation_transform.h', 'include/rex/graphics/pipeline/shader/spirv_contraction.h', 'tests/presentation_transform_test.cpp', 'tests/spirv_contraction_test.cpp', 'include/rex/ui/hdr_color.h', 'include/rex/ui/hdr_calibration.h', 'include/rex/ui/hdr_coverage.h', 'tests/hdr_calibration_test.cpp', 'tests/hdr_coverage_test.cpp', 'tests/hdr_color_test.cpp', 'include/rex/ui/hdr_parameters.h', 'tests/hdr_parameters_test.cpp', 'include/rex/ui/vulkan/hdr_format.h', 'tests/hdr_format_test.cpp', 'include/rex/ui/vulkan/image_compute*', 'tests/image_compute_test.cpp', 'include/rex/graphics/util/scene_capture.h', 'tests/scene_capture_test.cpp', 'tests/hdr_shader_contract_test.cpp', 'src/ui/shaders/vulkan_spirv/hdr*', 'src/graphics/shaders/vulkan_spirv/hdr*', 'src/ui/shaders/hdr*', 'src/graphics/shaders/hdr*', '.github/workflows/presentation-contracts.yml']
 permissions:
   contents: read
 jobs:
@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check HUD geometry and shader precision
         run: |
-          for test in presentation_transform spirv_contraction hdr_color hdr_parameters hdr_format hdr_shader_contract scene_capture; do
+          for test in presentation_transform spirv_contraction hdr_color hdr_parameters hdr_format hdr_shader_contract scene_capture hdr_calibration hdr_coverage; do
             g++ -std=c++20 -Wall -Wextra -Werror -Iinclude "tests/${test}_test.cpp" -o "$RUNNER_TEMP/$test"
             "$RUNNER_TEMP/$test"
           done

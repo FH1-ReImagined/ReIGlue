@@ -53,10 +53,12 @@ inline bool AllocateImageSets(const VulkanDevice& owner, VkDescriptorPool pool,
 
 template <typename Recorder>
 void RecordCoverageDispatch(Recorder& commands, VkPipelineLayout layout, VkDescriptorSet set,
-                            uint32_t width, uint32_t height) {
-  const std::array<uint32_t, 2> size{width, height};
+                            uint32_t width, uint32_t height, bool swap_rb, float source_quantum) {
+  const struct Parameters { uint32_t width, height, swap_rb; float source_quantum; }
+      size{width, height, uint32_t(swap_rb), source_quantum};
+  static_assert(sizeof(size) == 16);
   commands.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
-  commands.CmdVkPushConstants(layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(size), size.data());
+  commands.CmdVkPushConstants(layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(size), &size);
   commands.CmdVkDispatch((width + 15) / 16, (height + 7) / 8, 1);
 }
 }  // namespace rex::ui::vulkan
