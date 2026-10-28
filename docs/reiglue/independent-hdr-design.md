@@ -214,6 +214,23 @@ readback evidence for the negative cases above; no new live trigger is enabled.
 
 ## Qualification
 
+On 2026-10-28, checkpoint `342686ee76dd5758e691a57f84ce9e0964441ef7`
+rebuilt the Vulkan command processor, presenter, render-target cache and deferred
+recorder, linked both DLLs and passed loader/ABI checks in 27.063 seconds total.
+The single serial job enforced 60 seconds per step and 300 seconds overall.
+All 319 previously recorded input/output hashes matched before and after.
+The two exact-copy objects lacked historical object hash anchors, so they were
+rebuilt rather than treated as authenticated reuse; the other four reused
+replacement objects matched their recorded hashes. New object and DLL hashes,
+step results and ABI evidence are recorded in
+`validation/2026-10-28-hdr-request.json`. Both DLLs loaded, ABI version 1 was
+returned, all 135 imports resolved against 11,280 runtime exports, and invalid
+requests were rejected without creating graphics. Qualified binaries and the
+game SDK pin were unchanged. The CPU reservation was released after completion.
+This qualifies linking/loading of the hot-toggle and trace changes, not runtime
+rendering or independent provenance of the remaining integration. The concrete
+next evidence plan is [capture-witness-plan.md](capture-witness-plan.md).
+
 The new color/calibration/coverage policies change visible output. Prior image
 captures and old reference-curve checks do not qualify them. Required witnesses
 include HDR on/off, zero strength, paper/peak calibration, saturated highlights,

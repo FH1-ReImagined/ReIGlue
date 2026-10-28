@@ -1,0 +1,73 @@
+{
+  "source_commit": "342686ee76dd5758e691a57f84ce9e0964441ef7",
+  "parallelism": 1,
+  "deadline_seconds": 300,
+  "status": "passed",
+  "elapsed_seconds": 27.062999999994645,
+  "historical_hashes_verified": 319,
+  "unanchored_objects_rebuilt": [
+    6,
+    7
+  ],
+  "qualified_inputs_unchanged": true,
+  "object_hashes": {
+    "unit-3.obj": "20fdca104914984e431db3212986ee6ba8506fce2cfb12f90e0b9232e7b60c43",
+    "unit-5.obj": "6dc33cbdd242155125285b12b46f9add40805fc61c07826fd08960bd0de4e6b8",
+    "unit-6.obj": "74a289565dabb84544a93022d7bc7697befefd89f9083ba1f5b3d150fcb4aa9e",
+    "unit-7.obj": "a0316d0484c009a4d79eab34822750a524219d495a17a261ff04bdc2a92a3414"
+  },
+  "outputs": {
+    "rexgpu-xenos.dll": "78bf9abbc6c7ae72e89083bafa9599634d005eb4b4e99d91080d44f3e1c470f8",
+    "rexruntime.dll": "07a8ce79ef7e564af3fd3b3ff28f5bf6cadefbd8c836d4891887b22afaf4fbe0"
+  },
+  "abi": {
+    "gpu_runtime_imports": 135,
+    "runtime_exports": 11280,
+    "missing": [],
+    "loaded": true,
+    "abi_version": 1,
+    "invalid_inputs_rejected": true,
+    "graphics_system_constructed": false
+  },
+  "per_step_timeout_seconds": 60,
+  "steps": [
+    {
+      "name": "compile-3",
+      "exit_code": 0
+    },
+    {
+      "name": "compile-5",
+      "exit_code": 0
+    },
+    {
+      "name": "compile-6",
+      "exit_code": 0
+    },
+    {
+      "name": "compile-7",
+      "exit_code": 0
+    },
+    {
+      "name": "exports",
+      "exit_code": 0
+    },
+    {
+      "name": "link-rexruntime",
+      "exit_code": 0
+    },
+    {
+      "name": "link-rexgpu-xenos",
+      "exit_code": 0
+    },
+    {
+      "name": "loader-abi",
+      "exit_code": 0
+    }
+  ],
+  "limits": [
+    "No graphics system constructed or game run",
+    "No runtime HDR/VR qualification",
+    "Qualified baseline and game SDK pin unchanged",
+    "Object 6/7 had no historical SHA anchor and were rebuilt; object hashes now recorded"
+  ]
+}
