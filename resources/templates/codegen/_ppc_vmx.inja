@@ -9,14 +9,24 @@
 //   the product is not rounded before the add. Built with FMA (-mfma,
 //   /arch:AVX2, ARM64) that is the fused instruction. Otherwise it is the FMA
 //   instruction on a CPU that has it (the check and REX_PPC_FMA of ppc_fma
-//   above) and a multiply, then an add, on one without, which may differ from
-//   the hardware in the last bit.
+//   above), and on one without, or with REX_PPC_FMA=0, a multiply, then an add,
+//   as before ReIGlue 0400. That is two roundings, and the difference from the
+//   console is not only in the last bit: a product that underflows is flushed
+//   to a signed zero before the add (a tiny negative product plus +0 comes out
+//   +0 where the console gives -0), a sum that cancels magnifies the product's rounding (5 to 8
+//   units in the last place in xenia-canary's recorded cases), and a product
+//   that overflows float32 gives an infinity or a NaN the single rounding does
+//   not (FLT_MAX * 2 - FLT_MAX). 588 of its 15,600 recorded vmaddfp cases and
+//   300 of its 15,600 vnmsubfp cases come out different that way.
+//   REX_PPC_FMA=1 on such a CPU asks for the single rounding through std::fma
+//   per lane, many times slower. ppc_vfma_single_rounding() says whether the
+//   rounding is single (the PPC tests skip the cases that need it when not).
 // - vnmsubfp negates every result but a NaN: -(a * c - b), so an exact zero
 //   comes out as -0.
 // - A NaN result is the first NaN operand in the order vA, vB (the addend),
 //   vC, quieted; a NaN from an invalid operation (infinity times zero,
 //   infinity minus infinity) is 0x7FC00000. x86 gives 0xFFC00000 there and
-//   picks a NaN operand by position, so NaN lanes are redone out of line.
+//   picks a NaN operand by position, so NaN lanes are redone in a cold branch.
 // - vmaxfp, vminfp, vmsum3fp128 and vmsum4fp128: below.
 //=============================================================================
 
@@ -55,6 +65,10 @@ inline simde__m128 ppc_vfms(simde__m128 a, simde__m128 c, simde__m128 b) {
       a, c, simde_mm_xor_ps(b, simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));
 }
 
+inline bool ppc_vfma_single_rounding() {
+  return true;
+}
+
 #else
 
 // The FMA instructions are in inline assembly because the code is not built
@@ -63,6 +77,10 @@ inline simde__m128 ppc_vfms(simde__m128 a, simde__m128 c, simde__m128 b) {
 // single rounding on a CPU without FMA (std::fma per lane, slow). The empty
 // asm keeps the compiler from contracting the multiply and the add.
 inline const int ppc_vfma_mode = !ppc_host_has_fma ? 0 : ppc_detect_host_fma() ? 1 : 2;
+
+inline bool ppc_vfma_single_rounding() {
+  return ppc_vfma_mode != 0;
+}
 
 // Reads nothing but its arguments ([[gnu::const]]), so the call costs the sites
 // nothing while the mode is not 2.

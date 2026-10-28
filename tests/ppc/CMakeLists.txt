@@ -39,7 +39,9 @@ add_custom_command(
             --output=${PPC_GEN_DIR}
             --bin-dir=${PPC_BIN_DIR}
             --asm-dir=${CMAKE_CURRENT_SOURCE_DIR}/asm
+            --fma-cases=${CMAKE_CURRENT_SOURCE_DIR}/fma_cases.txt
     DEPENDS ${TEST_BINS} ${TEST_MAPS} ${ASM_FILES} rexglue
+            ${CMAKE_CURRENT_SOURCE_DIR}/fma_cases.txt
     COMMENT "Generating Catch2 test code with rexglue"
     VERBATIM
 )
