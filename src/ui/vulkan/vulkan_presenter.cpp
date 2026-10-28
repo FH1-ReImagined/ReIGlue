@@ -860,6 +860,9 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
                                                                  uint32_t new_surface_height,
                                                                  bool was_paintable,
                                                                  bool& is_vsync_implicit_out) {
+  // One request snapshot governs both attempts and is committed only once all
+  // resources exist. A setting changed during construction is handled next paint.
+  const bool requested_hdr = REXCVAR_GET(present_hdr);
   const VulkanInstance* const vulkan_instance = vulkan_device_->vulkan_instance();
   const VulkanInstance::Functions& ifn = vulkan_instance->functions();
   const VkInstance instance = vulkan_instance->instance();
@@ -883,7 +886,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
-        paint_context_.swapchain_hdr, paint_context_.swapchain_capture_supported, surface_unusable);
+        paint_context_.swapchain_hdr, paint_context_.swapchain_capture_supported,
+        requested_hdr, surface_unusable);
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -988,7 +992,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
-        paint_context_.swapchain_hdr, paint_context_.swapchain_capture_supported, surface_unusable);
+        paint_context_.swapchain_hdr, paint_context_.swapchain_capture_supported,
+        requested_hdr, surface_unusable);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -1182,6 +1187,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   }
 
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
+  paint_context_.hdr_request.Commit(requested_hdr);
   return SurfacePaintConnectResult::kSuccess;
 }
 
@@ -1291,7 +1297,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
     VkExtent2D& image_extent_out, bool& is_fifo_out, bool& hdr_out, bool& capture_supported_out,
-    bool& ui_surface_unusable_out) {
+    bool requested_hdr, bool& ui_surface_unusable_out) {
   ui_surface_unusable_out = false;
   hdr_out = false;
 
@@ -1474,12 +1480,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   }
   const auto hdr_choice = ChooseHdrFormat(surface_formats, image_format,
       vulkan_device->vulkan_instance()->extensions().ext_EXT_swapchain_colorspace,
-      REXCVAR_GET(present_hdr),
+      requested_hdr,
       VkSurfaceFormatKHR{PaintContext::kHdrFormat, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT});
   image_format = hdr_choice.format;
   hdr_out = hdr_choice.active;
   PublishHdrFlag(1, hdr_choice.available);
-  if (REXCVAR_GET(present_hdr))
+  if (requested_hdr)
     REXLOG_INFO("HDR surface selection: {}", hdr_out ? "linear scRGB" : "SDR fallback");
 
   // Get presentation modes.
@@ -1768,11 +1774,9 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
-  // present_hdr switched (#442): recreate the swapchain in the other format
-  // through the reconnection. Where the surface offers no scRGB, nothing
-  // changes.
-  if (REXCVAR_GET(present_hdr) != paint_context_.swapchain_hdr &&
-      (paint_context_.swapchain_hdr || GetHdrOutputState().offered)) {
+  // Re-evaluate each changed request once, even on an SDR-only surface. An
+  // accepted fallback is stable until a new request or an external reconnect.
+  if (paint_context_.hdr_request.NeedsConnection(REXCVAR_GET(present_hdr))) {
     return PaintResult::kNotPresentedConnectionOutdated;
   }
   // Begin the submission in place of the one not currently potentially used on

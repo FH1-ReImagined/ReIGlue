@@ -170,6 +170,48 @@ gameplay, pause/resume, reconstruction and VR paths. Correlate those records wit
 scene/HUD readbacks before enabling a new trigger. A failure to find a safe
 predicate must not silently disable HDR or VR separation.
 
+## Connection request handling, 2026-10-28
+
+The next source change replaces the inherited hot-toggle predicate with a
+request/commit protocol. Its requirements come from connection lifecycle
+behavior: a changed setting needs fresh capability selection; successful SDR
+fallback must remain paintable; failed construction must not acknowledge a
+request; a setting changed during construction needs reconsideration next paint.
+
+`HdrConnectionRequest` records the request accepted by the last fully successful
+connection. The connection function snapshots `present_hdr` once, passes it to
+both the existing-surface and fresh-surface attempts, and commits after all
+framebuffers and semaphores exist. Paint requests reconnection when the setting
+differs from the committed request. Capability and actual format are observations,
+not inputs to this decision. An unavailable HDR request produces one capability
+evaluation per successful request transition, without a per-paint retry loop.
+External surface reconnects still query capability; toggling off/on also retries
+an unavailable request. Changes returning to the committed value before paint
+need no reconstruction.
+
+This changes behavior: toggling on an SDR-only surface requests one reconnection.
+Resource retirement, UI/paint thread exclusion, reconnect failure handling and
+surface events remain the existing presenter mechanisms. These are retained
+dependencies, not newly independent implementations. The whole presenter
+integration is not replaced. Previous code was inspected; this is not a
+segregated clean-room process. Existing notices remain.
+
+Request/format fallback and exact-copy contracts pass with Windows clang 23.1.3,
+C++20, `-Wall -Wextra -Werror`; the production Vulkan presenter passes a
+syntax-only check. No DLL link or graphics initialization was performed for this
+change. Local evidence is in the enclosing workspace at
+`build/pinyon-audit/hdr-request-source-check/results.json`. The capture trigger
+remains inherited; the later trace extension remains unqualified at runtime.
+
+The bounded next build requires a separate orchestrator grant. Serially rebuild
+the presenter and trace-modified command processor in a private directory,
+verify hashes before reusing other objects from the `8c97dd5` checkpoint, link
+both DLLs and run the existing loader/ABI checks without creating graphics.
+Allow at most 60 seconds per compile/link step; stop on failure or changed
+baseline inputs. Preserve qualified baseline binaries. This cannot qualify
+rendering. Capture replacement still requires correlated issued-draw, source and
+readback evidence for the negative cases above; no new live trigger is enabled.
+
 ## Qualification
 
 The new color/calibration/coverage policies change visible output. Prior image
