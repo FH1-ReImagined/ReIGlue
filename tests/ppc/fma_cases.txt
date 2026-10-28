@@ -27,3 +27,9 @@ vnmsubfp_hw.test_vnmsubfp_11827_GEN
 vnmsubfp_hw.test_vnmsubfp_12295_GEN
 vnmsubfp_hw.test_vnmsubfp_12402_GEN
 vnmsubfp_hw.test_vnmsubfp_14252_GEN
+
+# The *_special.s cases: overflow of a rounded product, and the single rounding of the VMX128 forms
+vmaddfp_special.test_3
+vmaddfp128_special.test_2
+vmaddcfp128_special.test_2
+vnmsubfp128_special.test_2
