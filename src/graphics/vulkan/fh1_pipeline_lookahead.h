@@ -59,6 +59,12 @@ struct Stats {
   double walk_ms = 0, wait_ms = 0;
   uint64_t waits = 0;
   uint64_t frames = 0, skipped_frames = 0, skipped_draws = 0;
+  // #167: frames shown with draws skipped (after the hold, or with the skip setting off); frames
+  // held past the hold for a draw that must not be missing; CPU readbacks with draws skipped.
+  uint64_t incomplete_frames_shown = 0, held_for_stale_contents = 0, incomplete_readbacks = 0;
+  // #167: skipped draws that hold their frame, by kind (Fh1SkipMustHoldFrame).
+  uint64_t skipped_stereo = 0, skipped_depth = 0, skipped_screen_passes = 0,
+           skipped_front_buffer = 0;
 };
 inline Stats stats;
 
