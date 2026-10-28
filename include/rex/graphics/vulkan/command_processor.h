@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
@@ -628,6 +629,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
+  // FH1 (#167): whether the last frames used placeholders, and since when (IssueSwap).
+  bool fh1_incomplete_frames_ = false;
+  std::chrono::steady_clock::time_point fh1_incomplete_since_{};
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

@@ -125,6 +125,12 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "used placeholder pipelines to avoid visible flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_UINT32(vulkan_async_skip_incomplete_frames_ms, 100, "GPU/Vulkan",
+                      "How long vulkan_async_skip_incomplete_frames holds frames back while the "
+                      "pipelines they need are built, in milliseconds; after that they are shown "
+                      "without the draws whose pipelines are not ready yet (0: until all are)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -4832,6 +4838,24 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
+  // FH1 (#167): the pipelines are built in the background across frames now (a frame end waits
+  // for them only briefly, pipeline_cache.cpp), so frames that need one are held back for at most
+  // vulkan_async_skip_incomplete_frames_ms, then shown without those draws until it is ready.
+  if (!frame_used_async_placeholder_pipeline_) {
+    fh1_incomplete_frames_ = false;
+  } else {
+    const auto now = std::chrono::steady_clock::now();
+    if (!fh1_incomplete_frames_) {
+      fh1_incomplete_frames_ = true;
+      fh1_incomplete_since_ = now;
+    }
+    const uint32_t hold_ms = REXCVAR_GET(vulkan_async_skip_incomplete_frames_ms);
+    if (skip_present_due_async_placeholder && hold_ms &&
+        now - fh1_incomplete_since_ >= std::chrono::milliseconds(hold_ms)) {
+      skip_present_due_async_placeholder = false;
+      ++fh1_pipeline_lookahead::stats.incomplete_frames_shown;
+    }
+  }
   // FH1 (#378): the log's pipeline summary (fh1_pipeline_lookahead.h).
   ++fh1_pipeline_lookahead::stats.frames;
   if (skip_present_due_async_placeholder) {
@@ -8548,8 +8572,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
 }
 
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
-  return !submission_open_ || (!scratch_buffer_used_ && !pipeline_cache_->IsCreatingPipelines() &&
-      (!fh1_other_pipelines_ || !fh1_other_pipelines_->IsCreatingPipelines()));
+  // FH1 (#167): pipelines being built keep the submission open where its end waits for them
+  // (vulkan_async_frame_end_wait_ms 0: never).
+  auto waits = [](const VulkanPipelineCache* cache) {
+    return cache && cache->WaitsForCreationAtSubmissionEnd() && cache->IsCreatingPipelines();
+  };
+  return !submission_open_ || (!scratch_buffer_used_ && !waits(pipeline_cache_.get()) &&
+                               !waits(fh1_other_pipelines_.get()));
 }
 
 bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {

@@ -59,6 +59,7 @@ struct Stats {
   double walk_ms = 0, wait_ms = 0;
   uint64_t waits = 0;
   uint64_t frames = 0, skipped_frames = 0, skipped_draws = 0;
+  uint64_t incomplete_frames_shown = 0;  // #167: held back long enough, shown without those draws
 };
 inline Stats stats;
 
