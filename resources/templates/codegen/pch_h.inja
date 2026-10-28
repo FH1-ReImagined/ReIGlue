@@ -255,6 +255,8 @@ extern PPCFuncMapping PPCFuncMappings[];
 
 {% include "codegen/_ppc_fma.inja" %}
 
+{% include "codegen/_ppc_vmx.inja" %}
+
 //=============================================================================
 // Misc
 //=============================================================================
