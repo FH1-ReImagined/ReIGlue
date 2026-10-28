@@ -20,8 +20,9 @@ Pinyon Shift
   Copyright (c) 2026, Pinyon Shift contributors.
   BSD 3-Clause License: see LICENSE-Pinyon-Shift. Adapted here: the native
   ultrawide presentation and HUD viewport transforms (0063), the scRGB HDR
-  presenter, highlight curve and HUD coverage shaders (0091), and the contraction
-  part of its macOS pixel-math tuning (0082).
+  presenter, highlight curve and HUD coverage shaders (0091), the contraction
+  part of its macOS pixel-math tuning (0082), and the idea of decoding kicked
+  XMA contexts on the XMA decoder thread (0406).
 
 Downloaded at configure time, not stored in this repository (pinned revisions,
 SHA-256 checked; each license is installed beside the GPU library):

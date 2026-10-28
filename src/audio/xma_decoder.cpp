@@ -27,6 +27,10 @@ extern "C" {
 }  // extern "C"
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+REXCVAR_DEFINE_BOOL(xma_worker_decode, false, "Audio",
+                    "Decode a kicked XMA context on the XMA decoder thread instead of the thread "
+                    "that kicked it; the game's next kick, lock, clear or release of the context "
+                    "waits for that decode");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -122,6 +126,16 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   register_file_[XmaRegister::NextContextIndex] = 1;
   context_bitmap_.Resize(kContextCount);
 
+  worker_decode_ = REXCVAR_GET(xma_worker_decode);
+  for (auto& state : job_state_) {
+    state.store(JobState::kIdle, std::memory_order_relaxed);
+  }
+  job_next_.fill(-1);
+  job_prev_.fill(-1);
+  if (worker_decode_) {
+    REXAPU_INFO("XMA: kicked contexts are decoded on the decoder thread (xma_worker_decode)");
+  }
+
   worker_running_ = true;
   work_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(work_event_);
@@ -139,16 +153,31 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 
 void XmaDecoder::WorkerThreadMain() {
   while (worker_running_) {
-    // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
-    for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
-      XmaContext& context = contexts_[n];
-      bool worked = context.Work();
-      if (worked) {
-        context.SignalWorkDone();
-        PROFILE_XMA_FRAME_DECODED();
+    if (worker_decode_) {
+      // The kicks' jobs, in kick order. Every enabled context has one (only a kick enables a
+      // context), so the sweep below would find nothing more.
+      did_work = RunQueuedJobs();
+      if (did_work && !first_stats_logged_) {
+        const auto now = std::chrono::steady_clock::now();
+        if (first_job_time_ == std::chrono::steady_clock::time_point{}) {
+          first_job_time_ = now;
+        } else if (now - first_job_time_ >= std::chrono::seconds(60)) {
+          first_stats_logged_ = true;
+          LogJobStats();
+        }
       }
-      did_work = did_work || worked;
+    } else {
+      // Okay, let's loop through XMA contexts to find ones we need to decode!
+      for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
+        XmaContext& context = contexts_[n];
+        bool worked = context.Work();
+        if (worked) {
+          context.SignalWorkDone();
+          PROFILE_XMA_FRAME_DECODED();
+        }
+        did_work = did_work || worked;
+      }
     }
 
     if (paused_) {
@@ -185,6 +214,9 @@ void XmaDecoder::Shutdown() {
     REXAPU_WARN("XMA: Worker thread did not exit within 2s, abandoning");
   }
   worker_thread_.reset();
+  if (worker_decode_) {
+    LogJobStats();
+  }
 
   if (context_data_first_ptr_) {
     memory()->SystemHeapFree(context_data_first_ptr_);
@@ -220,6 +252,9 @@ void XmaDecoder::ReleaseContext(uint32_t guest_ptr) {
   auto context_id = GetContextId(guest_ptr);
   assert_true(context_id >= 0);
 
+  if (worker_decode_) {
+    JoinContext(context_id);
+  }
   XmaContext& context = contexts_[context_id];
   assert_true(context.is_allocated());
   context.Release();
@@ -286,6 +321,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // The context ID is a bit in the range of the entire context array.
     uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
     uint32_t kicked_value = value;
+    if (worker_decode_) {
+      QueueJobs(base_context_id, kicked_value);
+      work_event_->Set();
+      return;
+    }
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
@@ -313,6 +353,10 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
+        if (worker_decode_) {
+          // The decode the last kick asked for comes first, as when it ran at the kick.
+          JoinContext(context_id);
+        }
         auto& context = contexts_[context_id];
         context.Disable();
         // [XMA fix] Added Block(false) after Disable(). Without this, the game
@@ -331,6 +375,9 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
+        if (worker_decode_) {
+          JoinContext(context_id);
+        }
         XmaContext& context = contexts_[context_id];
         context.Clear();
       }
@@ -352,6 +399,173 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
 #pragma warning(suppress : 4065)
     }
   }
+}
+
+void XmaDecoder::QueueJobs(uint32_t base_context_id, uint32_t kicked_value) {
+  // A context kicked again before its last job ran gets that decode first, so that each kick
+  // has its own, as at the kick.
+  for (uint32_t i = 0, bits = kicked_value; bits && i < 32; ++i, bits >>= 1) {
+    if (bits & 1) {
+      JoinContext(base_context_id + i);
+    }
+  }
+  for (uint32_t i = 0, bits = kicked_value; bits && i < 32; ++i, bits >>= 1) {
+    if (bits & 1) {
+      contexts_[base_context_id + i].Enable();
+    }
+  }
+  std::unique_lock<std::mutex> lock(job_mutex_);
+  for (uint32_t i = 0, bits = kicked_value; bits && i < 32; ++i, bits >>= 1) {
+    if (!(bits & 1)) {
+      continue;
+    }
+    const uint32_t context_id = base_context_id + i;
+    while (job_state_[context_id].load(std::memory_order_relaxed) != JobState::kIdle) {
+      // Another thread kicked it since the join above. Its job may have run before this
+      // thread's Enable(): this kick still needs one of its own.
+      lock.unlock();
+      JoinContext(context_id);
+      lock.lock();
+    }
+    job_state_[context_id].store(JobState::kQueued, std::memory_order_relaxed);
+    job_next_[context_id] = -1;
+    job_prev_[context_id] = job_tail_;
+    if (job_tail_ >= 0) {
+      job_next_[job_tail_] = static_cast<int16_t>(context_id);
+    } else {
+      job_head_ = static_cast<int16_t>(context_id);
+    }
+    job_tail_ = static_cast<int16_t>(context_id);
+    ++jobs_queued_;
+  }
+}
+
+void XmaDecoder::UnlinkJobLocked(uint32_t context_id) {
+  const int16_t prev = job_prev_[context_id];
+  const int16_t next = job_next_[context_id];
+  if (prev >= 0) {
+    job_next_[prev] = next;
+  } else {
+    job_head_ = next;
+  }
+  if (next >= 0) {
+    job_prev_[next] = prev;
+  } else {
+    job_tail_ = prev;
+  }
+  job_next_[context_id] = -1;
+  job_prev_[context_id] = -1;
+}
+
+void XmaDecoder::RunJob(uint32_t context_id) {
+  // As the inline decode at the kick.
+  XmaContext& context = contexts_[context_id];
+  if (context.Work()) {
+    context.SignalWorkDone();
+  }
+}
+
+void XmaDecoder::FinishJob(uint32_t context_id) {
+  std::lock_guard<std::mutex> lock(job_mutex_);
+  // Release: a join that sees kIdle without the mutex also sees what the decode wrote.
+  job_state_[context_id].store(JobState::kIdle, std::memory_order_release);
+  if (job_waiters_) {
+    job_done_.notify_all();
+  }
+}
+
+bool XmaDecoder::RunQueuedJobs() {
+  bool did_work = false;
+  while (worker_running_) {
+    uint32_t context_id;
+    {
+      std::lock_guard<std::mutex> lock(job_mutex_);
+      if (job_head_ < 0) {
+        break;
+      }
+      context_id = static_cast<uint32_t>(job_head_);
+      UnlinkJobLocked(context_id);
+      job_state_[context_id].store(JobState::kRunning, std::memory_order_relaxed);
+    }
+    RunJob(context_id);
+    FinishJob(context_id);
+    did_work = true;
+  }
+  return did_work;
+}
+
+void XmaDecoder::JoinContext(uint32_t context_id) {
+  std::unique_lock<std::mutex> lock(job_mutex_);
+  const JobState state = job_state_[context_id].load(std::memory_order_relaxed);
+  if (state == JobState::kIdle) {
+    return;
+  }
+  if (state == JobState::kQueued) {
+    // The decoder thread has not reached it: decode it here, as the kick would have. The game
+    // often locks a context again right after kicking it, to take the next frame.
+    UnlinkJobLocked(context_id);
+    job_state_[context_id].store(JobState::kRunning, std::memory_order_relaxed);
+    ++jobs_taken_;
+    lock.unlock();
+    RunJob(context_id);
+    FinishJob(context_id);
+    return;
+  }
+  // Running on the decoder thread (or on another thread that joined it). A decode takes a few
+  // microseconds: poll a little before sleeping, which costs a wakeup.
+  lock.unlock();
+  const auto start = std::chrono::steady_clock::now();
+  auto end = start;
+  bool done = false;
+  for (uint32_t polls = 0;; ++polls) {
+    if (job_state_[context_id].load(std::memory_order_acquire) == JobState::kIdle) {
+      done = true;
+      break;
+    }
+    if ((polls & 7) == 7) {
+      end = std::chrono::steady_clock::now();
+      if (end - start >= std::chrono::microseconds(50)) {
+        break;
+      }
+    }
+    rex::thread::MaybeYield();
+  }
+  lock.lock();
+  if (!done) {
+    ++job_waiters_;
+    job_done_.wait(lock, [&] {
+      return job_state_[context_id].load(std::memory_order_relaxed) == JobState::kIdle;
+    });
+    --job_waiters_;
+  }
+  end = std::chrono::steady_clock::now();
+  const uint64_t us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+  ++jobs_waited_;
+  job_wait_total_us_ += us;
+  job_wait_max_us_ = std::max(job_wait_max_us_, us);
+  bool log = false;
+  if (us >= 1000) {
+    // A wait this long can delay the game's audio frame.
+    ++jobs_waited_long_;
+    log = end - long_wait_log_time_ >= std::chrono::seconds(60);
+  }
+  lock.unlock();
+  if (log) {
+    LogJobStats();
+  }
+}
+
+void XmaDecoder::LogJobStats() {
+  std::lock_guard<std::mutex> lock(job_mutex_);
+  long_wait_log_time_ = std::chrono::steady_clock::now();
+  REXAPU_INFO(
+      "XMA decoder thread: {} decodes, {} of them on the game's thread at its next use of the "
+      "context; {} waited for ({} of 1 ms or more, {} since the last line; longest {} us, {} us "
+      "in all)",
+      jobs_queued_, jobs_taken_, jobs_waited_, jobs_waited_long_,
+      jobs_waited_long_ - jobs_waited_long_logged_, job_wait_max_us_, job_wait_total_us_);
+  jobs_waited_long_logged_ = jobs_waited_long_;
 }
 
 void XmaDecoder::Pause() {
