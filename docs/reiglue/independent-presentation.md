@@ -40,6 +40,9 @@ Windows clang 23.1.3 standalone tests, C++20 with `-Wall -Wextra -Werror`:
   idempotence, excluded stages/depth/exports, malformed input without mutation.
 - `hdr_color_test`: every 8-bit sRGB round trip, gamma conversion, bounded
   monotonic highlight output, paper-white HUD and disabled expansion.
+- `hdr_shader_contract_test`: reflects the three generated SPIR-V binaries to
+  check shader stages, workgroup dimensions, descriptor bindings, push-constant
+  member offsets and the C++ parameter size.
 - `hdr_format_test`: HDR available/requested/disabled, extension absence, wrong
   format/color-space pair and empty capability list.
 - `hdr_parameters_test`: normal settings, below-paper peak, range clamps,
@@ -53,8 +56,11 @@ DLLs linked in a private directory in 27 seconds, serially. Baseline object and
 library hashes stayed unchanged. Windows loaded both DLLs; all 135 GPU imports
 resolved. The ABI version returned 1 and the factory rejected incompatible ABI,
 null configuration and unknown backend without constructing a graphics system.
-Later output-pass/format-selection replacements pass syntax and contract checks
-but have not yet repeated that link qualification. No HDR display readback,
+The output-pass/format-selection changes at `ab7752b` also passed a private
+presenter rebuild and both DLL links in 5.375 seconds. Five unchanged objects
+were reused from the first validation; baseline input hashes stayed unchanged.
+Both DLLs loaded and passed the same ABI functions, with all 135 imports
+resolved against 11,280 runtime exports. No HDR display readback,
 Vulkan validation run, VR run or macOS visual test has qualified the branch. Do not treat this branch as ready to remove notices or ship.
 
 Shader regeneration, from the repository root:
