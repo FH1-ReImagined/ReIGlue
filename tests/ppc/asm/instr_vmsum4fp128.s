@@ -67,3 +67,59 @@ test_vmsum4fp128_8:
   vmsum4fp128 v5, v3, v4
   blr
   #_ REGISTER_OUT v5 [3f800000, 3f800000, 3f800000, 3f800000]
+
+test_vmsum4fp128_9:
+  # infinity times zero (invalid): Xenon's default QNaN, 7fc00000 (x86 makes ffc00000)
+  #_ REGISTER_IN v3 [7f800000, 00000000, 00000000, 00000000]
+  #_ REGISTER_IN v4 [00000000, 00000000, 00000000, 00000000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
+
+test_vmsum4fp128_10:
+  # infinity minus infinity (invalid): 7fc00000
+  #_ REGISTER_IN v3 [7f800000, ff800000, 00000000, 00000000]
+  #_ REGISTER_IN v4 [3f800000, 3f800000, 00000000, 00000000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
+
+test_vmsum4fp128_11:
+  # NaN in vA and vB: vA's, as Xenia's sequence (no recorded case has two NaNs)
+  #_ REGISTER_IN v3 [7fc00001, 3f800000, 3f800000, 3f800000]
+  #_ REGISTER_IN v4 [7fc00002, 3f800000, 3f800000, 3f800000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [7fc00001, 7fc00001, 7fc00001, 7fc00001]
+
+test_vmsum4fp128_12:
+  # x before z: vB's x (a signaling NaN, quieted) before vA's z
+  #_ REGISTER_IN v3 [3f800000, 3f800000, ffc00003, 3f800000]
+  #_ REGISTER_IN v4 [7f800004, 3f800000, 3f800000, 3f800000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [7fc00004, 7fc00004, 7fc00004, 7fc00004]
+
+test_vmsum4fp128_13:
+  # an invalid x before a NaN in z: 7fc00000
+  #_ REGISTER_IN v3 [7f800000, 3f800000, 7fc00005, 3f800000]
+  #_ REGISTER_IN v4 [00000000, 3f800000, 3f800000, 3f800000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
+
+test_vmsum4fp128_14:
+  # (x + z) before (y + w)
+  #_ REGISTER_IN v3 [3f800000, 7fc00006, ffc00009, 3f800000]
+  #_ REGISTER_IN v4 [3f800000, 3f800000, 3f800000, 3f800000]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [ffc00009, ffc00009, ffc00009, ffc00009]
+
+test_vmsum4fp128_15:
+  # y before w
+  #_ REGISTER_IN v3 [3f800000, 7fc00006, 3f800000, 3f800000]
+  #_ REGISTER_IN v4 [3f800000, 3f800000, 3f800000, ffc00007]
+  vmsum4fp128 v5, v3, v4
+  blr
+  #_ REGISTER_OUT v5 [7fc00006, 7fc00006, 7fc00006, 7fc00006]
