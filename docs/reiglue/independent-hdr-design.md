@@ -231,6 +231,39 @@ This qualifies linking/loading of the hot-toggle and trace changes, not runtime
 rendering or independent provenance of the remaining integration. The concrete
 next evidence plan is [capture-witness-plan.md](capture-witness-plan.md).
 
+A separately granted HDR-off session subsequently ran for 183.563 seconds under
+an owned Job, assigned before the suspended game was resumed, with a 240-second
+watchdog and a 45-second inspected-first-frame deadline. The compatible host was
+main `52d5784`, built against baseline SDK `7d17ea5`; 13 audited ABI headers
+matched and all runtime imports resolved. This host does not contain game #493's
+new AI or presentation mechanisms. Only the new private SDK DLLs were substituted.
+The fresh handoff hashed its runtime, copied source-profile/cache/update inputs,
+all 2,400 shared game assets and concrete system dependencies; all notices were
+included. Offline flags, HDR off, VR off, bilinear 1280x720/30 fps, disabled async
+compilation and the existing safe Vulkan flags bounded the configuration.
+
+Normal Computer Use UI input reached startup/title, Single Player, a rendered
+opening Viper/Flynt world scene with HUD, pause, then resume with scene/HUD intact.
+The seed entered the opening sequence, not the intended garage or ordinary
+free-roam; those intended cases remain unobserved. Native pause and resumed-world
+snapshots were visually checked. No steering/throttle or helper input was used.
+The operator stopped the owned Job after this witness; exit 1 is that deliberate
+termination, not a crash. Job active count and full game-process enumeration were
+zero. Source profile/cache, shared game assets and runtime hashes remained
+unchanged. Exact report and snapshot hashes are in
+`validation/2026-10-28-hdr-off-smoke.json`; artifacts remain in the enclosing
+workspace's `build/pinyon-audit/runtime-hdr-off-r5`. Two logged filesystem/kernel
+errors are retained in the report without claiming they were diagnosed or absent;
+no native-fault, fatal or device-loss log match was recorded.
+
+This is a limited HDR-off startup/world/pause-resume witness. It does not qualify
+HDR mapping/coverage, exact-copy transfer, toggling, scene acquisition, VR, or the
+game PR's AI/presentation replacements. Actual HDR qualification requires an
+HDR-capable display, Windows HDR enabled, confirmed scRGB output and new calibrated
+readbacks. No trace trigger was armed or new capture predicate enabled. The SDK
+pin, qualified shared binaries, required notices and remaining provenance gates
+are unchanged; the graphics reservation was released on closure.
+
 The new color/calibration/coverage policies change visible output. Prior image
 captures and old reference-curve checks do not qualify them. Required witnesses
 include HDR on/off, zero strength, paper/peak calibration, saturated highlights,

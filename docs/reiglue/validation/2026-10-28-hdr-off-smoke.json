@@ -1,0 +1,97 @@
+{
+  "sdk_source": "342686ee76dd5758e691a57f84ce9e0964441ef7",
+  "host_source": "52d5784af194328802a98d43e0c633265c922645",
+  "host_sdk_baseline": "7d17ea51a51861cfef4244afc06a908bf1fd74a2",
+  "preparation_sha256": "a9c056eaf7db6c03976a92b200e97a9a576a3021d11485bc4c017a7bf98933d2",
+  "closure_sha256": "122c54de4fd4aa6bc09451e3ec4fe028069edd4b61c6aa2ecb2e33eac257eba3",
+  "game_log_sha256": "c877bf82f7f88fb8cf927f55f41fe85665da9b1184fe3441cb85198ffc5ef68a",
+  "runner_sha256": "8335640d8a388cf103ecf5ff290bc8e9bc6bc84bc5369f1ca19bf98ee66ceed5",
+  "runtime_sha256": {
+    "forza.exe": "2934d76f41b14d87dfe9d4e2ac68620ce329b9a077d9dccba73a41c8136dba9e",
+    "forza.toml": "d2bd95057c6abed93c8b15673af3abad5b4cedba981870511519c0de17e44d76",
+    "forza_SpeechFacade_default.dll": "ffd51d741419c028a716f7c9a6c8ff15dad3e4fe2c06b2f17d82d2ab7c8cc20e",
+    "forza_XMediaFacade_default.dll": "c884ecdf6b27c8c4088cea75dfae519312ee823b363ddbf51be1d9e85c05a670",
+    "notices/AMD-FidelityFX-LICENSE.txt": "82cf74fc23885107c7f69249ac3f1dac55898ff68320eb2c753984cae6b2d78a",
+    "notices/Game-LICENSE": "13dc1f4a6560e1600b75af8405d59b737403c3e3fa393595f56595c1b235a20b",
+    "notices/Host-LICENSE-Pinyon-Shift": "d28e6bbe398febdc1a9f915d1d9f44eb44f41daad6931b29392cb48448c4172a",
+    "notices/NVIDIA-DLSS-LICENSE.txt": "d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0",
+    "notices/ReIGlue-LICENSE": "8e065be1da2ff9a16b1f063d4636d8b67e6a654bb90583ea4332e66ac421bb18",
+    "notices/ReIGlue-LICENSE-Pinyon-Shift": "eb34f059ac07f6466729513a97a6b086ba64e4e770ab29bab0a4981c5806c1a2",
+    "notices/ReIGlue-NOTICE": "e2e09b0986746674a2c1a03e8d834f472b08de84ec1171dbd0ccd3a58ff36fe7",
+    "notices/sdk-installed/SDL3/LICENSE.txt": "f4c406cd23df8e2ea3e8bb1af62f15cb6b2439e4e5385828cf90301baea4d944",
+    "notices/SMAA-LICENSE.txt": "2b848b67ba50ac40b53e11cf1ccdaee2a190ca83b4652cba695a5f1ce81f52ae",
+    "rexgpu-xenos.dll": "78bf9abbc6c7ae72e89083bafa9599634d005eb4b4e99d91080d44f3e1c470f8",
+    "rexruntime.dll": "07a8ce79ef7e564af3fd3b3ff28f5bf6cadefbd8c836d4891887b22afaf4fbe0",
+    "TracyClient.dll": "6c4d76863d1a639b720ce39028b2fcf68a1af37e1e5563fe20d8256aaf284f19"
+  },
+  "source_profile_file_count": 9,
+  "shared_game_asset_count": 2400,
+  "matched_critical_abi_headers": 13,
+  "resolved_runtime_imports": {
+    "forza.exe": 478,
+    "forza_SpeechFacade_default.dll": 126,
+    "forza_XMediaFacade_default.dll": 63,
+    "rexgpu-xenos.dll": 135
+  },
+  "configuration": {
+    "present_hdr": false,
+    "vr_mode": "off",
+    "live_server": "",
+    "live_signin": false,
+    "resolution": [
+      1280,
+      720
+    ],
+    "frame_rate": 30,
+    "async_shader_compilation": false,
+    "vulkan_sparse_shared_memory": false,
+    "vulkan_threaded_submission": false
+  },
+  "closed_session": {
+    "pid": 21808,
+    "launched": true,
+    "assigned_before_resume": true,
+    "elapsed_seconds": 183.563,
+    "exit_code": 1,
+    "stop_reasons": [
+      "Owned operator stop trigger",
+      "Owned operator stop trigger"
+    ],
+    "owned_job_active_processes": 0,
+    "remaining_forza": [],
+    "source_profile_unchanged": true,
+    "source_cache_unchanged": true,
+    "shared_game_data_unchanged": true,
+    "runtime_inputs_unchanged": true,
+    "original_user_save_used": false
+  },
+  "single_question": "Can the replacement SDK render with HDR off and survive ordinary pause/resume?",
+  "intended_but_not_observed": "Garage/ordinary free-roam; source seed instead entered opening Viper/Flynt sequence",
+  "observations": [
+    "Normal startup movies, title and main menu rendered",
+    "Normal UI entered SinglePlayer and opening Viper/Flynt world sequence",
+    "3D world and HUD rendered",
+    "Return opened pause menu; Space selected Resume; world and HUD returned",
+    "Native pause and resume snapshots visually inspected"
+  ],
+  "controls": "Computer Use @oai/sky only; one action then refresh; no steering/throttle, automatic/helper input or test backdoor",
+  "snapshots": {
+    "forza_shot_0000.14.ppm": "c91de5312dc7b2168136c7db8612fc966b23970d40b3ed74c6a601886e338f2e",
+    "forza_shot_0143.39.ppm": "7309dd53058f0e49ea604733c7faa0be9e885d0ce388b885b2f9c4ecf8195a22",
+    "forza_shot_0164.39.ppm": "b095fa3cf041fd8a03d401ebaf5bf0640f19fa5c4d5bdeb117eb8eb1086d9d6c",
+    "forza_shot_0173.06.ppm": "ff08b85b1737f987647b178c0f32416177c72801b49fb30515a3ebc44a616294"
+  },
+  "log_error_lines": [
+    "[2026-10-28 18:37:14.635] [error] [fs] [t33944] ResolvePath(\\Device) failed - device not found",
+    "[2026-10-28 18:37:15.210] [error] [krnl] [t33944] XMsgStartIORequestEx: app 000000F1 undefined"
+  ],
+  "native_fault_device_loss_or_fatal_log_matches": [],
+  "limits": [
+    "Limited HDR-off startup/world/pause-resume witness, not garage/free-roam qualification",
+    "No trace witness; no final scene acquisition policy changed",
+    "HDR mapping, overlay coverage, exact-copy transfer and hot-toggle transitions not qualified",
+    "No VR or game PR493 AI/presentation qualification; host is prior main",
+    "Actual HDR qualification requires HDR-capable display with Windows HDR enabled, confirmed scRGB selection and new calibrated readbacks",
+    "No all-Pinyon-removal or legal-clearance claim; all notices and game SDK pin retained"
+  ]
+}
