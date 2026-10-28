@@ -22,6 +22,7 @@ review and replacement. Historical source in the game repository is separate.
 | `src/graphics/shaders/hdr_hud_mask.cs.glsl` | New shared-memory tile implementation: each workgroup loads an 18x10 image tile, then performs 3x3 dilation from shared memory. Channel permutations are compared without sorting. |
 | `src/ui/shaders/vulkan_spirv/hdr_output_ps.h`, `hdr_ui_mask_ps.h`, `src/graphics/shaders/vulkan_spirv/hdr_hud_mask_cs.h` | Regenerated from the replacement shader sources; no retained binary from the former shaders. |
 | `include/rex/ui/vulkan/hdr_format.h`, `hdr_output_pass.h` | New exact format/color-space selection, output render-pass construction, shader module setup and command recording. |
+| `include/rex/ui/vulkan/image_compute_transaction.h`, `image_compute.h` | New transactional compute-effect factory shared by HDR coverage and the VR HUD setup. Failure releases all partial handles; frame descriptors are published together. |
 | `include/rex/ui/vulkan/hdr_surface.h` | New move-only owner for per-image HDR resources. Partial construction cleans itself up. |
 | `include/rex/ui/vulkan/presenter.h`, `src/ui/vulkan/vulkan_presenter.cpp` | Replace per-image allocation/cleanup with the resource owner and batch descriptor allocation; publish frame resources only after all allocations succeed. Replace HDR settings packing. Other HDR presenter portions remain adapted. |
 
@@ -38,6 +39,7 @@ Windows clang 23.1.3 standalone tests, C++20 with `-Wall -Wextra -Werror`:
   inverse/tiled viewport identity and invalid settings.
 - `spirv_contraction_test`: annotation removal with operations preserved,
   idempotence, excluded stages/depth/exports, malformed input without mutation.
+- `image_compute_test`: injects failure at all five creation stages, checks no leaked handles, descriptor budgets, ownership transfer and invalid-input rejection without a Vulkan device.
 - `hdr_color_test`: every 8-bit sRGB round trip, gamma conversion, bounded
   monotonic highlight output, paper-white HUD and disabled expansion.
 - `hdr_shader_contract_test`: reflects the three generated SPIR-V binaries to
@@ -70,3 +72,7 @@ glslangValidator -V -S frag --vn hdr_output_ps src/ui/shaders/hdr_output.ps.glsl
 glslangValidator -V -S frag --vn hdr_ui_mask_ps src/ui/shaders/hdr_ui_mask.ps.glsl -o src/ui/shaders/vulkan_spirv/hdr_ui_mask_ps.h
 glslangValidator -V -S comp --vn hdr_hud_mask_cs src/graphics/shaders/hdr_hud_mask.cs.glsl -o src/graphics/shaders/vulkan_spirv/hdr_hud_mask_cs.h
 ```
+
+The subsequent compute-resource replacement passes the production Vulkan command
+processor syntax check and the failure-injection test. It has not yet been
+linked into the private validation DLLs above.

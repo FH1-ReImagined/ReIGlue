@@ -39,6 +39,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/util/fh1_hud.h>
 #include <rex/graphics/util/presentation_transform.h>
+#include <rex/ui/vulkan/image_compute.h>
 #include "fh1_device_memory.h"
 #include "fh1_render_target_trim.h"
 #include "fh1_pipeline_lookahead.h"
@@ -3282,76 +3283,23 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 }
 
 bool VulkanCommandProcessor::EnsureSwapHudMask() {
-  if (swap_hud_mask_pipeline_ != VK_NULL_HANDLE)
-    return true;
-  if (swap_hud_mask_failed_)
-    return false;
+  if (swap_hud_mask_pipeline_) return true;
+  if (swap_hud_mask_failed_) return false;
   swap_hud_mask_failed_ = true;
-  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  VkDescriptorSetLayoutBinding bindings[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
-    bindings[i].binding = i;
-    bindings[i].descriptorType =
-        i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    bindings[i].descriptorCount = 1;
-    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  }
-  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
-  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 3;
-  set_layout_info.pBindings = bindings;
-  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
-                                      &swap_hud_mask_set_layout_) != VK_SUCCESS) {
-    REXGPU_WARN("Failed to create the HDR HUD mask descriptor set layout");
+  const std::array signature{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+  auto objects = ui::vulkan::ImageComputeObjects::Create(*GetVulkanDevice(), shaders::hdr_hud_mask_cs,
+      signature, kMaxFramesInFlight, sizeof(uint32_t) * 2, ui::vulkan::BuildImageComputePipeline);
+  if (!objects) {
+    REXGPU_WARN("HDR coverage pipeline construction failed; retaining paper-white output");
     return false;
   }
-  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 2};
-  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
-  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  pipeline_layout_info.setLayoutCount = 1;
-  pipeline_layout_info.pSetLayouts = &swap_hud_mask_set_layout_;
-  pipeline_layout_info.pushConstantRangeCount = 1;
-  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
-  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
-                                 &swap_hud_mask_pipeline_layout_) != VK_SUCCESS) {
-    REXGPU_WARN("Failed to create the HDR HUD mask pipeline layout");
-    return false;
-  }
-  VkDescriptorPoolSize pool_sizes[2] = {
-      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * kMaxFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight},
-  };
-  VkDescriptorPoolCreateInfo pool_info = {};
-  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pool_info.maxSets = kMaxFramesInFlight;
-  pool_info.poolSizeCount = 2;
-  pool_info.pPoolSizes = pool_sizes;
-  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &swap_hud_mask_descriptor_pool_) !=
-      VK_SUCCESS) {
-    REXGPU_WARN("Failed to create the HDR HUD mask descriptor pool");
-    return false;
-  }
-  std::array<VkDescriptorSetLayout, kMaxFramesInFlight> set_layouts;
-  set_layouts.fill(swap_hud_mask_set_layout_);
-  VkDescriptorSetAllocateInfo set_info = {};
-  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  set_info.descriptorPool = swap_hud_mask_descriptor_pool_;
-  set_info.descriptorSetCount = kMaxFramesInFlight;
-  set_info.pSetLayouts = set_layouts.data();
-  if (dfn.vkAllocateDescriptorSets(device, &set_info, swap_hud_mask_descriptor_sets_.data()) !=
-      VK_SUCCESS) {
-    REXGPU_WARN("Failed to allocate the HDR HUD mask descriptor sets");
-    return false;
-  }
-  swap_hud_mask_pipeline_ = ui::vulkan::util::CreateComputePipeline(
-      vulkan_device, swap_hud_mask_pipeline_layout_, shaders::hdr_hud_mask_cs,
-      sizeof(shaders::hdr_hud_mask_cs));
-  if (swap_hud_mask_pipeline_ == VK_NULL_HANDLE) {
-    REXGPU_WARN("Failed to create the HDR HUD mask pipeline");
-    return false;
-  }
+  swap_hud_mask_set_layout_ = objects->set_layout;
+  swap_hud_mask_pipeline_layout_ = objects->layout;
+  swap_hud_mask_descriptor_pool_ = objects->pool;
+  swap_hud_mask_pipeline_ = objects->pipeline;
+  std::copy(objects->sets.begin(), objects->sets.end(), swap_hud_mask_descriptor_sets_.begin());
+  objects->Release();
   swap_hud_mask_failed_ = false;
   return true;
 }
@@ -3527,86 +3475,45 @@ bool VulkanCommandProcessor::Fh1VrLayersWanted() const {
 }
 
 bool VulkanCommandProcessor::Fh1VrEnsurePipelines() {
-  if (fh1_vr_hud_pipeline_ != VK_NULL_HANDLE) return true;
+  if (fh1_vr_hud_pipeline_) return true;
   if (fh1_vr_failed_) return false;
   fh1_vr_failed_ = true;
-  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  VkDescriptorSetLayoutBinding bindings[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
-    bindings[i].binding = i;
-    bindings[i].descriptorType =
-        i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    bindings[i].descriptorCount = 1;
-    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  }
-  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
-  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 3;
-  set_layout_info.pBindings = bindings;
-  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
-                                      &fh1_vr_hud_set_layout_) != VK_SUCCESS) {
-    REXGPU_WARN("VR layers: no descriptor set layout; off");
-    return false;
-  }
-  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 4};
-  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
-  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  pipeline_layout_info.setLayoutCount = 1;
-  pipeline_layout_info.pSetLayouts = &fh1_vr_hud_set_layout_;
-  pipeline_layout_info.pushConstantRangeCount = 1;
-  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
-  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
-                                 &fh1_vr_hud_pipeline_layout_) != VK_SUCCESS) {
-    REXGPU_WARN("VR layers: no pipeline layout; off");
-    return false;
-  }
-  VkDescriptorPoolSize pool_sizes[2] = {
-      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * kMaxFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kMaxFramesInFlight},
-  };
-  VkDescriptorPoolCreateInfo pool_info = {};
-  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pool_info.maxSets = 3 * kMaxFramesInFlight;
-  pool_info.poolSizeCount = 2;
-  pool_info.pPoolSizes = pool_sizes;
-  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &fh1_vr_descriptor_pool_) !=
-      VK_SUCCESS) {
-    REXGPU_WARN("VR layers: no descriptor pool; off");
-    return false;
-  }
-  auto allocate = [&](VkDescriptorSetLayout layout,
-                      std::array<VkDescriptorSet, kMaxFramesInFlight>& sets) {
-    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts;
-    layouts.fill(layout);
-    VkDescriptorSetAllocateInfo set_info = {};
-    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    set_info.descriptorPool = fh1_vr_descriptor_pool_;
-    set_info.descriptorSetCount = kMaxFramesInFlight;
-    set_info.pSetLayouts = layouts.data();
-    return dfn.vkAllocateDescriptorSets(device, &set_info, sets.data()) == VK_SUCCESS;
-  };
-  if (!allocate(swap_descriptor_set_layout_sampled_image_, fh1_vr_gamma_source_sets_) ||
-      !allocate(swap_descriptor_set_layout_storage_image_, fh1_vr_gamma_destination_sets_) ||
-      !allocate(fh1_vr_hud_set_layout_, fh1_vr_hud_sets_)) {
-    REXGPU_WARN("VR layers: no descriptor sets; off");
-    return false;
-  }
-  std::vector<uint32_t> spirv;
+  std::vector<uint32_t> shader;
   std::string error;
-  if (!CompileFh1Compute(kFh1VrHudShader, spirv, error)) {
-    REXGPU_WARN("VR layers: the HUD shader did not compile ({}); off", error);
+  if (!CompileFh1Compute(kFh1VrHudShader, shader, error)) {
+    REXGPU_WARN("VR HUD shader compilation failed: {}", error);
     return false;
   }
-  fh1_vr_hud_pipeline_ = ui::vulkan::util::CreateComputePipeline(
-      vulkan_device, fh1_vr_hud_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
-  if (fh1_vr_hud_pipeline_ == VK_NULL_HANDLE) {
-    REXGPU_WARN("VR layers: no HUD pipeline; off");
+  const auto& device = *GetVulkanDevice();
+  const std::array signature{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+  // The gamma conversion uses one sampled and one storage descriptor set per
+  // frame, in addition to the three-image HUD separation effect.
+  const std::array extra{
+      VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
+      VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight}};
+  auto objects = ui::vulkan::ImageComputeObjects::Create(device, shader, signature,
+      kMaxFramesInFlight, sizeof(uint32_t) * 4, ui::vulkan::BuildImageComputePipeline,
+      2 * kMaxFramesInFlight, extra);
+  std::array<VkDescriptorSet, kMaxFramesInFlight> gamma_sources{}, gamma_destinations{};
+  if (!objects ||
+      !ui::vulkan::AllocateImageSets(device, objects->pool, swap_descriptor_set_layout_sampled_image_,
+                                    gamma_sources) ||
+      !ui::vulkan::AllocateImageSets(device, objects->pool, swap_descriptor_set_layout_storage_image_,
+                                    gamma_destinations)) {
+    REXGPU_WARN("VR HUD effect allocation failed");
     return false;
   }
+  fh1_vr_gamma_source_sets_ = gamma_sources;
+  fh1_vr_gamma_destination_sets_ = gamma_destinations;
+  fh1_vr_hud_set_layout_ = objects->set_layout;
+  fh1_vr_hud_pipeline_layout_ = objects->layout;
+  fh1_vr_descriptor_pool_ = objects->pool;
+  fh1_vr_hud_pipeline_ = objects->pipeline;
+  std::copy(objects->sets.begin(), objects->sets.end(), fh1_vr_hud_sets_.begin());
+  objects->Release();
   fh1_vr_failed_ = false;
-  REXGPU_INFO("VR layers: on (the scene before the HUD and the HUD alone, for the OpenXR client)");
+  REXGPU_INFO("VR HUD separation effect initialized");
   return true;
 }
 
@@ -5336,32 +5243,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
             SubmitBarriers(true);
-            VkDescriptorSet hud_mask_set = swap_hud_mask_descriptor_sets_[swap_frame_index];
-            VkDescriptorImageInfo hud_mask_image_infos[3] = {
-                {VK_NULL_HANDLE, swap_texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                {VK_NULL_HANDLE, vulkan_context.image_view(), VK_IMAGE_LAYOUT_GENERAL},
-            };
-            VkWriteDescriptorSet hud_mask_writes[3] = {};
-            for (uint32_t i = 0; i < 3; ++i) {
-              hud_mask_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-              hud_mask_writes[i].dstSet = hud_mask_set;
-              hud_mask_writes[i].dstBinding = i;
-              hud_mask_writes[i].descriptorCount = 1;
-              hud_mask_writes[i].descriptorType =
-                  i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-              hud_mask_writes[i].pImageInfo = &hud_mask_image_infos[i];
-            }
-            dfn.vkUpdateDescriptorSets(device, 3, hud_mask_writes, 0, nullptr);
-            deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                             swap_hud_mask_pipeline_layout_, 0, 1,
-                                                             &hud_mask_set, 0, nullptr);
-            const uint32_t hud_mask_size[2] = {guest_output_width, guest_output_height};
-            deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
-                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                                        sizeof(hud_mask_size), hud_mask_size);
+            const auto set = swap_hud_mask_descriptor_sets_[swap_frame_index];
+            const std::array images{
+                ui::vulkan::ComputeImageBinding{swap_texture_view, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                ui::vulkan::ComputeImageBinding{hud_snapshot_view, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                ui::vulkan::ComputeImageBinding{vulkan_context.image_view(), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                VK_IMAGE_LAYOUT_GENERAL}};
+            ui::vulkan::WriteComputeImages(*GetVulkanDevice(), set, images);
             BindExternalComputePipeline(swap_hud_mask_pipeline_);
-            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            ui::vulkan::RecordCoverageDispatch(deferred_command_buffer_, swap_hud_mask_pipeline_layout_,
+                set, guest_output_width, guest_output_height);
           }
 
           if (vr_snapshot_view != VK_NULL_HANDLE) {
