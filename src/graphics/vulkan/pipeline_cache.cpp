@@ -4273,9 +4273,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   } else {
     creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
     if (was_placeholder && old_pipeline != VK_NULL_HANDLE) {
-      std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
-      deferred_destroy_pipelines_.emplace_back(command_processor_.GetCurrentSubmission(),
-                                               old_pipeline);
+      deferred_destroy_pipelines_.Retire(old_pipeline);
     }
   }
 
@@ -4365,26 +4363,12 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
 }
 
 void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
-  std::vector<VkPipeline> pipelines_to_destroy;
-  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
-  {
-    std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
-    if (deferred_destroy_pipelines_.empty()) {
-      return;
-    }
-    auto it = deferred_destroy_pipelines_.begin();
-    while (it != deferred_destroy_pipelines_.end()) {
-      if (force_all || it->first <= completed_submission) {
-        pipelines_to_destroy.push_back(it->second);
-        it = deferred_destroy_pipelines_.erase(it);
-      } else if (!force_all) {
-        // The queue is sorted by submission index.
-        break;
-      } else {
-        ++it;
-      }
-    }
-  }
+  // Workers may finish after EndSubmission's bounded wait. Only the command
+  // processor may read its fence bookkeeping; tagging here also covers draws
+  // that kept using a placeholder while creation spanned multiple submissions.
+  auto pipelines_to_destroy = deferred_destroy_pipelines_.Collect(
+      command_processor_.GetCurrentSubmission(), command_processor_.GetCompletedSubmission(),
+      force_all);
   if (pipelines_to_destroy.empty()) {
     return;
   }
