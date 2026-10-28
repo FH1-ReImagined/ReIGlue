@@ -30,6 +30,10 @@
 // - vmaxfp, vminfp, vmsum3fp128 and vmsum4fp128: below.
 //=============================================================================
 
+#include <bit>
+#include <cmath>
+#include <cstdint>
+
 #if defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64)
 #include <simde/x86/fma.h>
 #endif
