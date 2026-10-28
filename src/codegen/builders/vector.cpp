@@ -30,16 +30,6 @@ namespace rex::codegen {
 // This file uses several magic constants from Intel SSE/SSE4 intrinsics.
 // Here are the key constants and their meanings:
 //
-// === Dot Product Masks (simde_mm_dp_ps) ===
-// The mask byte controls which elements participate in the dot product and
-// where the result is broadcast. Format: 0bAAAABBBB
-//   High nibble (AAAA): Which source elements to multiply (bit 7=x, 6=y, 5=z, 4=w)
-//   Low nibble (BBBB):  Which destination elements receive the result
-//
-// 0xEF = 0b11101111: Dot product of elements y,z,w (bits 765 set), result to all (bits 3210 set)
-//        This computes dot(yzw) due to guest->host vector element reversal.
-// 0xFF = 0b11111111: Full 4-element dot product, result broadcast to all elements
-//
 // === Floating-Point Sign Bit ===
 // 0x80000000: IEEE 754 sign bit mask for 32-bit float
 //             Used for negation via XOR and sign extraction
@@ -192,53 +182,16 @@ bool build_vlogefp(BuilderContext& ctx) {
 // Vector Dot Products
 //=============================================================================
 
-// Xenon's dot products return QNaN where the sum of finite inputs overflows; dpps gives an
-// infinity there (or NaN, when products overflow both ways). The dpps result is kept when it
-// is finite, which is one well-predicted branch on its exponent. Otherwise the sum is redone
-// as Xenia's x64 backend does (DOT_PRODUCT_3/4): float64 products and sums in its order,
-// (x + z) + y or (x + z) + (y + w), rounded to float32; a float32 overflow of that finite sum
-// is QNaN 0x7FC00000, and an infinity or NaN that came from the inputs is kept. Host lanes
-// 3..0 hold the guest's x, y, z, w.
-static void emit_dot_product(BuilderContext& ctx, const char* mask, bool four) {
-  auto vD = ctx.v(ctx.insn.operands[0]);
-  auto vA = ctx.v(ctx.insn.operands[1]);
-  auto vB = ctx.v(ctx.insn.operands[2]);
-  ctx.emit_set_flush_mode(true);
-  ctx.println("\t{{");
-  ctx.println(
-      "\t\tsimde__m128 d = simde_mm_dp_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), "
-      "{});",
-      vA, vB, mask);
-  ctx.println(
-      "\t\tif ((uint32_t(simde_mm_cvtsi128_si32(simde_mm_castps_si128(d))) << 1) >= "
-      "0xFF000000u) [[unlikely]] {{");
-  ctx.println("\t\t\tdouble s = double({0}.f32[3]) * {1}.f32[3] + double({0}.f32[1]) * {1}.f32[1];",
-              vA, vB);
-  if (four) {
-    ctx.println("\t\t\ts += double({0}.f32[2]) * {1}.f32[2] + double({0}.f32[0]) * {1}.f32[0];", vA,
-                vB);
-  } else {
-    ctx.println("\t\t\ts += double({0}.f32[2]) * {1}.f32[2];", vA, vB);
-  }
-  ctx.println("\t\t\tfloat f = float(s);");
-  ctx.println(
-      "\t\t\td = std::isinf(f) && std::isfinite(s) ? "
-      "simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7FC00000)) : simde_mm_set1_ps(f);");
-  ctx.println("\t\t}}");
-  ctx.println("\t\tsimde_mm_store_ps({}.f32, d);", vD);
-  ctx.println("\t}}");
-}
-
+// vmsum3fp128 and vmsum4fp128: float64 products summed in Xenon's order, (x + z) + y or
+// (x + z) + (y + w), and rounded once to float32, with QNaN where finite inputs overflow
+// float32 (0025).
 bool build_vmsum3fp128(BuilderContext& ctx) {
-  // 3-element dot product accounting for guest->host vector element reversal
-  // 0xEF = dot(yzw) with result broadcast to all elements (see constants doc)
-  emit_dot_product(ctx, "0xEF", false);
+  emit_vec_fp_helper(ctx, "ppc_vmsum3fp128");
   return true;
 }
 
 bool build_vmsum4fp128(BuilderContext& ctx) {
-  // 4-element dot product: 0xFF = all 4 elements, result to all (see constants doc)
-  emit_dot_product(ctx, "0xFF", true);
+  emit_vec_fp_helper(ctx, "ppc_vmsum4fp128");
   return true;
 }
 

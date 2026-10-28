@@ -20,8 +20,9 @@ xenia-canary
   BSD 3-Clause License (the Xenia terms in LICENSE). PPC instruction tests in
   tests/ppc/asm from its src/xenia/cpu/ppc/testing (commit 48b318a2ad):
   instr_vmaddfp.s, instr_vmaddfp128.s, instr_vmaddcfp128.s, instr_vnmsubfp.s
-  and instr_vnmsubfp128.s as they are there, and cases it recorded on an Xbox
-  360, unchanged subsets of its instr__gen_*.s files (the *_hw.s files).
+  and instr_vnmsubfp128.s as they are there, the first three cases of
+  instr_vmsum3fp128.s and instr_vmsum4fp128.s, and cases it recorded on an
+  Xbox 360, unchanged subsets of its instr__gen_*.s files (the *_hw.s files).
 
 Pinyon Shift
   https://github.com/arcanite24/pinyon-shift
@@ -32,8 +33,9 @@ Pinyon Shift
   presenter, highlight curve and HUD coverage shaders (0091), the contraction
   part of its macOS pixel-math tuning (0082), and from ShiftGlue the vector
   float instructions as the Xbox 360 computes them, checked against
-  xenia-canary's cases: a fused vmaddfp and vnmsubfp (0400), and vmaxfp and
-  vminfp with its NaN, zero and denormal rules (0401).
+  xenia-canary's cases: a fused vmaddfp and vnmsubfp (0400), vmaxfp and
+  vminfp with its NaN, zero and denormal rules (0401), and vmsum3fp128 and
+  vmsum4fp128 summed in float64 in vectors (0402).
 
 Downloaded at configure time, not stored in this repository (pinned revisions,
 SHA-256 checked; each license is installed beside the GPU library):

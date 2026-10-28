@@ -2,8 +2,8 @@
 // Vector Float Instructions as Xenon Computes Them
 //
 // The VMX instructions whose plain SSE form gives other bits than the Xbox 360,
-// with the rules xenia-canary's hardware-recorded tests show (ReIGlue 0400,
-// 0401):
+// with the rules xenia-canary's hardware-recorded tests show (ReIGlue 0400 to
+// 0402):
 //
 // - vmaddfp and vnmsubfp (and vmaddfp128, vmaddcfp128, vnmsubfp128) round once:
 //   the product is not rounded before the add. Built with FMA (-mfma,
@@ -17,7 +17,7 @@
 //   vC, quieted; a NaN from an invalid operation (infinity times zero,
 //   infinity minus infinity) is 0x7FC00000. x86 gives 0xFFC00000 there and
 //   picks a NaN operand by position, so NaN lanes are redone out of line.
-// - vmaxfp and vminfp: below.
+// - vmaxfp, vminfp, vmsum3fp128 and vmsum4fp128: below.
 //=============================================================================
 
 #if defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64)
@@ -170,4 +170,42 @@ inline simde__m128 ppc_vminfp(simde__m128 a, simde__m128 b) {
     r = ppc_vnan2(r, a, b);
   }
   return r;
+}
+
+// vmsum3fp128 and vmsum4fp128: each product of two floats is exact in float64,
+// summed in the order Xenia's x64 backend uses and matched to the console
+// (DOT_PRODUCT_3/4), (x + z) + y or (x + z) + (y + w): each sum rounded to
+// float64, the total rounded once to float32, in all four lanes.
+// Where finite inputs overflow float32 the result is QNaN 0x7FC00000 (0025);
+// an infinity or NaN from the inputs is kept, and a denormal result is its
+// signed zero. Guest x, y, z and w are host lanes 3, 2, 1 and 0; denormal
+// inputs are zeros through DAZ, which the conversion to float64 obeys.
+inline simde__m128d ppc_vmsum_pairs(simde__m128 a, simde__m128 b, simde__m128d& yx) {
+  const simde__m128d wz = simde_mm_mul_pd(simde_mm_cvtps_pd(a), simde_mm_cvtps_pd(b));
+  yx = simde_mm_mul_pd(simde_mm_cvtps_pd(simde_mm_movehl_ps(a, a)),
+                       simde_mm_cvtps_pd(simde_mm_movehl_ps(b, b)));
+  return simde_mm_add_pd(yx, wz);  // {y + w, x + z}
+}
+
+inline simde__m128 ppc_vmsum_result(simde__m128d sum) {
+  const simde__m128 narrow = simde_mm_cvtsd_ss(simde_mm_castpd_ps(sum), sum);
+  uint32_t bits = uint32_t(simde_mm_cvtsi128_si32(simde_mm_castps_si128(narrow)));
+  if ((bits & 0x7F800000u) == 0) {
+    bits &= 0x80000000u;
+  } else if ((bits << 1) >= 0xFF000000u && std::isfinite(simde_mm_cvtsd_f64(sum))) [[unlikely]] {
+    bits = 0x7FC00000u;
+  }
+  return simde_mm_castsi128_ps(simde_mm_set1_epi32(int(bits)));
+}
+
+inline simde__m128 ppc_vmsum3fp128(simde__m128 a, simde__m128 b) {
+  simde__m128d yx;
+  const simde__m128d pairs = ppc_vmsum_pairs(a, b, yx);
+  return ppc_vmsum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), yx));
+}
+
+inline simde__m128 ppc_vmsum4fp128(simde__m128 a, simde__m128 b) {
+  simde__m128d yx;
+  const simde__m128d pairs = ppc_vmsum_pairs(a, b, yx);
+  return ppc_vmsum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), pairs));
 }
