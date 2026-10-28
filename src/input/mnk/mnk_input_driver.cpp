@@ -532,6 +532,9 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   std::lock_guard lock(state_mutex_);
 
+  // These bit indices follow PadBinds(): A..RB = 0..5, triggers = 6..7,
+  // stick clicks/Back/Start/D-pad = 8..15. Keep this mapping and DigitalTaps'
+  // digital-only mask in sync if that table is reordered; axes stay live.
   const auto binds = PadBinds();
   uint32_t live_binds = 0;
   for (size_t i = 0; i < binds.size(); ++i) {
