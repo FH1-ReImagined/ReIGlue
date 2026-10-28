@@ -186,11 +186,73 @@ inline simde__m128 ppc_vminfp(simde__m128 a, simde__m128 b) {
 // vmsum3fp128 and vmsum4fp128: each product of two floats is exact in float64,
 // summed in the order Xenia's x64 backend uses and matched to the console
 // (DOT_PRODUCT_3/4), (x + z) + y or (x + z) + (y + w): each sum rounded to
-// float64, the total rounded once to float32, in all four lanes.
-// Where finite inputs overflow float32 the result is QNaN 0x7FC00000 (0025);
-// an infinity or NaN from the inputs is kept, and a denormal result is its
-// signed zero. Guest x, y, z and w are host lanes 3, 2, 1 and 0; denormal
-// inputs are zeros through DAZ, which the conversion to float64 obeys.
+// float64, the total rounded once to float32, to nearest, in all four lanes.
+// Guest x, y, z and w are host lanes 3, 2, 1 and 0. As in Xenia, denormal
+// inputs and a denormal result are zeros through the flush mode the generated
+// code sets before every vector float instruction (DAZ and FTZ on x86, FZ on
+// ARM64). The narrowing is a plain conversion (cvtsd2ss, fcvt): simde's
+// cvtsd_ss is fcvtxn on ARM64, which rounds to odd and never overflows.
+//
+// A result that is not finite is redone from the inputs by ppc_vmsum_special,
+// in the order of Xenia's sequence, so that it does not depend on the host or
+// on the order the compiler gives the commutative operations: the first NaN
+// operand of each step goes through, quieted (vA's before vB's in a product, x
+// before z, (x + z) before y or (y + w), y before w); a NaN a step makes
+// (infinity times zero, infinity minus infinity) is Xenon's default QNaN
+// 0x7FC00000, as its invalid operations give in xenia-canary's recorded
+// vrsqrtefp cases (x86 makes 0xFFC00000); finite inputs that overflow float32
+// give 0x7FC00000 too (0025), and an infinity from the inputs is kept. The
+// common path has one branch, on the narrowed result, and no general-purpose
+// register round trip for the result.
+[[gnu::noinline, gnu::cold, gnu::const]] inline uint32_t ppc_vmsum_special(simde__m128 a,
+                                                                         simde__m128 b,
+                                                                         bool four) {
+  alignas(16) uint32_t av[4], bv[4];
+  simde_mm_store_si128(reinterpret_cast<simde__m128i*>(av), simde_mm_castps_si128(a));
+  simde_mm_store_si128(reinterpret_cast<simde__m128i*>(bv), simde_mm_castps_si128(b));
+  struct Term {
+    double value;
+    uint32_t nan;  // the result's bits when it is a NaN, else 0
+  };
+  const auto is_nan = [](uint32_t x) { return (x & 0x7FFFFFFFu) > 0x7F800000u; };
+  const auto value = [](uint32_t x) {
+    if ((x & 0x7F800000u) == 0) {
+      x &= 0x80000000u;  // a denormal input is a signed zero
+    }
+    return double(std::bit_cast<float>(x));
+  };
+  const auto product = [&](int lane) -> Term {
+    if (is_nan(av[lane])) {
+      return {0.0, av[lane] | 0x00400000u};
+    }
+    if (is_nan(bv[lane])) {
+      return {0.0, bv[lane] | 0x00400000u};
+    }
+    const double p = value(av[lane]) * value(bv[lane]);
+    return p != p ? Term{0.0, 0x7FC00000u} : Term{p, 0};
+  };
+  const auto add = [](Term x, Term y) -> Term {
+    if (x.nan) {
+      return x;
+    }
+    if (y.nan) {
+      return y;
+    }
+    const double s = x.value + y.value;
+    return s != s ? Term{0.0, 0x7FC00000u} : Term{s, 0};
+  };
+  const Term xz = add(product(3), product(1));
+  const Term total = four ? add(xz, add(product(2), product(0))) : add(xz, product(2));
+  if (total.nan) {
+    return total.nan;
+  }
+  const float narrow = float(total.value);
+  if (std::isinf(narrow) && std::isfinite(total.value)) {
+    return 0x7FC00000u;
+  }
+  return std::bit_cast<uint32_t>(narrow);
+}
+
 inline simde__m128d ppc_vmsum_pairs(simde__m128 a, simde__m128 b, simde__m128d& yx) {
   const simde__m128d wz = simde_mm_mul_pd(simde_mm_cvtps_pd(a), simde_mm_cvtps_pd(b));
   yx = simde_mm_mul_pd(simde_mm_cvtps_pd(simde_mm_movehl_ps(a, a)),
@@ -198,25 +260,22 @@ inline simde__m128d ppc_vmsum_pairs(simde__m128 a, simde__m128 b, simde__m128d& 
   return simde_mm_add_pd(yx, wz);  // {y + w, x + z}
 }
 
-inline simde__m128 ppc_vmsum_result(simde__m128d sum) {
-  const simde__m128 narrow = simde_mm_cvtsd_ss(simde_mm_castpd_ps(sum), sum);
-  uint32_t bits = uint32_t(simde_mm_cvtsi128_si32(simde_mm_castps_si128(narrow)));
-  if ((bits & 0x7F800000u) == 0) {
-    bits &= 0x80000000u;
-  } else if ((bits << 1) >= 0xFF000000u && std::isfinite(simde_mm_cvtsd_f64(sum))) [[unlikely]] {
-    bits = 0x7FC00000u;
+inline simde__m128 ppc_vmsum_result(simde__m128d sum, simde__m128 a, simde__m128 b, bool four) {
+  const float narrow = float(simde_mm_cvtsd_f64(sum));
+  if ((std::bit_cast<uint32_t>(narrow) << 1) >= 0xFF000000u) [[unlikely]] {
+    return simde_mm_castsi128_ps(simde_mm_set1_epi32(int(ppc_vmsum_special(a, b, four))));
   }
-  return simde_mm_castsi128_ps(simde_mm_set1_epi32(int(bits)));
+  return simde_mm_set1_ps(narrow);
 }
 
 inline simde__m128 ppc_vmsum3fp128(simde__m128 a, simde__m128 b) {
   simde__m128d yx;
   const simde__m128d pairs = ppc_vmsum_pairs(a, b, yx);
-  return ppc_vmsum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), yx));
+  return ppc_vmsum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), yx), a, b, false);
 }
 
 inline simde__m128 ppc_vmsum4fp128(simde__m128 a, simde__m128 b) {
   simde__m128d yx;
   const simde__m128d pairs = ppc_vmsum_pairs(a, b, yx);
-  return ppc_vmsum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), pairs));
+  return ppc_vmsum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), pairs), a, b, true);
 }
