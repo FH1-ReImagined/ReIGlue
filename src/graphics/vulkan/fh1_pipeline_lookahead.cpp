@@ -602,11 +602,15 @@ void LogSummary() {
   REXGPU_INFO(
       "Pipelines: {} built, {} of them ahead of their draws ({} drawn with so far, {} failed), "
       "{} placeholders; {} draws skipped and {} of {} frames not shown while pipelines were "
-      "built ({} shown without them); lookahead: {} walks ({}), {} packets, {} draws, {} queued, "
-      "{} unmet waits, {:.1f} ms; {} waits {:.1f} ms",
+      "built ({} of them past the hold for a draw that must not be missing: skipped depth only "
+      "{}, screen passes {}, front buffer or HUD {}, VR stereo {}; {} shown without draws; {} "
+      "copied back for the CPU without draws); lookahead: {} walks ({}), {} packets, {} draws, "
+      "{} queued, {} unmet waits, {:.1f} ms; {} waits {:.1f} ms",
       created, stats.created_ahead.load(std::memory_order_relaxed), stats.drawn_ahead,
       stats.failed_ahead.load(std::memory_order_relaxed), placeholders, stats.skipped_draws,
-      stats.skipped_frames, stats.frames, stats.incomplete_frames_shown, stats.walks,
+      stats.skipped_frames, stats.frames, stats.held_for_stale_contents, stats.skipped_depth,
+      stats.skipped_screen_passes, stats.skipped_front_buffer, stats.skipped_stereo,
+      stats.incomplete_frames_shown, stats.incomplete_readbacks, stats.walks,
       ends.empty() ? "none" : ends,
       stats.walk_packets, stats.walk_draws, stats.queued_ahead, stats.walk_unmet_waits,
       stats.walk_ms, stats.waits,

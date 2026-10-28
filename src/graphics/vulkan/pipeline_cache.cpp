@@ -74,13 +74,6 @@ REXCVAR_DEFINE_BOOL(vulkan_store_pipeline_cache, true, "GPU/Vulkan",
 // FH1 (#378): fh1_pipeline_lookahead.cpp.
 REXCVAR_DECLARE(bool, vulkan_pipeline_lookahead);
 
-REXCVAR_DEFINE_INT32(vulkan_async_frame_end_wait_ms, 33, "GPU/Vulkan",
-                     "Asynchronous pipeline creation: how long a frame end waits for the "
-                     "pipelines being built, in milliseconds (0: not at all; -1: until all are "
-                     "built, the queued ones on the command processor, however long the driver "
-                     "takes)")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -1251,7 +1244,7 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
   shader_storage_title_id_ = 0;
 }
 
-void VulkanPipelineCache::EndSubmission() {
+double VulkanPipelineCache::EndSubmission(int32_t wait_ms) {
   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
@@ -1267,6 +1260,9 @@ void VulkanPipelineCache::EndSubmission() {
     pipeline_storage_file_flush_needed_ = false;
   }
 
+  // FH1 (#167): the time spent here waiting for pipelines, also in the frame's cost (the
+  // slow-frame report counted it as the command processor being idle).
+  double waited_ms = 0;
   if (!creation_threads_.empty()) {
     bool startup_loading = false;
     {
@@ -1275,15 +1271,16 @@ void VulkanPipelineCache::EndSubmission() {
     }
     if (startup_loading) {
       creation_request_cond_.notify_one();
-    } else if (const int32_t wait_ms = AsyncFrameEndWaitMs(); wait_ms >= 0) {
-      // FH1 (#167): the creation threads go on in the background; the frame end waits for them
-      // for at most wait_ms. Nothing recorded uses a pipeline that is not built yet: a draw that
-      // needs one is skipped (a placeholder, or one being built ahead), and the frame is held
-      // back (IssueSwap). Waiting until all were built stopped the command processor, and with
-      // it the game's render thread and main loop, for as long as the driver took to compile
-      // every pipeline in flight: 0.2-0.4 s per new pipeline on AMD's Windows driver whenever
-      // new cars or materials came into view. A fast driver is mostly done within the wait, so
-      // the next frame still has its pipelines.
+    } else if (wait_ms >= 0) {
+      // FH1 (#167): the creation threads go on in the background; this submission end waits
+      // for them for at most wait_ms, what is left of the frame's budget (the command
+      // processor's Fh1PipelineWaitMs). Nothing recorded uses a pipeline that is not built yet:
+      // a draw that needs one is skipped (a placeholder, or one being built ahead), and the
+      // frame is held back (IssueSwap). Waiting until all were built stopped the command
+      // processor, and with it the game's render thread and main loop, for as long as the
+      // driver took to compile every pipeline in flight: 0.2-0.4 s per new pipeline on AMD's
+      // Windows driver whenever new cars or materials came into view. A fast driver is mostly
+      // done within the wait, so the next frame still has its pipelines.
       bool await_creation_completion_event = false;
       if (wait_ms > 0) {
         std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -1295,10 +1292,12 @@ void VulkanPipelineCache::EndSubmission() {
       }
       creation_request_cond_.notify_all();
       if (await_creation_completion_event) {
+        fh1_frame_cost::Timer cost_timer(waited_ms);
         rex::thread::Wait(creation_completion_event_.get(), false,
                           std::chrono::milliseconds(wait_ms));
       }
     } else {
+      fh1_frame_cost::Timer cost_timer(waited_ms);
       // Help worker threads on the processor thread to reduce warm-up latency.
       CreateQueuedPipelinesOnProcessorThread();
       bool await_creation_completion_event;
@@ -1318,8 +1317,10 @@ void VulkanPipelineCache::EndSubmission() {
       }
     }
   }
+  fh1_frame_cost::Current().pipeline_ms += waited_ms;
 
   ProcessDeferredPipelineDestructions(false);
+  return waited_ms;
 }
 
 void VulkanPipelineCache::Shutdown() {
@@ -1839,18 +1840,6 @@ bool VulkanPipelineCache::ConfigurePipeline(
     *pipeline_handle_out = &pipeline.second;
   }
   return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
-}
-
-int32_t VulkanPipelineCache::AsyncFrameEndWaitMs() const {
-  // Synchronous creation waits until all are built, as before.
-  if (!REXCVAR_GET(async_shader_compilation) || REXCVAR_GET(sync_pipeline_creation)) {
-    return -1;
-  }
-  return std::max(REXCVAR_GET(vulkan_async_frame_end_wait_ms), int32_t(-1));
-}
-
-bool VulkanPipelineCache::WaitsForCreationAtSubmissionEnd() const {
-  return AsyncFrameEndWaitMs() != 0;
 }
 
 bool VulkanPipelineCache::IsCreatingPipelines() const {

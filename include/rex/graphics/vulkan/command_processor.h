@@ -629,9 +629,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
-  // FH1 (#167): whether the last frames used placeholders, and since when (IssueSwap).
+  // FH1 (#167): whether the last frames used placeholders, and since when (IssueSwap); whether
+  // this frame skipped a draw that must not be missing from a shown frame (Fh1SkipMustHoldFrame);
+  // what is left of this frame's wait for pipelines being built (Fh1PipelineWaitMs).
   bool fh1_incomplete_frames_ = false;
   std::chrono::steady_clock::time_point fh1_incomplete_since_{};
+  bool fh1_frame_skipped_critical_ = false;
+  double fh1_pipeline_wait_left_ms_ = 0;
+  bool Fh1SkipMustHoldFrame(bool has_pixel_shader, uint32_t color_mask, uint32_t host_vertex_count);
+  int32_t Fh1PipelineWaitMs() const;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

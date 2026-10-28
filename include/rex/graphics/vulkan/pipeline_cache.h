@@ -78,7 +78,9 @@ class VulkanPipelineCache {
     shader_prebuild_partition_ = partition;
   }
   void ShutdownShaderStorage();
-  void EndSubmission();
+  // FH1 (#167): waits for the pipelines being built for at most wait_ms (0: not at all; -1: until
+  // all are, building the queued ones on the command processor); returns the time waited, in ms.
+  double EndSubmission(int32_t wait_ms = -1);
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                            uint32_t dword_count);
@@ -113,10 +115,6 @@ class VulkanPipelineCache {
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
-  // FH1 (#167): how long EndSubmission waits for the pipelines being built: -1 until all are
-  // (synchronous creation), else vulkan_async_frame_end_wait_ms; and whether it waits at all.
-  int32_t AsyncFrameEndWaitMs() const;
-  bool WaitsForCreationAtSubmissionEnd() const;
   // FH1 (#378): for a draw queued behind the current one (fh1_pipeline_lookahead.cpp), on the
   // command processor thread with the registers as they will be at that draw: translates its
   // shaders and, if its pipeline does not exist yet, hands it to the creation threads, without a

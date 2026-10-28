@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-139 commits: 105 general (Performance 35, Xenos GPU 26, Input 16, Runtime and platform 12, Diagnostics 7, Codegen and build 6, Workarounds and defaults 3) and 34 Forza-specific (Upscaling and HUD 17, VR 8, Game-specific fixes 3, Input 3, Texture packs 2, Shader-hash effects 1).
+140 commits: 105 general (Performance 35, Xenos GPU 26, Input 16, Runtime and platform 12, Diagnostics 7, Codegen and build 6, Workarounds and defaults 3) and 35 Forza-specific (Upscaling and HUD 17, VR 8, Input 4, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147); see the README. Issue numbers
 (`#45`) in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
 

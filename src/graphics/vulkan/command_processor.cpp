@@ -128,7 +128,16 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
 REXCVAR_DEFINE_UINT32(vulkan_async_skip_incomplete_frames_ms, 100, "GPU/Vulkan",
                       "How long vulkan_async_skip_incomplete_frames holds frames back while the "
                       "pipelines they need are built, in milliseconds; after that they are shown "
-                      "without the draws whose pipelines are not ready yet (0: until all are)")
+                      "without the object draws whose pipelines are not ready yet (a frame that "
+                      "misses a full-screen, depth or stencil, front-buffer or HUD draw is held "
+                      "until it is built; 0: every frame until all are)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_async_frame_end_wait_ms, 33, "GPU/Vulkan",
+                     "Asynchronous pipeline creation: how long one frame's submission ends may "
+                     "wait for the pipelines being built, in milliseconds, all of them together "
+                     "(0: not at all; -1: every submission end waits until all are built, the "
+                     "queued ones on the command processor, however long the driver takes)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
@@ -4838,9 +4847,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
-  // FH1 (#167): the pipelines are built in the background across frames now (a frame end waits
-  // for them only briefly, pipeline_cache.cpp), so frames that need one are held back for at most
+  // FH1 (#167): the pipelines are built in the background across frames now (a frame waits for
+  // them only briefly, Fh1PipelineWaitMs), so frames that need one are held back for at most
   // vulkan_async_skip_incomplete_frames_ms, then shown without those draws until it is ready.
+  // Only object draws, though: a frame that skipped a draw whose absence leaves stale contents
+  // (Fh1SkipMustHoldFrame) is held however long the build takes.
+  bool held_for_stale_contents = false;
   if (!frame_used_async_placeholder_pipeline_) {
     fh1_incomplete_frames_ = false;
   } else {
@@ -4852,14 +4864,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     const uint32_t hold_ms = REXCVAR_GET(vulkan_async_skip_incomplete_frames_ms);
     if (skip_present_due_async_placeholder && hold_ms &&
         now - fh1_incomplete_since_ >= std::chrono::milliseconds(hold_ms)) {
-      skip_present_due_async_placeholder = false;
-      ++fh1_pipeline_lookahead::stats.incomplete_frames_shown;
+      if (fh1_frame_skipped_critical_) {
+        held_for_stale_contents = true;
+      } else {
+        skip_present_due_async_placeholder = false;
+      }
     }
   }
   // FH1 (#378): the log's pipeline summary (fh1_pipeline_lookahead.h).
   ++fh1_pipeline_lookahead::stats.frames;
   if (skip_present_due_async_placeholder) {
     ++fh1_pipeline_lookahead::stats.skipped_frames;
+    if (held_for_stale_contents) ++fh1_pipeline_lookahead::stats.held_for_stale_contents;
+  } else if (frame_used_async_placeholder_pipeline_ &&
+             REXCVAR_GET(async_shader_compilation)) {
+    // Shown with draws missing: after the hold, or with vulkan_async_skip_incomplete_frames off.
+    ++fh1_pipeline_lookahead::stats.incomplete_frames_shown;
   }
   fh1_pipeline_lookahead::LogSummary();
   if (skip_present_due_async_placeholder) {
@@ -6979,6 +6999,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
     ++fh1_pipeline_lookahead::stats.skipped_draws;  // FH1 (#378)
+    if (Fh1SkipMustHoldFrame(pixel_shader != nullptr, normalized_color_mask,
+                             primitive_processing_result.host_draw_vertex_count)) {
+      fh1_frame_skipped_critical_ = true;
+    }
     return true;
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
@@ -8085,6 +8109,20 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     fh1_frame_cost::Timer cost_timer(cost.readback_ms);
     ++cost.readbacks;
     cost.readback_bytes += written_length;
+    // FH1 (#167): this resolve is copied back for the CPU (readback_resolve), and draws of this
+    // frame were skipped for pipelines still being built: what the game may read misses them.
+    // Renders made once and kept (a car's picture, its livery, a photo) are made with
+    // sync_pipeline_creation for that. A cold cache's boot and loads copy many first-seen
+    // resolves this way, as before 0364.
+    if (frame_used_async_placeholder_pipeline_ && REXCVAR_GET(async_shader_compilation) &&
+        !REXCVAR_GET(sync_pipeline_creation)) {
+      const uint64_t incomplete = ++fh1_pipeline_lookahead::stats.incomplete_readbacks;
+      if (incomplete <= 10 || incomplete % 100 == 0) {
+        REXGPU_WARN("Pipelines: a resolve copied back for the CPU ({} bytes at {:08X}) missed "
+                    "draws whose pipelines were still being built ({} so far)",
+                    written_length, written_address, incomplete);
+      }
+    }
     VkMappedMemoryRange readback_memory_range = {};
     readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     readback_memory_range.memory = readback.memories[read_index];
@@ -8571,14 +8609,67 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   }
 }
 
+bool VulkanCommandProcessor::Fh1SkipMustHoldFrame(bool has_pixel_shader, uint32_t color_mask,
+                                                  uint32_t host_vertex_count) {
+  // FH1 (#167): a skipped draw whose absence would leave stale or wrong contents on screen, not
+  // just an object missing for a few frames, keeps its frame from being shown past the hold.
+  // The kinds are counted for the pipeline summary line (skipped draws, not frames).
+  auto& stats = fh1_pipeline_lookahead::stats;
+  // VR true stereo: the right eye replays the left eye's draws and may find the pipeline built,
+  // which would show the object in one eye only.
+  if (fh1_stereo_state_ != Fh1StereoState::kOff) {
+    ++stats.skipped_stereo;
+    return true;
+  }
+  // Depth or stencil only (shadow casters, Z, stencil masks): later passes read what it writes.
+  if (!has_pixel_shader || !color_mask) {
+    ++stats.skipped_depth;
+    return true;
+  }
+  // A screen-space pass (a full-screen effect or composite, a movie frame, a HUD element): it
+  // replaces what its target holds instead of adding to it.
+  constexpr uint32_t kScreenPassVertices = 6;
+  if (host_vertex_count <= kScreenPassVertices) {
+    ++stats.skipped_screen_passes;
+    return true;
+  }
+  // The front buffer and UI target (1280 wide, no MSAA, 10-bit color), and the native HUD.
+  const RegisterFile& regs = *register_file_;
+  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+  const auto color = regs.Get<reg::RB_COLOR_INFO>();
+  if (fh1_native_hud_active_ ||
+      (surface.surface_pitch == 1280 && surface.msaa_samples == xenos::MsaaSamples::k1X &&
+       (color.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
+        color.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10))) {
+    ++stats.skipped_front_buffer;
+    return true;
+  }
+  return false;
+}
+
+int32_t VulkanCommandProcessor::Fh1PipelineWaitMs() const {
+  // Synchronous creation (async_shader_compilation off, or sync_pipeline_creation for a render
+  // made once) records draws with the pipelines it waited for: every submission end waits
+  // until all are built, as before.
+  const int32_t budget = REXCVAR_GET(vulkan_async_frame_end_wait_ms);
+  if (!REXCVAR_GET(async_shader_compilation) || REXCVAR_GET(sync_pipeline_creation) ||
+      budget < 0) {
+    return -1;
+  }
+  // FH1 (#167): what is left of the frame's budget (swap to swap), shared by every submission
+  // end of the frame (draw-limit splits, readbacks) and by both pipeline caches.
+  return std::max(int32_t(fh1_pipeline_wait_left_ms_), int32_t(0));
+}
+
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
-  // FH1 (#167): pipelines being built keep the submission open where its end waits for them
-  // (vulkan_async_frame_end_wait_ms 0: never).
-  auto waits = [](const VulkanPipelineCache* cache) {
-    return cache && cache->WaitsForCreationAtSubmissionEnd() && cache->IsCreatingPipelines();
+  // FH1 (#167): pipelines being built keep the submission open where its end would wait for them.
+  const bool waits = Fh1PipelineWaitMs() != 0;
+  auto creating = [](const VulkanPipelineCache* cache) {
+    return cache && cache->IsCreatingPipelines();
   };
-  return !submission_open_ || (!scratch_buffer_used_ && !waits(pipeline_cache_.get()) &&
-                               !waits(fh1_other_pipelines_.get()));
+  return !submission_open_ ||
+         (!scratch_buffer_used_ &&
+          !(waits && (creating(pipeline_cache_.get()) || creating(fh1_other_pipelines_.get()))));
 }
 
 bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
@@ -8684,6 +8775,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     hdr_scene_base_ = UINT32_MAX;
     hdr_capture_attempted_ = false;
     frame_used_async_placeholder_pipeline_ = false;
+    // FH1 (#167): the frame's pipeline wait budget and its skipped draws.
+    fh1_frame_skipped_critical_ = false;
+    fh1_pipeline_wait_left_ms_ = double(std::max(REXCVAR_GET(vulkan_async_frame_end_wait_ms), 0));
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -8836,8 +8930,15 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     EndRenderPass();
 
-    pipeline_cache_->EndSubmission();
-    if (fh1_other_pipelines_) fh1_other_pipelines_->EndSubmission();
+    // FH1 (#167): both caches wait within the frame's one budget.
+    const int32_t pipeline_wait_ms = Fh1PipelineWaitMs();
+    double pipeline_waited_ms = pipeline_cache_->EndSubmission(pipeline_wait_ms);
+    if (fh1_other_pipelines_) {
+      pipeline_waited_ms += fh1_other_pipelines_->EndSubmission(
+          pipeline_wait_ms < 0 ? -1
+                               : std::max(int32_t(pipeline_wait_ms - pipeline_waited_ms), 0));
+    }
+    if (pipeline_wait_ms >= 0) fh1_pipeline_wait_left_ms_ -= pipeline_waited_ms;
 
     render_target_cache_->EndSubmission();
     if (fh1_other_render_targets_) fh1_other_render_targets_->EndSubmission();
