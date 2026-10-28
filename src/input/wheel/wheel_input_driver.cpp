@@ -162,6 +162,11 @@ REXCVAR_DEFINE_INT32(wheel_ffb_min_strength, 0, "Input",
                      "centre), stronger ones play as they are, so a light car still has weight "
                      "(0: off; before wheel_ffb_strength; not the spring, damper or rumble)")
     .range(0, 100);
+REXCVAR_DEFINE_INT32(wheel_shifter_neutral_ms, 400, "Input",
+                     "H-pattern: milliseconds the lever may cross neutral between two gates and "
+                     "still go from one gear to the other, so the game sees an upshift as one "
+                     "(its paddle animation), 0 to 2000; 0: neutral at once")
+    .range(0, 2000);
 REXCVAR_DEFINE_BOOL(wheel_shifter_follow_slot, true, "Input",
                     "H-pattern: the game takes the lever's slot whenever it sets the gear itself "
                     "(race and event starts and finishes), as on the Xbox; false: a gear engages "
@@ -309,10 +314,7 @@ FfStrengths Strengths() {
 
 // The H-pattern gear to report on thumb_rx (wheel_gear_request.h): on lever moves only, or the
 // engaged gear all the time with wheel_shifter_follow_slot. A new request is logged.
-int GearRequestOf(GearRequest& r, int engaged, bool game_read) {
-  const double now_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
+int GearRequestOf(GearRequest& r, int engaged, bool game_read, double now_ms) {
   const int before = r.request;
   const int out =
       GearToReport(r, engaged, now_ms, game_read, REXCVAR_GET(wheel_shifter_follow_slot));
@@ -732,6 +734,8 @@ struct WheelInputDriver::Wheel {
   bool ffb = false;  // force feedback (wheel_primary.h: such a wheel comes first)
   int gear = kGearNeutral;  // the H-pattern gear engaged (EngageGear)
   GearRequest gear_request;  // what thumb_rx asks of the game (wheel_gear_request.h)
+  LeverHold lever_hold;      // the lever crossing neutral between two gates (#468)
+  int gears_logged = 0;      // H-pattern gear changes logged so far
   bool keystroke_poll = false;  // ComputeStateLocked for a keystroke: not a state the game reads
   bool shifter_logged = false;  // where the shifter is read was logged
   bool title_caps = false;  // the game read the capabilities, so it takes this for a wheel
@@ -1643,9 +1647,41 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
     const int buttons_n = aux_shifter ? w.shifter_device.num_buttons : w.num_buttons;
     auto held = [&](int n) { return n >= 0 && n < buttons_n && SDL_GetJoystickButton(sj, n); };
     if (shifter == "h") {
-      w.gear = EngageGear(LeverGear(m, held), w.gear, REXCVAR_GET(wheel_shifter_clutch), clutch,
+      const double now_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+      // A lever crossing neutral between two gates goes from one gear to the other (#468).
+      const double crossing_since = w.lever_hold.neutral_since;
+      const int lever = LeverThroughNeutral(w.lever_hold, LeverGear(m, held), now_ms,
+                                            REXCVAR_GET(wheel_shifter_neutral_ms));
+      const int before = w.gear;
+      w.gear = EngageGear(lever, w.gear, REXCVAR_GET(wheel_shifter_clutch), clutch,
                           static_cast<float>(REXCVAR_GET(wheel_clutch_threshold)));
-      gear = GearRequestOf(w.gear_request, w.gear, !w.keystroke_poll);
+      if (w.gear != before && !w.keystroke_poll && w.gears_logged < 16) {
+        // How the game takes the change, which its paddle animation shows (#468). A change into
+        // neutral plays none; one out of it is a downshift for the game whatever the gear.
+        auto name = [](int g) {
+          return g == kGearReverse ? std::string("R")
+                 : g == kGearNeutral ? std::string("N")
+                                     : std::to_string(g);
+        };
+        std::string how;
+        if (w.gear == kGearNeutral) {
+          how = "";
+        } else if (before == kGearNeutral) {
+          how = ", a downshift for the game (its neutral is above every gear)";
+        } else {
+          how = GameUpshift(before, w.gear) ? ", an upshift for the game"
+                                            : ", a downshift for the game";
+          if (crossing_since >= 0.0) {
+            how += fmt::format(" (the lever crossed neutral in {:.0f} ms)",
+                               now_ms - crossing_since);
+          }
+        }
+        REXLOG_INFO("Wheel: H-pattern {} > {}{}{}", name(before), name(w.gear), how,
+                    ++w.gears_logged == 16 ? "; the next changes are not logged" : "");
+      }
+      gear = GearRequestOf(w.gear_request, w.gear, !w.keystroke_poll, now_ms);
     } else {
       if (held(m.up)) buttons |= 0x0200;
       if (held(m.down)) buttons |= 0x0100;
