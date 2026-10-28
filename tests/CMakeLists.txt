@@ -3,6 +3,7 @@
 
 # Unit tests for core components
 add_subdirectory(unit)
+add_subdirectory(mnk-fast-taps)
 
 # Header-only FH1 raster policy: no game data, GPU, or runtime library needed.
 add_executable(fh1_screen_raster_test fh1_screen_raster_test.cpp)

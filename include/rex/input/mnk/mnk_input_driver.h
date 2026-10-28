@@ -11,6 +11,7 @@
 #pragma once
 
 #include <rex/input/input_driver.h>
+#include <rex/input/mnk/digital_taps.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
@@ -85,6 +86,7 @@ class MnkInputDriver final : public InputDriver,
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  DigitalTaps digital_taps_;
 
   // Mouse delta tracking. Fractional because relative motion arrives in
   // fractions of a pixel, and truncating each event drops slow movement.
