@@ -42,6 +42,7 @@
 #include <rex/ui/vulkan/image_compute.h>
 #include <rex/ui/vulkan/copy_target.h>
 #include <rex/graphics/util/scene_capture.h>
+#include <rex/graphics/util/draw_trace_budget.h>
 #include "fh1_device_memory.h"
 #include "fh1_render_target_trim.h"
 #include "fh1_pipeline_lookahead.h"
@@ -4589,7 +4590,7 @@ void VulkanCommandProcessor::CaptureHdrScene() {
   scene.submission = GetCurrentSubmission();
   scene.frame = copied ? frame_current_ : UINT64_MAX;
   if (fh1_frame_trace::file) {
-    std::fprintf(fh1_frame_trace::file,
+    ThreadDrawTraceBudget().Write(fh1_frame_trace::file, frame_current_,
         "S draw=%u frame=%llu image=%016llX copied=%u extent=%u,%u\n",
         fh1_frame_trace::draws ? fh1_frame_trace::draws - 1 : 0,
         static_cast<unsigned long long>(frame_current_),
@@ -7102,7 +7103,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // creation. V records are written only after an actual Vulkan draw was queued.
   // This does not select a scene snapshot or change rendering policy.
   if (fh1_frame_trace::file && fh1_frame_trace::draws <= 16384) {
-    std::fprintf(fh1_frame_trace::file,
+    const bool recorded_draw = ThreadDrawTraceBudget().Write(fh1_frame_trace::file, frame_current_,
         "V draw=%u frame=%llu eye=%u vs=%016llX ps=%016llX image=%016llX cache=%p "
         "hostvp=%u,%u,%u,%u scale=%u,%u raster=%g,%g mask=%08X dctl=%08X "
         "blend=%08X ctl=%08X textures=%08X native=%u hdr=%u vr=%u\n",
@@ -7121,9 +7122,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         regs[XE_GPU_REG_RB_COLORCONTROL], used_texture_mask, uint32_t(Fh1NativeEnabled()),
         uint32_t(ui::vulkan::GetHdrOutputState().active), uint32_t(Fh1VrLayersWanted()));
     for (uint32_t slot = 0; slot < 32; ++slot) {
-      if (!(used_texture_mask & (uint32_t(1) << slot))) continue;
+      if (!recorded_draw || !(used_texture_mask & (uint32_t(1) << slot))) continue;
       const auto& fetch = regs.GetTextureFetch(slot);
-      std::fprintf(fh1_frame_trace::file,
+      ThreadDrawTraceBudget().Write(fh1_frame_trace::file, frame_current_,
           "T draw=%u slot=%u words=%08X,%08X,%08X,%08X,%08X,%08X\n",
           fh1_frame_trace::draws ? fh1_frame_trace::draws - 1 : 0, slot,
           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);

@@ -67,7 +67,7 @@ else()
 endif()
 add_test(NAME graphics.scene_capture COMMAND scene_capture_test)
 
-foreach(name hdr_calibration hdr_coverage)
+foreach(name hdr_calibration hdr_coverage draw_trace_budget)
   add_executable(${name}_test ${name}_test.cpp)
   target_include_directories(${name}_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
   if(MSVC)

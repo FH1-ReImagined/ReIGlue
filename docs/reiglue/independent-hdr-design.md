@@ -155,7 +155,12 @@ a snapshot. V rows identify the guest draw, frame, eye, shader pair, host image,
 cache, viewport, scales, normalized depth/write state and blend/color controls.
 This distinguishes an issued draw from an asynchronous placeholder skipped after
 its D row. It does not prove GPU completion. Added V/T rows stop after 16,384
-guest draws; the existing tracer still owns the one-frame trigger and stream.
+guest draws, 65,536 added records or 16 MiB of added text, whichever comes first.
+Individual records must fit 1,023 bytes; oversized records are discarded rather
+than truncated. A file-write failure stops further added records for that frame.
+Byte/record/reset/disabled-path contracts cover the bounds. The existing tracer
+still owns the one-frame trigger and stream. With no trigger stream, the extension
+only tests a null pointer and does no formatting, allocation or file access.
 The trace extension makes no snapshot decision and the production syntax check
 passes. Capture and visual evidence remain required before enabling a new policy.
 
