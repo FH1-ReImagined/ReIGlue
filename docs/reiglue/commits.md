@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-149 commits: 112 general (Performance 36, Xenos GPU 27, Input 18, Runtime and platform 14, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+152 commits: 115 general (Performance 36, Xenos GPU 27, Input 18, Runtime and platform 14, Codegen and build 10, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147); see the README. Issue numbers
 (`#45`) in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
 
@@ -168,3 +168,6 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0409 | This branch | FH1 split: startup movies whole at a 1080p output ([#539](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/539)) | **Forza** | Upscaling and HUD | Dyotson |
 | 0411 | This branch | Resolve readback: a range the game reads on the CPU waits for the GPU (`readback_resolve_wait_range`) ([#552](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/552)) | General | Xenos GPU | Dyotson |
 | 0412 | This branch | Racing wheels: a device setting finds a device that has no name (matching by vid:pid, a known nameless pedal set, shifter, handbrake or wheel), and the log lists every joystick when one is missing ([#562](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/562)) | General | Input | Dyotson |
+| 0416 | This branch | Codegen: vmaddfp and vnmsubfp round once, as on Xenon ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0417 | This branch | Codegen: vmaxfp and vminfp with Xenon's NaN, zero and denormal results ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0418 | This branch | Codegen: vmsum3fp128 and vmsum4fp128 always in Xenon's order ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
