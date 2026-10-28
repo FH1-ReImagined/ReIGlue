@@ -9,26 +9,40 @@ namespace rex::ui::vulkan {
 // One full-surface write after the composed SDR attachment becomes readable.
 // The acquire semaphore protects the color-output stage; the completed
 // attachment is transitioned for the presentation engine by the render pass.
-inline VkRenderPass CreateHdrOutputPass(const VulkanDevice& owner, VkFormat format) {
+inline VkRenderPass CreateHdrColorPass(const VulkanDevice& owner, VkFormat format,
+                                       bool sampled_afterwards, bool clear = false) {
   VkAttachmentDescription color{};
   color.format = format;
   color.samples = VK_SAMPLE_COUNT_1_BIT;
-  color.loadOp = color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  color.loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  color.finalLayout = sampled_afterwards ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                        : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
   const VkAttachmentReference reference{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkSubpassDescription subpass{};
   subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass.colorAttachmentCount = 1;
   subpass.pColorAttachments = &reference;
-  const std::array<VkSubpassDependency, 2> dependencies{{
+  std::array<VkSubpassDependency, 2> dependencies{{
       {VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_DEPENDENCY_BY_REGION_BIT},
       {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
        VK_ACCESS_MEMORY_READ_BIT, VK_DEPENDENCY_BY_REGION_BIT}}};
+  if (sampled_afterwards) {
+    // The previous conversion must finish sampling before the next composition
+    // overwrites this attachment. Color blending also reads the attachment.
+    dependencies[0].srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[0].dstAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    dependencies[0].dependencyFlags = 0;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[1].dependencyFlags = 0;
+  }
   VkRenderPassCreateInfo description{};
   description.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
   description.attachmentCount = description.subpassCount = 1;
@@ -40,6 +54,25 @@ inline VkRenderPass CreateHdrOutputPass(const VulkanDevice& owner, VkFormat form
   if (owner.functions().vkCreateRenderPass(owner.device(), &description, nullptr, &result) != VK_SUCCESS)
     return VK_NULL_HANDLE;
   return result;
+}
+
+inline VkRenderPass CreateHdrOutputPass(const VulkanDevice& owner, VkFormat format) {
+  return CreateHdrColorPass(owner, format, false);
+}
+
+// Overlay coverage uses the regular rectangle/sampler ABI but replaces alpha
+// only. The color conversion then sees both game coverage and host UI coverage.
+template <typename Rectangle, typename Sampling>
+void RecordHdrCoverage(const VulkanDevice& owner, VkCommandBuffer commands, VkPipeline pipeline,
+                        VkPipelineLayout layout, VkDescriptorSet image,
+                        const Rectangle& rectangle, const Sampling& sampling) {
+  const auto& api = owner.functions();
+  api.vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  api.vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &image, 0, nullptr);
+  api.vkCmdPushConstants(commands, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(rectangle), &rectangle);
+  api.vkCmdPushConstants(commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(rectangle),
+                          sizeof(sampling), &sampling);
+  api.vkCmdDraw(commands, 4, 1, 0, 0);
 }
 
 template <size_t Count>

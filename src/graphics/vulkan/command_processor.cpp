@@ -40,6 +40,8 @@
 #include <rex/graphics/util/fh1_hud.h>
 #include <rex/graphics/util/presentation_transform.h>
 #include <rex/ui/vulkan/image_compute.h>
+#include <rex/ui/vulkan/copy_target.h>
+#include <rex/graphics/util/scene_capture.h>
 #include "fh1_device_memory.h"
 #include "fh1_render_target_trim.h"
 #include "fh1_pipeline_lookahead.h"
@@ -3555,30 +3557,9 @@ std::shared_ptr<VulkanCommandProcessor::Fh1VrSlot> VulkanCommandProcessor::Fh1Vr
   if (fh1_vr_slots_.size() >= kFh1VrMaxSlots) return nullptr;
   auto slot = std::make_shared<Fh1VrSlot>();
   auto make = [&](Fh1VrSlot::Image& out, VkFormat format, uint32_t w, uint32_t h) {
-    VkImageCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.imageType = VK_IMAGE_TYPE_2D;
-    info.format = format;
-    info.extent = {w, h, 1};
-    info.mipLevels = 1;
-    info.arrayLayers = 1;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-            vulkan_device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, out.image,
-            out.memory))
-      return false;
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = out.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = format;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    return dfn.vkCreateImageView(device, &view, nullptr, &out.view) == VK_SUCCESS;
+    return ui::vulkan::InstallCopyTarget(*vulkan_device, w, h, out, format,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
   };
   const bool stereo = Fh1VrStereoWanted();
   // Patch 0396: true stereo's left eye and both eyes side by side.
@@ -3757,78 +3738,27 @@ void main() {
 }  // namespace
 
 bool VulkanCommandProcessor::Fh1VrSharpenEnsurePipeline() {
-  if (fh1_vr_sharpen_pipeline_ != VK_NULL_HANDLE) return true;
+  if (fh1_vr_sharpen_pipeline_) return true;
   if (fh1_vr_sharpen_failed_) return false;
   fh1_vr_sharpen_failed_ = true;
-  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  VkDescriptorSetLayoutBinding bindings[2] = {};
-  for (uint32_t i = 0; i < 2; ++i) {
-    bindings[i].binding = i;
-    bindings[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    bindings[i].descriptorCount = 1;
-    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  }
-  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
-  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 2;
-  set_layout_info.pBindings = bindings;
-  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
-                                      &fh1_vr_sharpen_set_layout_) != VK_SUCCESS) {
-    REXGPU_WARN("VR sharpening: no descriptor set layout; off");
-    return false;
-  }
-  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 3};
-  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
-  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  pipeline_layout_info.setLayoutCount = 1;
-  pipeline_layout_info.pSetLayouts = &fh1_vr_sharpen_set_layout_;
-  pipeline_layout_info.pushConstantRangeCount = 1;
-  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
-  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
-                                 &fh1_vr_sharpen_pipeline_layout_) != VK_SUCCESS) {
-    REXGPU_WARN("VR sharpening: no pipeline layout; off");
-    return false;
-  }
-  VkDescriptorPoolSize pool_sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
-                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight}};
-  VkDescriptorPoolCreateInfo pool_info = {};
-  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pool_info.maxSets = kMaxFramesInFlight;
-  pool_info.poolSizeCount = 2;
-  pool_info.pPoolSizes = pool_sizes;
-  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &fh1_vr_sharpen_descriptor_pool_) !=
-      VK_SUCCESS) {
-    REXGPU_WARN("VR sharpening: no descriptor pool; off");
-    return false;
-  }
-  std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts;
-  layouts.fill(fh1_vr_sharpen_set_layout_);
-  VkDescriptorSetAllocateInfo set_info = {};
-  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  set_info.descriptorPool = fh1_vr_sharpen_descriptor_pool_;
-  set_info.descriptorSetCount = kMaxFramesInFlight;
-  set_info.pSetLayouts = layouts.data();
-  if (dfn.vkAllocateDescriptorSets(device, &set_info, fh1_vr_sharpen_sets_.data()) != VK_SUCCESS) {
-    REXGPU_WARN("VR sharpening: no descriptor sets; off");
-    return false;
-  }
-  std::vector<uint32_t> spirv;
+  std::vector<uint32_t> shader;
   std::string error;
-  if (!CompileFh1Compute(kFh1VrSharpenShader, spirv, error)) {
-    REXGPU_WARN("VR sharpening: the shader did not compile ({}); off", error);
+  if (!CompileFh1Compute(kFh1VrSharpenShader, shader, error)) {
+    REXGPU_WARN("VR sharpening compilation failed: {}", error);
     return false;
   }
-  fh1_vr_sharpen_pipeline_ = ui::vulkan::util::CreateComputePipeline(
-      vulkan_device, fh1_vr_sharpen_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
-  if (fh1_vr_sharpen_pipeline_ == VK_NULL_HANDLE) {
-    REXGPU_WARN("VR sharpening: no pipeline; off");
-    return false;
-  }
+  const std::array signature{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+  auto objects = ui::vulkan::ImageComputeObjects::Create(*GetVulkanDevice(), shader, signature,
+      kMaxFramesInFlight, sizeof(uint32_t) * 3, ui::vulkan::BuildImageComputePipeline);
+  if (!objects) return false;
+  fh1_vr_sharpen_set_layout_ = objects->set_layout;
+  fh1_vr_sharpen_pipeline_layout_ = objects->layout;
+  fh1_vr_sharpen_descriptor_pool_ = objects->pool;
+  fh1_vr_sharpen_pipeline_ = objects->pipeline;
+  std::copy(objects->sets.begin(), objects->sets.end(), fh1_vr_sharpen_sets_.begin());
+  objects->Release();
   fh1_vr_sharpen_failed_ = false;
-  REXGPU_INFO("VR sharpening: on ({:.2f}, contrast-adaptive, on the headset's scene layer)",
-              rexui_GuestOutputSharpen());
+  REXGPU_INFO("VR sharpening effect initialized at strength {:.2f}", rexui_GuestOutputSharpen());
   return true;
 }
 
@@ -3991,41 +3921,11 @@ bool VulkanCommandProcessor::Fh1StereoLeftDone() {
   left.frame = UINT64_MAX;
   if (left.submission) CheckSubmissionFenceAndDeviceLoss(left.submission);
   if (left.image && (left.width != width || left.height != height)) DestroyHdrScene(left);
-  const auto* gpu = GetVulkanDevice();
-  const auto& dfn = gpu->functions();
   const bool existing = left.image != VK_NULL_HANDLE;
-  if (!existing) {
-    VkImageCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.imageType = VK_IMAGE_TYPE_2D;
-    info.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    info.extent = {width, height, 1};
-    info.mipLevels = 1;
-    info.arrayLayers = 1;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-            gpu, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, left.image, left.memory)) {
-      fh1_stereo_failed_ = true;
-      REXGPU_WARN("VR stereo: no memory for the left eye's {}x{} picture: mono", width, height);
-      return false;
-    }
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = left.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = info.format;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (dfn.vkCreateImageView(gpu->device(), &view, nullptr, &left.view) != VK_SUCCESS) {
-      DestroyHdrScene(left);
-      fh1_stereo_failed_ = true;
-      return false;
-    }
-    left.width = width;
-    left.height = height;
+  if (!existing && !ui::vulkan::InstallCopyTarget(*GetVulkanDevice(), width, height, left)) {
+    fh1_stereo_failed_ = true;
+    REXGPU_WARN("VR stereo image allocation failed at {}x{}", width, height);
+    return false;
   }
   EndRenderPass();
   const auto range = ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
@@ -4634,66 +4534,31 @@ bool VulkanCommandProcessor::Fh1VrStereo(Fh1VrSlot& slot, uint32_t width, uint32
 }
 
 void VulkanCommandProcessor::CaptureHdrScene() {
-  const auto& regs = *register_file_;
-  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
-  if (surface.surface_pitch != 1280 || surface.msaa_samples != xenos::MsaaSamples::k1X)
-    return;
-  const auto color = regs.Get<reg::RB_COLOR_INFO>();
-  if (color.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10) {
-    hdr_scene_base_ = color.color_base;
-    return;
+  using namespace scene_capture;
+  const auto surface = register_file_->Get<reg::RB_SURFACE_INFO>();
+  const auto color = register_file_->Get<reg::RB_COLOR_INFO>();
+  const DrawKind kind = color.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10
+      ? DrawKind::Composite
+      : color.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10
+          ? DrawKind::Overlay : DrawKind::Other;
+  const bool eligible = surface.surface_pitch == 1280 && surface.msaa_samples == xenos::MsaaSamples::k1X;
+  switch (Evaluate(kind, eligible, color.color_base, hdr_scene_base_, hdr_capture_attempted_)) {
+    case Action::Ignore: return;
+    case Action::RememberSurface: hdr_scene_base_ = color.color_base; return;
+    case Action::Capture: hdr_capture_attempted_ = true; break;
   }
-  if (hdr_capture_attempted_ || color.color_base != hdr_scene_base_ ||
-      color.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10)
-    return;
-  hdr_capture_attempted_ = true;
-  if (render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets)
-    return;
-  uint32_t width = 1280 * render_target_cache_->draw_resolution_scale_x();
-  uint32_t height = 720 * render_target_cache_->draw_resolution_scale_y();
-  if (REXCVAR_GET(forza_native_width) > 0)
-    width = std::min(width, uint32_t(REXCVAR_GET(forza_native_width)));
-  if (REXCVAR_GET(forza_native_height) > 0)
-    height = std::min(height, uint32_t(REXCVAR_GET(forza_native_height)));
+  if (render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) return;
+  const auto [width, height] = Resolution(render_target_cache_->draw_resolution_scale_x(),
+      render_target_cache_->draw_resolution_scale_y(), REXCVAR_GET(forza_native_width),
+      REXCVAR_GET(forza_native_height));
   auto& scene = hdr_scenes_[frame_current_ % kMaxFramesInFlight];
   // A slot is never overwritten while an earlier swap can still sample it.
   if (scene.submission)
     CheckSubmissionFenceAndDeviceLoss(scene.submission);
   if (scene.image && (scene.width != width || scene.height != height))
     DestroyHdrScene(scene);
-  const auto* gpu = GetVulkanDevice();
-  const auto& dfn = gpu->functions();
-  const auto device = gpu->device();
   const bool existing = scene.image != VK_NULL_HANDLE;
-  if (!existing) {
-    VkImageCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.imageType = VK_IMAGE_TYPE_2D;
-    info.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    info.extent = {width, height, 1};
-    info.mipLevels = 1;
-    info.arrayLayers = 1;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-            gpu, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, scene.image, scene.memory))
-      return;
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = scene.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = info.format;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (dfn.vkCreateImageView(device, &view, nullptr, &scene.view) != VK_SUCCESS) {
-      DestroyHdrScene(scene);
-      return;
-    }
-    scene.width = width;
-    scene.height = height;
-  }
+  if (!existing && !ui::vulkan::InstallCopyTarget(*GetVulkanDevice(), width, height, scene)) return;
   EndRenderPass();
   const auto range = ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
   PushImageMemoryBarrier(

@@ -1004,8 +1004,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
   // returning.
 
-  // Update the render pass to the new format. With an HDR swapchain, it draws
-  // into the SDR stand-ins, and the last pass samples them.
+  // HDR composes into its own sampled attachment before output conversion.
   const bool hdr = paint_context_.swapchain_hdr;
   const VkFormat render_pass_format = hdr ? PaintContext::kHdrStandInFormat : new_swapchain_format;
   if (paint_context_.swapchain_render_pass_format != render_pass_format ||
@@ -1013,6 +1012,16 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
                                paint_context_.swapchain_render_pass);
     paint_context_.swapchain_render_pass_format = render_pass_format;
+  }
+  if (hdr && !paint_context_.swapchain_render_pass) {
+    const bool clear = REXCVAR_GET(present_render_pass_clear);
+    paint_context_.swapchain_render_pass = CreateHdrColorPass(*vulkan_device_, render_pass_format, true, clear);
+    if (!paint_context_.swapchain_render_pass) {
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    paint_context_.swapchain_render_pass_hdr = true;
+    paint_context_.swapchain_render_pass_clear_load_op = clear;
   }
   if (paint_context_.swapchain_render_pass == VK_NULL_HANDLE) {
     VkAttachmentDescription render_pass_attachment;
@@ -1026,8 +1035,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     render_pass_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     render_pass_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     render_pass_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    render_pass_attachment.finalLayout =
-        hdr ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    render_pass_attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     VkAttachmentReference render_pass_color_attachment;
     render_pass_color_attachment.attachment = 0;
     render_pass_color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1056,14 +1064,6 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     render_pass_dependencies[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
     render_pass_dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-    if (hdr) {
-      // The stand-in was last sampled by an earlier frame's HDR pass, and is
-      // sampled next by this frame's.
-      render_pass_dependencies[0].srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-      render_pass_dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-      render_pass_dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-      render_pass_dependencies[1].dependencyFlags = 0;
-    }
     VkRenderPassCreateInfo render_pass_create_info;
     render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     render_pass_create_info.pNext = nullptr;
@@ -1085,7 +1085,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
     paint_context_.swapchain_render_pass = new_render_pass;
     paint_context_.swapchain_render_pass_format = render_pass_format;
-    paint_context_.swapchain_render_pass_hdr = hdr;
+    paint_context_.swapchain_render_pass_hdr = false;
     paint_context_.swapchain_render_pass_clear_load_op =
         render_pass_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
   }
@@ -2323,27 +2323,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
 
           if (is_final_effect && paint_context_.swapchain_hdr) {
-            // The effects write an opaque alpha; the HDR pass reads the HUD
-            // coverage of the guest output from it instead.
-            VkPipelineLayout mask_pipeline_layout =
-                guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexBilinear];
-            dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                  paint_context_.hdr_ui_mask_pipeline);
-            dfn.vkCmdBindDescriptorSets(
-                draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mask_pipeline_layout, 0, 1,
-                &paint_context_.guest_output_descriptor_sets
-                     [PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
-                      guest_output_image_paint_ref_index],
-                0, nullptr);
-            dfn.vkCmdPushConstants(draw_command_buffer, mask_pipeline_layout,
-                                   VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(effect_rect_constants),
-                                   &effect_rect_constants);
-            BilinearConstants mask_constants;
-            mask_constants.Initialize(guest_output_flow, i);
-            dfn.vkCmdPushConstants(draw_command_buffer, mask_pipeline_layout,
-                                   VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(effect_rect_constants),
-                                   sizeof(mask_constants), &mask_constants);
-            dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
+            BilinearConstants sampling;
+            sampling.Initialize(guest_output_flow, i);
+            RecordHdrCoverage(*vulkan_device_, draw_command_buffer, paint_context_.hdr_ui_mask_pipeline,
+                guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexBilinear],
+                paint_context_.guest_output_descriptor_sets[
+                    PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled + guest_output_image_paint_ref_index],
+                effect_rect_constants, sampling);
           }
 
           if (is_final_effect) {
