@@ -25,6 +25,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/stream.h>
+#include <rex/system.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/system/xmemory.h>
@@ -46,6 +47,24 @@ namespace rex::memory {
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
   return rex::round_up(value, page_size) >> page_size_shift;
 }
+
+namespace {
+
+// The granularity of the backing file offsets that Memory::MapViews maps the
+// guest views at. The 0xE0000000 view starts 4KB into physical memory; where
+// this is coarser, that view is mapped rounded down, and host_address_offset
+// (and detail::PhysicalHostOffset in compiled code) adds the 0x1000 back.
+size_t ViewOffsetGranularity() {
+#if REX_PLATFORM_WIN32 && !REX_WIN32_ROUNDED_PHYSICAL_VIEW
+  // Placeholder views map at any page; Memory::Initialize refuses a Windows
+  // without them.
+  return rex::memory::page_size();
+#else
+  return rex::memory::allocation_granularity();
+#endif
+}
+
+}  // namespace
 
 /**
  * Memory map:
@@ -132,6 +151,20 @@ Memory::~Memory() {
 }
 
 bool Memory::Initialize() {
+#if REX_PLATFORM_WIN32 && !REX_WIN32_ROUNDED_PHYSICAL_VIEW
+  // Guest accesses at 0xE0000000 and up add nothing in this build
+  // (detail::PhysicalHostOffset, REX_PHYS_HOST_OFFSET), so that view must start
+  // exactly 4KB into physical memory, which takes a placeholder view.
+  if (!rex::memory::MapFileViewTakesPageOffsets()) {
+    constexpr std::string_view kMessage =
+        "This program needs Windows 10 version 1803 or later: it maps its memory with "
+        "VirtualAlloc2 and MapViewOfFile3, which this Windows does not have.";
+    REXSYS_ERROR("{}", kMessage);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, kMessage);
+    return false;
+  }
+#endif
+
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
 
   // Create main page file-backed mapping. This is all reserved but
@@ -361,8 +394,8 @@ int Memory::MapViewsMac() {
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
-  // side if system allocation granularity is bigger than 4 KB.
-  uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+  // side if the view offset granularity is bigger than 4 KB.
+  uint64_t granularity_mask = ~uint64_t(ViewOffsetGranularity() - 1);
   for (size_t n = 0; n < rex::countof(map_info); n++) {
     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
         mapping_, mapping_base + map_info[n].virtual_address_start,
@@ -1873,7 +1906,7 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
                               uint32_t heap_base, uint32_t heap_size, uint32_t page_size,
                               VirtualHeap* parent_heap) {
   uint32_t host_address_offset;
-  if (heap_base >= 0xE0000000 && rex::memory::allocation_granularity() > 0x1000) {
+  if (heap_base >= 0xE0000000 && ViewOffsetGranularity() > 0x1000) {
     host_address_offset = 0x1000;
   } else {
     host_address_offset = 0;

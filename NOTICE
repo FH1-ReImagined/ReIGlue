@@ -23,6 +23,15 @@ Pinyon Shift
   presenter, highlight curve and HUD coverage shaders (0091), and the contraction
   part of its macOS pixel-math tuning (0082).
 
+ShiftGlue
+  https://github.com/arcanite24/shiftglue-sdk
+  Pinyon Shift's fork of ReXGlue. Its code is under ReXGlue's license, the
+  same text as LICENSE here (Copyright (c) 2026, Tom Clay, with the Xenia
+  notice), not under LICENSE-Pinyon-Shift, which covers the Pinyon Shift game
+  repository's own files. Adapted here (changes by Brandon G. Neri in
+  ShiftGlue): the 0xE0000000 view mapped at its exact offset on Windows, with
+  placeholder views (0405).
+
 Downloaded at configure time, not stored in this repository (pinned revisions,
 SHA-256 checked; each license is installed beside the GPU library):
   NVIDIA DLSS SDK headers and loader (NVIDIA's license in that SDK), for 0046.
