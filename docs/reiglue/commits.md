@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-138 commits: 104 general (Performance 34, Xenos GPU 26, Input 16, Runtime and platform 12, Diagnostics 7, Codegen and build 6, Workarounds and defaults 3) and 34 Forza-specific (Upscaling and HUD 17, VR 8, Game-specific fixes 3, Input 3, Texture packs 2, Shader-hash effects 1).
+140 commits: 105 general (Performance 35, Xenos GPU 26, Input 16, Runtime and platform 12, Diagnostics 7, Codegen and build 6, Workarounds and defaults 3) and 35 Forza-specific (Upscaling and HUD 17, VR 8, Input 4, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147); see the README. Issue numbers
 (`#45`) in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
 
@@ -149,6 +149,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0361 | `5cdee7a` | Command processor calls into the runtime library ([#45](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/45)) | General | Performance | Dyotson |
 | 0362 | `edf21bf` | Shader translation memo ([#45](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/45)) | General | Performance | Dyotson |
 | 0363 | `6b45bc1` | Cockpit instrument textures retain integer coordinates in native ultrawide ([#419](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/419)) | **Forza** | Upscaling and HUD | Sean O’Connor |
+| 0364 | This branch | Asynchronous pipelines are built across frame ends ([#167](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/167)) | General | Performance | Dyotson |
 | 0390 | `e5f33a7` | VR: Vulkan created through the OpenXR runtime ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
 | 0391 | `461ae0d` | VR: the guest output for a second consumer, with a frame tag ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
 | 0392 | `b6aba71` | VR: pads without window focus ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |

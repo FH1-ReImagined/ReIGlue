@@ -23,6 +23,7 @@
 #include <queue>
 #include <set>
 #include <rex/graphics/vulkan/driver_cache_file.h>
+#include <rex/graphics/vulkan/pipeline_retirement_queue.h>
 #include <rex/graphics/pipeline_store_file.h>
 #include <thread>
 #include <unordered_map>
@@ -77,7 +78,9 @@ class VulkanPipelineCache {
     shader_prebuild_partition_ = partition;
   }
   void ShutdownShaderStorage();
-  void EndSubmission();
+  // FH1 (#167): waits for the pipelines being built for at most wait_ms (0: not at all; -1: until
+  // all are, building the queued ones on the command processor); returns the time waited, in ms.
+  double EndSubmission(int32_t wait_ms = -1);
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                            uint32_t dword_count);
@@ -507,9 +510,7 @@ class VulkanPipelineCache {
   }
   bool Fh1WaitForAhead(Pipeline* first);
   void Fh1StoreDrawnAhead(std::pair<const PipelineDescription, Pipeline>& pipeline);
-  // <Submission index, pipeline>.
-  std::deque<std::pair<uint64_t, VkPipeline>> deferred_destroy_pipelines_;
-  std::mutex deferred_destroy_lock_;
+  PipelineRetirementQueue<VkPipeline> deferred_destroy_pipelines_;
 
   // Where the shader prebuild's list is read from (empty: none), and for which partition.
   std::filesystem::path shader_prebuild_root_;
