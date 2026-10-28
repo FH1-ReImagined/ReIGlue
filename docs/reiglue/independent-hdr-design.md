@@ -74,11 +74,50 @@ Tests generate black, white and translucent composites, quantize both observatio
 and check that the estimated lower bound never exceeds actual opacity. A single
 changed pixel must not mark its neighbors.
 
+This model assumes both images observe aligned pixels in the same color domain.
+Actual resolve, channel order and VR paths still need witnesses. Same-color or
+rounding-indistinguishable overlays cannot be recovered from these observations.
+The readback checker consumes the supplied alpha classification; it verifies
+mapping/protection for that classification, not completeness of overlay detection.
+
+## Exact snapshot transfer
+
+The separate transfer replacement uses `vkCmdCopyImage`, without filtering or
+color conversion, for identical single-sample A2B10G10R10 images. Its typed plan
+rejects missing/equal images, incompatible formats or samples, missing transfer
+usage, zero extents, out-of-bounds regions and widened dimension overflow before
+recording commands. The target is a separately allocated, caller-owned image;
+source and destination allocations do not alias.
+
+`CreateRenderTarget` supplies TRANSFER_SRC for the eligible single-sample color
+format even when desktop HDR is off. Both snapshot destinations are created by
+`InstallCopyTarget` with TRANSFER_DST|SAMPLED usage, one mip, one layer and sample
+count one. Source dimensions come from the same key and resolution scale used
+at allocation; destination dimensions come from the successful allocation record.
+The color aspect, mip zero, layer zero/count one and equal rectangular extents
+follow the [Vulkan image-copy requirements](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyImage.html).
+
+The destination owner waits for its in-flight use and schedules TRANSFER_DST.
+The copy recorder ends rendering, transitions/tracks the source to TRANSFER_SRC,
+flushes both pending transitions, records the copy, then schedules/tracks the
+cache's next color-draw usage. This replaces the previous untracked save/restore
+blit. The owner schedules destination shader-read usage and publishes the frame
+only when a copy was recorded. All operations use the graphics queue; no queue
+family transfer is introduced. Invalid requests retain the existing unavailable
+snapshot fallback (paper-white output or the VR caller's mono frame).
+
+Contracts cover boundary/overflow rejection without recording, the precise
+subresource rectangle and read/copy/next-use ordering. The cache, deferred
+recorder and command processor pass production syntax checks. Rendering
+equivalence, synchronization validation and HDR-off/VR behavior still need GPU
+qualification. The transfer replacement does not replace capture timing.
+
 ## Scene acquisition: evidence required before changing the live trigger
 
 The existing two-format/same-EDRAM-base/first-overlay trigger remains inherited
 and is **not replaced by the policies above**. It must not be treated as cleared.
-The existing `CopyHdrScene` transfer routine also remains under review.
+The separately staged exact-copy replacement above also needs independent review
+and rendering qualification; source checks alone do not establish either.
 
 An alternative is to observe completed display-sized scene/postprocess draws and
 snapshot the latest proven scene result after the draw. This avoids using a

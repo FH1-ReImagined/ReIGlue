@@ -3936,7 +3936,9 @@ bool VulkanCommandProcessor::Fh1StereoLeftDone() {
       VK_ACCESS_TRANSFER_WRITE_BIT,
       existing ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-  const bool copied = render_target_cache_->CopyHdrScene(left.image, width, height);
+  const bool copied = render_target_cache_->CopyColorSnapshot({left.image,
+      VK_FORMAT_A2B10G10R10_UNORM_PACK32, left.width, left.height, VK_SAMPLE_COUNT_1_BIT,
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT});
   PushImageMemoryBarrier(left.image, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                          VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -4570,7 +4572,9 @@ void VulkanCommandProcessor::CaptureHdrScene() {
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
   // Copy only the post-tonemap scene, after reconstruction/ownership transfer
   // and before this first HUD draw. The ordinary renderer resumes unchanged.
-  const bool copied = render_target_cache_->CopyHdrScene(scene.image, width, height);
+  const bool copied = render_target_cache_->CopyColorSnapshot({scene.image,
+      VK_FORMAT_A2B10G10R10_UNORM_PACK32, scene.width, scene.height, VK_SAMPLE_COUNT_1_BIT,
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT});
   PushImageMemoryBarrier(scene.image, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                          VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,

@@ -45,6 +45,9 @@ foreach(contract presentation_transform_test spirv_contraction_test hdr_color_te
 endforeach()
 
 if(REXGLUE_USE_VULKAN)
+  add_executable(color_snapshot_test color_snapshot_test.cpp)
+  target_include_directories(color_snapshot_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/thirdparty/vulkan-headers/include)
+  add_test(NAME graphics.color_snapshot COMMAND color_snapshot_test)
   add_executable(image_compute_test image_compute_test.cpp)
   target_include_directories(image_compute_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/thirdparty/vulkan-headers/include)
   if(MSVC)
