@@ -1652,11 +1652,11 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
                                 .count();
       // A lever crossing neutral between two gates goes from one gear to the other (#468).
       const double crossing_since = w.lever_hold.neutral_since;
-      const int lever = LeverThroughNeutral(w.lever_hold, LeverGear(m, held), now_ms,
-                                            REXCVAR_GET(wheel_shifter_neutral_ms));
       const int before = w.gear;
-      w.gear = EngageGear(lever, w.gear, REXCVAR_GET(wheel_shifter_clutch), clutch,
-                          static_cast<float>(REXCVAR_GET(wheel_clutch_threshold)));
+      w.gear = EngageLeverGear(w.lever_hold, LeverGear(m, held), w.gear, now_ms,
+                               REXCVAR_GET(wheel_shifter_neutral_ms),
+                               REXCVAR_GET(wheel_shifter_clutch), clutch,
+                               static_cast<float>(REXCVAR_GET(wheel_clutch_threshold)));
       if (w.gear != before && !w.keystroke_poll && w.gears_logged < 16) {
         // How the game takes the change, which its paddle animation shows (#468). A change into
         // neutral plays none; one out of it is a downshift for the game whatever the gear.

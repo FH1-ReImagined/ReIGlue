@@ -12,3 +12,7 @@ add_test(NAME fh1.screen_raster COMMAND fh1_screen_raster_test)
 
 # PPC instruction tests (requires PPC toolchain)
 add_subdirectory(ppc)
+
+add_executable(wheel_gear_transit_test wheel_gear_transit_test.cpp)
+target_include_directories(wheel_gear_transit_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME input.wheel_gear_transit COMMAND wheel_gear_transit_test)

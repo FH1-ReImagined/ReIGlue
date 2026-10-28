@@ -72,6 +72,19 @@ inline int LeverThroughNeutral(LeverHold& h, int lever, double now_ms, double ho
   return kGearNeutral;
 }
 
+// A clutch-rejected slot is not a gear to carry through neutral. Otherwise
+// pressing the clutch after leaving that slot would engage it with the lever
+// already in neutral.
+inline int EngageLeverGear(LeverHold& h, int lever, int engaged, double now_ms,
+                           double hold_ms, bool need_clutch, float clutch, float threshold) {
+  const int filtered = LeverThroughNeutral(h, lever, now_ms, hold_ms);
+  const int result = EngageGear(filtered, engaged, need_clutch, clutch, threshold);
+  if (result != filtered) {
+    h = LeverHold{result, -1.0};
+  }
+  return result;
+}
+
 struct GearRequest {
   bool started = false;
   int engaged = kGearNeutral;      // the engaged gear last seen
