@@ -113,15 +113,24 @@ bool build_vnmsubfp(BuilderContext& ctx) {
   return true;
 }
 
-bool build_vmaxfp(BuilderContext& ctx) {
+// vD = helper(vA, vB), with a helper from the generated header (codegen/_ppc_vmx.inja).
+static void emit_vec_fp_helper(BuilderContext& ctx, const char* helper) {
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("max");
+  ctx.println(
+      "\tsimde_mm_store_ps({}.f32, {}(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), helper, ctx.v(ctx.insn.operands[1]),
+      ctx.v(ctx.insn.operands[2]));
+}
+
+// vmaxfp and vminfp with Xenon's NaN, signed zero and denormal results; SSE's max and min
+// differ there.
+bool build_vmaxfp(BuilderContext& ctx) {
+  emit_vec_fp_helper(ctx, "ppc_vmaxfp");
   return true;
 }
 
 bool build_vminfp(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("min");
+  emit_vec_fp_helper(ctx, "ppc_vminfp");
   return true;
 }
 
