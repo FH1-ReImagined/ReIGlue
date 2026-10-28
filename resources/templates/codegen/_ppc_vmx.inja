@@ -2,7 +2,8 @@
 // Vector Float Instructions as Xenon Computes Them
 //
 // The VMX instructions whose plain SSE form gives other bits than the Xbox 360,
-// with the rules xenia-canary's hardware-recorded tests show (ReIGlue 0400):
+// with the rules xenia-canary's hardware-recorded tests show (ReIGlue 0400,
+// 0401):
 //
 // - vmaddfp and vnmsubfp (and vmaddfp128, vmaddcfp128, vnmsubfp128) round once:
 //   the product is not rounded before the add. Built with FMA (-mfma,
@@ -16,6 +17,7 @@
 //   vC, quieted; a NaN from an invalid operation (infinity times zero,
 //   infinity minus infinity) is 0x7FC00000. x86 gives 0xFFC00000 there and
 //   picks a NaN operand by position, so NaN lanes are redone out of line.
+// - vmaxfp and vminfp: below.
 //=============================================================================
 
 #if defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64)
@@ -124,6 +126,48 @@ inline simde__m128 ppc_vnmsubfp(simde__m128 a, simde__m128 c, simde__m128 b) {
                                   simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))));
   if (ppc_vany_nan(r)) [[unlikely]] {
     r = ppc_vnan3(r, a, b, c);
+  }
+  return r;
+}
+
+// vmaxfp and vminfp (and the VMX128 forms): a denormal is a signed zero, a NaN
+// operand is the result (vA first, quieted), and between zeros the maximum is
+// -0 only when both are, the minimum +0 only when both are. SSE's max and min
+// give the second operand for a NaN and for equal values, and a denormal's
+// bits. The equal values take the AND (maximum) or the OR (minimum) of the two,
+// which is the right zero, and a denormal result becomes its signed zero, with
+// or without DAZ (which makes the compare see denormals as zeros).
+inline simde__m128 ppc_vflush(simde__m128 x) {
+  const simde__m128i bits = simde_mm_castps_si128(x);
+  const simde__m128i tiny = simde_mm_cmpeq_epi32(
+      simde_mm_and_si128(bits, simde_mm_set1_epi32(0x7F800000)), simde_mm_setzero_si128());
+  return simde_mm_castsi128_ps(
+      simde_mm_andnot_si128(simde_mm_and_si128(tiny, simde_mm_set1_epi32(0x7FFFFFFF)), bits));
+}
+
+// The lanes where a or b is a NaN: a quieted if it is one, else b quieted.
+[[gnu::noinline, gnu::cold]] inline simde__m128 ppc_vnan2(simde__m128 r, simde__m128 a,
+                                                        simde__m128 b) {
+  const simde__m128 quiet = simde_mm_castsi128_ps(simde_mm_set1_epi32(0x00400000));
+  const simde__m128 nan = simde_mm_blendv_ps(simde_mm_or_ps(b, quiet), simde_mm_or_ps(a, quiet),
+                                             simde_mm_cmpunord_ps(a, a));
+  return simde_mm_blendv_ps(r, nan, simde_mm_cmpunord_ps(a, b));
+}
+
+inline simde__m128 ppc_vmaxfp(simde__m128 a, simde__m128 b) {
+  simde__m128 r = ppc_vflush(simde_mm_blendv_ps(simde_mm_max_ps(a, b), simde_mm_and_ps(a, b),
+                                                simde_mm_cmpeq_ps(a, b)));
+  if (simde_mm_movemask_ps(simde_mm_cmpunord_ps(a, b)) != 0) [[unlikely]] {
+    r = ppc_vnan2(r, a, b);
+  }
+  return r;
+}
+
+inline simde__m128 ppc_vminfp(simde__m128 a, simde__m128 b) {
+  simde__m128 r = ppc_vflush(simde_mm_blendv_ps(simde_mm_min_ps(a, b), simde_mm_or_ps(a, b),
+                                                simde_mm_cmpeq_ps(a, b)));
+  if (simde_mm_movemask_ps(simde_mm_cmpunord_ps(a, b)) != 0) [[unlikely]] {
+    r = ppc_vnan2(r, a, b);
   }
   return r;
 }
