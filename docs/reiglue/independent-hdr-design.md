@@ -138,6 +138,27 @@ Required negative cases and counterexamples:
 - Native HUD seeding, DLAA/FSR scaling and VR left-eye passes change resource ownership.
 - A skipped asynchronous pipeline must not publish a new scene snapshot.
 
+Existing clean guest-frame traces already disprove the simplest full-viewport
+predicate. In the garage trace, draws 2492 and 2493 use vertex shader
+`20A41D46F34D238E` and pixel shader `C786F39CB12D40FE` to composite two 1280x360
+halves; UI follows at draw 2494. The earlier `64AEAE9314A0118B` pass is followed
+by a resolve and these composite draws, so capturing after that earlier pass
+would select the wrong stage. A future candidate must establish complete
+rectangle coverage and the shader/source role, not just a full-sized viewport.
+The traces are local evidence from the camera investigation, not new GPU
+qualification of this branch; raw guest D records also include copy-mode commands.
+
+The existing `FORZA_GPU_FRAME_TRACE=<path>` / `<path>.trigger` diagnostic now
+adds `V` rows after actual Vulkan draw commands are queued, `T` rows for their
+used texture-fetch words, and `S` rows when the current inherited policy attempts
+a snapshot. V rows identify the guest draw, frame, eye, shader pair, host image,
+cache, viewport, scales, normalized depth/write state and blend/color controls.
+This distinguishes an issued draw from an asynchronous placeholder skipped after
+its D row. It does not prove GPU completion. Added V/T rows stop after 16,384
+guest draws; the existing tracer still owns the one-frame trigger and stream.
+The trace extension makes no snapshot decision and the production syntax check
+passes. Capture and visual evidence remain required before enabling a new policy.
+
 Record draw order, shader identifiers, viewport/scissor, depth/blend/write state,
 source textures, render-target identity and draw completion for title, menu,
 gameplay, pause/resume, reconstruction and VR paths. Correlate those records with
@@ -158,3 +179,13 @@ including the two new mathematical contracts. Both regenerated shaders pass
 glslang compilation and reflected ABI checks. The updated Vulkan command
 processor and presenter pass production syntax checks. These are source-level
 checks; the redesigned policies have not yet been linked or run on a GPU.
+
+Checkpoint `8c97dd5` (including the exact-copy replacement) subsequently rebuilt
+four production units and linked both DLLs privately in 29.781 seconds, serially.
+Four unchanged objects were verified before reuse; qualified baseline input
+hashes remained unchanged. Both DLLs loaded, ABI version 1 was returned, all 135
+GPU imports resolved against 11,280 runtime exports, and incompatible ABI/null
+configuration/unknown backend requests were rejected without graphics creation.
+That check does not qualify rendering and does not include the later trace-only
+extension. Independent source review accepted the substantive policy and transfer
+replacements while retaining the capture, hot-toggle and hardware limits above.

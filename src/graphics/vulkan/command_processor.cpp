@@ -196,6 +196,12 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// The existing opt-in one-frame packet tracer owns and closes this stream.
+namespace rex::graphics::fh1_frame_trace {
+extern FILE* file;
+extern uint32_t draws;
+}
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -4582,6 +4588,15 @@ void VulkanCommandProcessor::CaptureHdrScene() {
   SubmitBarriers(true);
   scene.submission = GetCurrentSubmission();
   scene.frame = copied ? frame_current_ : UINT64_MAX;
+  if (fh1_frame_trace::file) {
+    std::fprintf(fh1_frame_trace::file,
+        "S draw=%u frame=%llu image=%016llX copied=%u extent=%u,%u\n",
+        fh1_frame_trace::draws ? fh1_frame_trace::draws - 1 : 0,
+        static_cast<unsigned long long>(frame_current_),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(
+            render_target_cache_->ColorAttachmentImageForDiagnostics())),
+        uint32_t(copied), width, height);
+  }
   if (copied && !existing)
     REXGPU_INFO("HDR: captured {}x{} scene before HUD", width, height);
 }
@@ -7081,6 +7096,38 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             : VK_INDEX_TYPE_UINT32);
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+  }
+
+  // Evidence only: a guest D record can be skipped by asynchronous pipeline
+  // creation. V records are written only after an actual Vulkan draw was queued.
+  // This does not select a scene snapshot or change rendering policy.
+  if (fh1_frame_trace::file && fh1_frame_trace::draws <= 16384) {
+    std::fprintf(fh1_frame_trace::file,
+        "V draw=%u frame=%llu eye=%u vs=%016llX ps=%016llX image=%016llX cache=%p "
+        "hostvp=%u,%u,%u,%u scale=%u,%u raster=%g,%g mask=%08X dctl=%08X "
+        "blend=%08X ctl=%08X textures=%08X native=%u hdr=%u vr=%u\n",
+        fh1_frame_trace::draws ? fh1_frame_trace::draws - 1 : 0,
+        static_cast<unsigned long long>(frame_current_), fh1_stereo_eye_,
+        static_cast<unsigned long long>(vertex_shader->ucode_data_hash()),
+        static_cast<unsigned long long>(pixel_shader ? pixel_shader->ucode_data_hash() : 0),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(
+            render_target_cache_->ColorAttachmentImageForDiagnostics())),
+        static_cast<void*>(render_target_cache_.get()),
+        viewport_info.xy_offset[0], viewport_info.xy_offset[1],
+        viewport_info.xy_extent[0], viewport_info.xy_extent[1],
+        render_target_cache_->draw_resolution_scale_x(), render_target_cache_->draw_resolution_scale_y(),
+        render_target_cache_->raster_scale_x(), render_target_cache_->raster_scale_y(),
+        normalized_color_mask, normalized_depth_control.value, regs[XE_GPU_REG_RB_BLENDCONTROL0],
+        regs[XE_GPU_REG_RB_COLORCONTROL], used_texture_mask, uint32_t(Fh1NativeEnabled()),
+        uint32_t(ui::vulkan::GetHdrOutputState().active), uint32_t(Fh1VrLayersWanted()));
+    for (uint32_t slot = 0; slot < 32; ++slot) {
+      if (!(used_texture_mask & (uint32_t(1) << slot))) continue;
+      const auto& fetch = regs.GetTextureFetch(slot);
+      std::fprintf(fh1_frame_trace::file,
+          "T draw=%u slot=%u words=%08X,%08X,%08X,%08X,%08X,%08X\n",
+          fh1_frame_trace::draws ? fh1_frame_trace::draws - 1 : 0, slot,
+          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+    }
   }
 
   // FH1 (#380): after the shadow mask's blur, multiplies the world AO into it.

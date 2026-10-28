@@ -133,6 +133,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   float raster_scale_x_ = 1.0f, raster_scale_y_ = 1.0f;
   bool SeedNativeHud(VulkanRenderTargetCache& scene, uint32_t width, uint32_t height);
   bool CopyColorSnapshot(const ui::vulkan::SnapshotSurface& destination);
+  VkImage ColorAttachmentImageForDiagnostics() const {
+    auto* color = static_cast<VulkanRenderTarget*>(last_update_accumulated_render_targets()[1]);
+    return color ? color->image() : VK_NULL_HANDLE;
+  }
   bool HasNativeHudColorTarget() const {
     return last_update_accumulated_render_targets()[1] != nullptr;
   }
