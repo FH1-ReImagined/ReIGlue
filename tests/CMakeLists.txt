@@ -16,3 +16,7 @@ add_subdirectory(ppc)
 add_executable(wheel_gear_transit_test wheel_gear_transit_test.cpp)
 target_include_directories(wheel_gear_transit_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME input.wheel_gear_transit COMMAND wheel_gear_transit_test)
+
+add_executable(wheel_rumble_pace_test wheel_rumble_pace_test.cpp)
+target_include_directories(wheel_rumble_pace_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME input.wheel_rumble_pace COMMAND wheel_rumble_pace_test)

@@ -10,7 +10,8 @@
  * sends its force feedback through the kernel's XInputdFF* calls (wheel_ff.h), played here on SDL
  * haptics; one that takes it for a gamepad only sets the vibration motors, which give an
  * approximate spring and a vibration. The rumble plays as a fine or classic vibration
- * (wheel_rumble.h), updated about 30 times a second whatever the frame rate (wheel_rumble_pace.h).
+ * (wheel_rumble.h), updated wheel_vibration_rate times a second whatever the frame rate
+ * (wheel_rumble_pace.h).
  * Pedals and a shifter on their own USB devices are read with the first wheel
  * (wheel_devices.h); steering, buttons and force feedback stay on the wheel.
  *
@@ -141,6 +142,13 @@ REXCVAR_DEFINE_STRING(wheel_rumble_style, "fine", "Input",
                       "wheels with rim motors); fine falls back to classic on a wheel without room "
                       "for its effects")
     .allowed({"fine", "classic"});
+REXCVAR_DEFINE_INT32(wheel_vibration_rate, 60, "Input",
+                     "Vibration updates per second, 15 to 120: the rate the wheel's vibration is "
+                     "updated at, whatever the frame rate (a wheel that restarts a playing effect "
+                     "on every update buzzes at this rate). 60 was the smoothest on a Fanatec CSR "
+                     "Elite and a Simagic Alpha EVO Pro; lower it (30) if the vibration feels too "
+                     "strong")
+    .range(15, 120);
 REXCVAR_DEFINE_STRING(wheel_pedal_device, "", "Input",
                       "Pedals on their own USB device: empty finds a known pedal set (or one named "
                       "like pedals), a device name, SDL GUID or vid:pid picks one, none reads the "
@@ -545,6 +553,10 @@ void PlayWave(SDL_Haptic* haptic, int fx, const RumbleWave& wave, int& sent, boo
   }
 }
 
+// Seconds between two vibration updates, from wheel_vibration_rate (read on each update: cheap, and
+// a change of the setting applies at once).
+double VibrationPaceSeconds() { return RumblePaceSeconds(REXCVAR_GET(wheel_vibration_rate)); }
+
 // The game's level for one vibration effect, played at the fixed pace of wheel_rumble_pace.h
 // (#467): when an update is due, or at once with `now_too` (the forces back at full strength, or
 // faded out: the vibration stops with them) and when a vibration starts from silence, which plays
@@ -554,12 +566,13 @@ void PaceWave(SDL_Haptic* haptic, int fx, RumbleWave wave, RumblePace& pace, int
   if (!haptic || fx < 0) {
     return;
   }
-  pace.Set(now, wave.level);
+  const double step = VibrationPaceSeconds();
+  pace.Set(now, wave.level, step);
   now_too = now_too || (!running && RumbleMagnitude(wave.level) > 0);
-  if (!now_too && !pace.Due(now)) {
+  if (!now_too && !pace.Due(now, step)) {
     return;
   }
-  const float paced = pace.Take(now);
+  const float paced = pace.Take(now, step);
   if (!now_too) {
     wave.level = paced;
   }
@@ -584,8 +597,9 @@ void PaceRumble(W& w, double now) {
                {w.engine_fx, kFineEnginePeriodMs, w.engine_pace, w.engine_magnitude,
                 w.engine_running},
                {w.sine_fx, kClassicPeriodMs, w.sine_pace, w.sine_magnitude, w.sine_running}};
+  const double step = VibrationPaceSeconds();
   for (const auto& v : waves) {
-    if (v.fx >= 0 && v.pace.Due(now)) {
+    if (v.fx >= 0 && v.pace.Due(now, step)) {
       PaceWave(w.haptic, v.fx, RumbleWave{v.period_ms, v.pace.level()}, v.pace, v.sent, v.running,
                false, false, now);
     }
@@ -701,7 +715,8 @@ struct WheelInputDriver::Wheel {
   int road_fx = -1, engine_fx = -1;
   bool road_running = false, engine_running = false;
   int road_magnitude = -1, engine_magnitude = -1;
-  // Each vibration effect's level, sent about 30 times a second (wheel_rumble_pace.h, #467).
+  // Each vibration effect's level, sent wheel_vibration_rate times a second (wheel_rumble_pace.h,
+  // #467).
   RumblePace road_pace, engine_pace, sine_pace;
   // Pedals and shifter on their own USB devices (the first wheel only, wheel_devices.h).
   AuxDevice pedals{AuxRole::kPedals};
