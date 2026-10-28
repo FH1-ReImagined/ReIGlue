@@ -90,26 +90,26 @@ bool build_vmulfp128(BuilderContext& ctx) {
   return true;
 }
 
-bool build_vmaddfp(BuilderContext& ctx) {
+// vmaddfp vD, vA, vC, vB (vD = vA * vC + vB) and vnmsubfp (vD = -(vA * vC - vB)) with one
+// rounding and Xenon's NaN results: ppc_vmaddfp and ppc_vnmsubfp in the generated header
+// (template codegen/_ppc_vmx.inja). vmaddfp128 (vD = vA * vB + vD), vmaddcfp128
+// (vD = vA * vD + vB) and vnmsubfp128 come here with the operands in that order.
+static void emit_multiply_add(BuilderContext& ctx, const char* helper) {
   ctx.emit_set_flush_mode(true);
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));",
-      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
+      "\tsimde_mm_store_ps({}.f32, {}(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), helper, ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
       ctx.v(ctx.insn.operands[3]));
+}
+
+bool build_vmaddfp(BuilderContext& ctx) {
+  emit_multiply_add(ctx, "ppc_vmaddfp");
   return true;
 }
 
 bool build_vnmsubfp(BuilderContext& ctx) {
-  // vnmsubfp: vD = -(vA * vB - vC) - negation done by XOR with sign bit (0x80000000)
-  ctx.emit_set_flush_mode(true);
-  ctx.println(
-      "\tsimde_mm_store_ps({}.f32, "
-      "simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)), "
-      "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));",
-      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
-      ctx.v(ctx.insn.operands[3]));
+  emit_multiply_add(ctx, "ppc_vnmsubfp");
   return true;
 }
 

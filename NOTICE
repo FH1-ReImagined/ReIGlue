@@ -14,14 +14,25 @@ Xenia
   ReXGlue's runtime and Xenos GPU emulation are derived from Xenia (see LICENSE).
   Many ReIGlue changes port later Xenia fixes; their commit messages name them.
 
+xenia-canary
+  https://github.com/xenia-canary/xenia-canary
+  Copyright (c) 2015, Ben Vanik.
+  BSD 3-Clause License (the Xenia terms in LICENSE). PPC instruction tests in
+  tests/ppc/asm from its src/xenia/cpu/ppc/testing (commit 48b318a2ad):
+  instr_vmaddfp.s, instr_vmaddfp128.s, instr_vmaddcfp128.s, instr_vnmsubfp.s
+  and instr_vnmsubfp128.s as they are there, and cases it recorded on an Xbox
+  360, unchanged subsets of its instr__gen_*.s files (the *_hw.s files).
+
 Pinyon Shift
   https://github.com/arcanite24/pinyon-shift
   https://github.com/arcanite24/shiftglue-sdk
   Copyright (c) 2026, Pinyon Shift contributors.
   BSD 3-Clause License: see LICENSE-Pinyon-Shift. Adapted here: the native
   ultrawide presentation and HUD viewport transforms (0063), the scRGB HDR
-  presenter, highlight curve and HUD coverage shaders (0091), and the contraction
-  part of its macOS pixel-math tuning (0082).
+  presenter, highlight curve and HUD coverage shaders (0091), the contraction
+  part of its macOS pixel-math tuning (0082), and from ShiftGlue the vector
+  float instructions as the Xbox 360 computes them, checked against
+  xenia-canary's cases: a fused vmaddfp and vnmsubfp (0400).
 
 Downloaded at configure time, not stored in this repository (pinned revisions,
 SHA-256 checked; each license is installed beside the GPU library):
