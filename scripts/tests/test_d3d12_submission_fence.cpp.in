@@ -1,0 +1,144 @@
+// CPU-only harness populated with the actual production block by the Python runner.
+#include <cstdint>
+#include <cstdio>
+#include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+using HRESULT = int32_t;
+using UINT64 = uint64_t;
+using HANDLE = void*;
+using DWORD = uint32_t;
+#define SUCCEEDED(hr) (((HRESULT)(hr)) >= 0)
+constexpr DWORD INFINITE = 0xFFFFFFFFu;
+constexpr DWORD WAIT_OBJECT_0 = 0;
+#endif
+
+static_assert(sizeof(HRESULT) == 4 && HRESULT(-1) < 0);
+
+struct Trace {
+  HRESULT signal_result;
+  HRESULT event_result;
+  void* expected_fence = nullptr;
+  HANDLE expected_event = nullptr;
+  bool* pending = nullptr;
+  UINT64 expected_value = 18;
+  bool registered = false;
+  int violations = 0;
+  std::string calls = {};
+
+  void Check(bool condition) {
+    if (!condition) {
+      ++violations;
+    }
+  }
+  void Call(const char* name) {
+    calls += name;
+    Check(*pending);
+  }
+};
+Trace* trace;
+
+struct ID3D12Fence {
+  HRESULT SetEventOnCompletion(UINT64 value, HANDLE event) {
+    trace->Call("register ");
+    trace->Check(this == trace->expected_fence && value == trace->expected_value &&
+                 event == trace->expected_event);
+    trace->registered = trace->event_result >= 0;
+    return trace->event_result;
+  }
+};
+
+struct ID3D12CommandQueue {
+  HRESULT Signal(ID3D12Fence* fence, UINT64 value) {
+    trace->Call("signal ");
+    trace->Check(fence == trace->expected_fence && value == trace->expected_value);
+    return trace->signal_result;
+  }
+};
+
+struct Provider {
+  ID3D12CommandQueue queue;
+  ID3D12CommandQueue* GetDirectQueue() {
+    trace->Call("queue ");
+    return &queue;
+  }
+};
+
+// A rejected or absent registration is reported immediately; never actually wait.
+DWORD MockWaitForSingleObject(HANDLE event, DWORD timeout) {
+  trace->Call("wait ");
+  trace->Check(trace->registered && trace->signal_result >= 0 && event == trace->expected_event &&
+               timeout == INFINITE);
+  return WAIT_OBJECT_0;
+}
+#define WaitForSingleObject MockWaitForSingleObject
+#define PROFILE_CMD_BUFFER_STALL() trace->Call("profile ")
+#define REXGPU_ERROR(...) trace->Call("error ")
+
+struct Fixture {
+  ID3D12Fence fence;
+  int event_token = 0;
+  Provider provider;
+  bool queue_operations_done_since_submission_signal_ = true;
+  UINT64 queue_operations_since_submission_fence_last_ = 17;
+  ID3D12Fence* queue_operations_since_submission_fence_ = &fence;
+  HANDLE fence_completion_event_ = &event_token;
+
+  Provider& GetD3D12Provider() { return provider; }
+  void Run() {
+    // PRODUCTION_FENCE_BLOCK
+  }
+};
+
+int main() {
+  // S_OK, S_FALSE, another nonnegative success, and E_FAIL/E_OUTOFMEMORY.
+  const HRESULT signal_results[] = {0, 1, 0x7FFFFFFF, -2147467259};
+  const HRESULT event_results[] = {0, 1, 0x7FFFFFFF, -2147024882};
+  int failures = 0;
+  int cases = 0;
+  for (bool pending : {false, true}) {
+    for (HRESULT signal : signal_results) {
+      for (HRESULT event : event_results) {
+        Fixture fixture;
+        fixture.queue_operations_done_since_submission_signal_ = pending;
+        Trace state{signal, event};
+        trace = &state;
+        state.expected_fence = &fixture.fence;
+        state.expected_event = fixture.fence_completion_event_;
+        state.pending = &fixture.queue_operations_done_since_submission_signal_;
+        fixture.Run();
+        const char* expected_calls;
+        bool expected_pending;
+        if (!pending) {
+          expected_calls = "";
+          expected_pending = false;
+        } else if (signal < 0) {
+          expected_calls = "queue signal error ";
+          expected_pending = true;
+        } else if (event < 0) {
+          expected_calls = "queue signal register error ";
+          expected_pending = true;
+        } else {
+          expected_calls = "queue signal register profile wait ";
+          expected_pending = false;
+        }
+        bool passed = state.violations == 0 && state.calls == expected_calls &&
+                      *state.pending == expected_pending &&
+                      fixture.queue_operations_since_submission_fence_last_ == (pending ? 18 : 17);
+        ++cases;
+        if (!passed) {
+          ++failures;
+          std::printf(
+              "FAIL initial_pending=%d signal=%lld event=%lld calls='%s' pending=%d "
+              "violations=%d\n",
+              int(pending), static_cast<long long>(signal), static_cast<long long>(event),
+              state.calls.c_str(), int(*state.pending), state.violations);
+        }
+      }
+    }
+  }
+  std::printf("%d/%d fence cases passed\n", cases - failures, cases);
+  return failures ? 1 : 0;
+}
