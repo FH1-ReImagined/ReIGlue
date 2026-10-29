@@ -31,6 +31,9 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+  // Acquire an owned reference only if the library is already in this process.
+  // Never load a library from disk. Close releases the acquired reference.
+  bool LoadIfLoaded(const std::filesystem::path& path);
   void Close();
   explicit operator bool() const { return handle_ != nullptr; }
 

@@ -1,0 +1,30 @@
+name: Dynamic library tests
+
+on:
+  pull_request:
+    paths:
+      - 'include/rex/platform/**'
+      - 'include/rex/platform.h'
+      - 'src/core/dynlib_*'
+      - 'src/ui/renderdoc_api.cpp'
+      - 'tests/dynlib-loaded-only/**'
+      - '.github/workflows/dynlib-tests.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'include/rex/platform/**'
+      - 'src/core/dynlib_*'
+      - 'tests/dynlib-loaded-only/**'
+      - '.github/workflows/dynlib-tests.yaml'
+
+jobs:
+  loader:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: cmake -S tests/dynlib-loaded-only -B build/dynlib-tests -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build/dynlib-tests --config Release --parallel 2
+      - run: ctest --test-dir build/dynlib-tests -C Release --output-on-failure
