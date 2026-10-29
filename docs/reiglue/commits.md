@@ -160,3 +160,4 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0397 | `4d66d72` | VR: when each guest output frame was published ([#333](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/333)) | **Forza** | VR | Dyotson |
 | 0399 | This branch | Read-only active physical controller disconnect sequence ([#331](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/pull/331)) | **Forza** | Input | Sean O’Connor |
 | 0400 | This branch | Build (Linux): the small code model, large on request ([#473](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/473)) | General | Codegen and build | Dyotson |
+| 0406 | This branch | Vulkan: direct scaled depth texture uploads on NVIDIA ([#500](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/500)) | General | Performance | Sean O’Connor |

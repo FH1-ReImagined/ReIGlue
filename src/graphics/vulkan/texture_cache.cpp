@@ -40,6 +40,9 @@ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube 
 REXCVAR_DEFINE_BOOL(
     vulkan_direct_scaled_texture_upload, true, "Vulkan",
     "Load eligible scaled NVIDIA textures directly into images; false uses the copy-buffer path");
+REXCVAR_DEFINE_BOOL(
+    vulkan_direct_scaled_depth_upload, true, "Vulkan",
+    "Also load eligible scaled NVIDIA depth textures directly into images, preserving depth conversion");
 
 REXCVAR_DEFINE_BOOL(vulkan_force_base_mip, false, "GPU/Vulkan",
     "Work around texture filtering artifacts by sampling 2D textures at their base mip");
@@ -1220,7 +1223,10 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
       vulkan_device->properties().vendorID == 0x10DE && key.scaled_resolve && key.tiled &&
       key.dimension == xenos::DataDimension::k2DOrStacked && depth_or_array_size == 1 &&
       key.mip_max_level == 0 && key.GetWidth() >= 32 && key.GetHeight() >= 32 &&
-      host_format.format_unsigned.load_shader == kLoadShaderIndex32bpb &&
+      (host_format.format_unsigned.load_shader == kLoadShaderIndex32bpb ||
+       (REXCVAR_GET(vulkan_direct_scaled_depth_upload) &&
+        (host_format.format_unsigned.load_shader == kLoadShaderIndexDepthUnorm ||
+         host_format.format_unsigned.load_shader == kLoadShaderIndexDepthFloat))) &&
       (formats[0] == VK_FORMAT_R8G8B8A8_UNORM || formats[0] == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
        formats[0] == VK_FORMAT_R32_SFLOAT);
   if (direct_upload) {
@@ -1418,6 +1424,12 @@ bool VulkanTextureCache::LoadScaledTextureDirect(VulkanTexture& texture) {
   LoadConstants constants = {};
   uint32_t sx = draw_resolution_scale_x(), sy = draw_resolution_scale_y();
   constants.is_tiled_3d_endian_scale = 1 | (uint32_t(key.endianness) << 2) | (sx << 4) | (sy << 7);
+  const auto load_shader = GetHostFormatPair(key).format_unsigned.load_shader;
+  if (load_shader == kLoadShaderIndexDepthUnorm) {
+    constants.is_tiled_3d_endian_scale |= 1u << 10;
+  } else if (load_shader == kLoadShaderIndexDepthFloat) {
+    constants.is_tiled_3d_endian_scale |= 2u << 10;
+  }
   constants.guest_pitch_aligned = texture.guest_layout().base.row_pitch_bytes / 4;
   constants.size_blocks[0] = key.GetWidth() * sx;
   constants.size_blocks[1] = key.GetHeight() * sy;
