@@ -252,9 +252,9 @@ attempts reset their private capability output. The new status contract and the
 existing request contract pass with Windows clang 23.1.3, C++20 and
 `-Wall -Wextra -Werror`. A production presenter syntax check also passes; it took
 3.766 seconds and generated no object. Commands, source hashes and results are in
-`validation/2026-10-29-hdr-status-source.json`. This source chunk requires separate
-link and runtime qualification; the earlier linked DLL and HDR-off session do not
-qualify it.
+`validation/2026-10-29-hdr-status-source.json`. At that source checkpoint, link
+and runtime qualification remained pending; the earlier linked DLL and HDR-off
+session did not qualify it.
 
 The independent source review found no functional blocker and separately passed
 Linux GCC and Windows clang contracts plus presenter syntax checking. Its test
@@ -266,6 +266,26 @@ HDR; the identical test then fails at the retirement assertion. The first fixtur
 configure attempted an unavailable debug CRT; selecting Release for its compiler
 probe resolves that environment limitation. This is a focused registration check,
 not a full SDK test build. Results are included in the source validation record.
+
+Production source `e6c1711e198dafba4e6d76dad8272a05ae28d691` subsequently passed
+the separately granted private build. All fourteen translation units in the
+changed header's include closure compiled without PCH, and exports regenerated.
+The first serial window stopped after 64.344 seconds when its strict input scanner
+mistook `/implib:` for an input. That failure receipt and all fourteen object
+hashes are preserved. Parser regressions distinguish output options from `/def:`
+and ordinary inputs, including quoted paths. A separately granted link-only
+continuation reused the verified objects and completed both DLL links and the
+loader/ABI audit in 2.797 seconds, with no recompilation or graphics creation.
+
+Both DLLs loaded, all 135 GPU imports resolved against 11,280 runtime exports,
+ABI 1 and invalid-request rejection passed, and the initial HDR status was
+`false/false`. All 347 protected hashes, including 325 historical inputs/outputs,
+matched afterward. Owned child processes were gone before the controller exited;
+no matching build process remained afterward. Exact hashes, commands, compile
+provenance and limits are in `validation/2026-10-29-hdr-status-build.json`.
+This qualifies private compilation/linking/loading, not connection-transition
+runtime behavior, active HDR, readbacks, capture acquisition, VR or game PR #493's
+AI/presentation mechanisms. Shared binaries, SDK pin and required notices remain.
 
 ## Qualification
 
