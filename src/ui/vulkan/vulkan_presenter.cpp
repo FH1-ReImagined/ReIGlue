@@ -124,6 +124,10 @@ namespace rex {
 namespace ui {
 namespace vulkan {
 
+namespace {
+HdrOutputPublication hdr_output_publication;
+}  // namespace
+
 namespace guest_output_export {
 std::atomic<bool> enabled{false};
 std::atomic<uint32_t> flags{0};  // patch 0393: REX_GUEST_OUTPUT_EXPORT_*
@@ -860,6 +864,10 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
                                                                  uint32_t new_surface_height,
                                                                  bool was_paintable,
                                                                  bool& is_vsync_implicit_out) {
+  // Capability and selected format remain private until every resource exists.
+  // A failure at any construction stage leaves the public observation empty.
+  hdr_output_publication.Clear();
+  bool hdr_offered = false;
   // One request snapshot governs both attempts and is committed only once all
   // resources exist. A setting changed during construction is handled next paint.
   const bool requested_hdr = REXCVAR_GET(present_hdr);
@@ -887,7 +895,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
         paint_context_.swapchain_hdr, paint_context_.swapchain_capture_supported,
-        requested_hdr, surface_unusable);
+        hdr_offered, requested_hdr, surface_unusable);
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -993,7 +1001,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
         paint_context_.swapchain_hdr, paint_context_.swapchain_capture_supported,
-        requested_hdr, surface_unusable);
+        hdr_offered, requested_hdr, surface_unusable);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -1188,6 +1196,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
 
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
   paint_context_.hdr_request.Commit(requested_hdr);
+  hdr_output_publication.CommitConnection(hdr_offered, paint_context_.swapchain_hdr);
   return SurfacePaintConnectResult::kSuccess;
 }
 
@@ -1282,24 +1291,17 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   return refresher_succeeded;
 }
 
-namespace {
-std::atomic<uint8_t> hdr_status{0};
-void PublishHdrFlag(uint8_t flag, bool value) {
-  if (value) hdr_status.fetch_or(flag, std::memory_order_relaxed);
-  else hdr_status.fetch_and(uint8_t(~flag), std::memory_order_relaxed);
-}
-}  // namespace
 HdrOutputState GetHdrOutputState() {
-  const auto status = hdr_status.load(std::memory_order_relaxed);
-  return {bool(status & 1), bool(status & 2)};
+  return hdr_output_publication.Read();
 }
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
     VkExtent2D& image_extent_out, bool& is_fifo_out, bool& hdr_out, bool& capture_supported_out,
-    bool requested_hdr, bool& ui_surface_unusable_out) {
+    bool& hdr_offered_out, bool requested_hdr, bool& ui_surface_unusable_out) {
   ui_surface_unusable_out = false;
   hdr_out = false;
+  hdr_offered_out = false;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -1484,7 +1486,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       VkSurfaceFormatKHR{PaintContext::kHdrFormat, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT});
   image_format = hdr_choice.format;
   hdr_out = hdr_choice.active;
-  PublishHdrFlag(1, hdr_choice.available);
+  hdr_offered_out = hdr_choice.available;
   if (requested_hdr)
     REXLOG_INFO("HDR surface selection: {}", hdr_out ? "linear scRGB" : "SDR fallback");
 
@@ -1646,7 +1648,6 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
       uint32_t(swapchain_create_info.presentMode));
 
-  PublishHdrFlag(2, hdr_out);
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;
   image_extent_out = swapchain_create_info.imageExtent;
@@ -1657,7 +1658,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
-  PublishHdrFlag(2, false);
+  hdr_output_publication.Clear();
   if (swapchain != VK_NULL_HANDLE) {
     submission_tracker.AwaitAllSubmissionsCompletion();
     // Submission fences don't cover presentation. Drain it before destroying

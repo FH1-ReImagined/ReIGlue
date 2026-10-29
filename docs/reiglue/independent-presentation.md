@@ -34,6 +34,7 @@ replaces the old blit, with independent review and runtime qualification pending
 | `include/rex/graphics/util/scene_capture.h`, `include/rex/ui/vulkan/copy_target.h` | Capture decisions still implement the inherited two-format/same-base/first-overlay policy; extraction does not establish independence. The new unpublished image-allocation guard is shared by HDR, VR left-eye and VR layer images. |
 | `include/rex/ui/vulkan/hdr_surface.h` | New move-only owner for per-image HDR resources. Partial construction cleans itself up. |
 | `include/rex/ui/vulkan/hdr_request.h`, presenter connection/paint entry | Request/commit hot-toggle policy accepts successful SDR fallback, retries changed requests and snapshots one setting across construction. Existing retirement, thread exclusion and reconnect failure mechanisms remain dependencies. See the 2026-10-28 section of `independent-hdr-design.md`. |
+| `include/rex/ui/vulkan/hdr_status.h`, presenter connection/retirement | Publish one coherent capability/output observation only after complete connection construction. Discovery stays private; connection failure and retirement clear both observations. GPU lifetime and capture decisions remain existing dependencies. See the 2026-10-29 design section; no new link or GPU qualification. |
 | `include/rex/ui/vulkan/color_snapshot.h`, render-target cache and deferred recorder | Typed, validated exact image-copy plan and tracked next-use transitions replace the old `CopyHdrScene` blit. Both HDR and VR left-eye callers retain their existing failure fallback. Capture timing is unchanged. |
 | `include/rex/ui/vulkan/presenter.h`, `src/ui/vulkan/vulkan_presenter.cpp` | Replace per-image allocation/cleanup with the resource owner and batch descriptor allocation; publish frame resources only after all allocations succeed. Replace HDR settings packing. Other HDR presenter portions remain adapted. |
 
@@ -61,6 +62,9 @@ Windows clang 23.1.3 standalone tests, C++20 with `-Wall -Wextra -Werror`:
   format/color-space pair and empty capability list.
 - `hdr_request_test`: unsupported HDR fallback without repeated reconnection,
   off/on retry, uncommitted failure and changes during construction.
+- `hdr_status_test`: unpublished discovery, complete connection publication,
+  retirement, SDR fallback/request independence, invalid observations and
+  coherent concurrent reads. See the later status design section for validation.
 - `hdr_parameters_test`: normal settings, below-paper peak, range clamps,
   nonfinite defaults and comparison/calibration settings.
 - `hdr_calibration_test`: grid interiors, surrounds, checker cells, outside bounds

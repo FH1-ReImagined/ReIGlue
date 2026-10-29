@@ -23,6 +23,7 @@
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/hdr_request.h>
+#include <rex/ui/vulkan/hdr_status.h>
 #include <rex/ui/vulkan/hdr_surface.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/submission_tracker.h>
@@ -60,12 +61,7 @@ class VulkanUIDrawContext final : public UIDrawContext {
   VkFormat render_pass_format_;
 };
 
-// From the latest swapchain: whether its surface offers scRGB, and whether
-// it is in use (present_hdr).
-struct HdrOutputState {
-  bool offered = false;
-  bool active = false;
-};
+// A complete connection's capability/output observation, not a GPU lifetime guard.
 HdrOutputState GetHdrOutputState();
 
 class VulkanPresenter final : public Presenter {
@@ -372,7 +368,8 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out, bool& hdr_out,
-        bool& capture_supported_out, bool requested_hdr, bool& ui_surface_unusable_out);
+        bool& capture_supported_out, bool& hdr_offered_out, bool requested_hdr,
+        bool& ui_surface_unusable_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if

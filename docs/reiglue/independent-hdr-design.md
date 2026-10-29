@@ -212,6 +212,61 @@ baseline inputs. Preserve qualified baseline binaries. This cannot qualify
 rendering. Capture replacement still requires correlated issued-draw, source and
 readback evidence for the negative cases above; no new live trigger is enabled.
 
+## Connection status publication, 2026-10-29
+
+The next source chunk replaces independent updates of the process-wide HDR flags
+with a complete connection observation. Requirements come from the consumer
+interface: an active output must belong to a successfully constructed connection;
+surface capability discovered during an attempt must not escape when that attempt
+fails; retiring a surface must discard its capability as well as its active state.
+
+`HdrOutputPublication` stores one of three modes atomically: unavailable, SDR with
+HDR offered, or active HDR. The existing two-boolean `HdrOutputState` interface is
+decoded from one load. An inconsistent active-but-unoffered observation fails
+closed. A connection clears the old observation before construction, carries
+capability privately through either surface attempt, and commits only after all
+swapchain images, HDR attachments, image views, framebuffers and presentation
+semaphores succeed. Retirement clears the complete observation before waiting
+for existing resources. No capability or active state is published by the
+swapchain factory itself.
+
+This changes the failure semantics: a failed or disconnected surface no longer
+advertises its old HDR capability, and successful swapchain allocation alone no
+longer advertises active HDR while its dependent resources are still being built.
+Successful SDR fallback and the separate request acknowledgement retain their
+existing meanings. The public status still describes the process's presenter;
+this does not add support for independently published simultaneous presenters.
+
+Relaxed atomics provide a coherent observation, not permission to dereference
+resources, a GPU completion witness or a retirement fence. Existing connection
+serialization, GPU waits, resource ownership and capture acquisition remain
+dependencies. The previous local implementation was inspected to establish the
+integration contract; no Pinyon implementation was copied or adapted for this
+change. Existing notices remain, and this does not clear the whole presenter.
+
+The new contract covers initial and retired state, successful HDR, SDR-only
+fallback, disabled HDR on a capable surface, inconsistent observations and
+concurrent readers during repeated publication/retirement. Production source
+checks verified that commit follows the last fallible allocation and both surface
+attempts reset their private capability output. The new status contract and the
+existing request contract pass with Windows clang 23.1.3, C++20 and
+`-Wall -Wextra -Werror`. A production presenter syntax check also passes; it took
+3.766 seconds and generated no object. Commands, source hashes and results are in
+`validation/2026-10-29-hdr-status-source.json`. This source chunk requires separate
+link and runtime qualification; the earlier linked DLL and HDR-off session do not
+qualify it.
+
+The independent source review found no functional blocker and separately passed
+Linux GCC and Windows clang contracts plus presenter syntax checking. Its test
+registration finding is addressed in the normal SDK CMake contract list, with
+`Threads::Threads` and assertions enabled in Release. An isolated CMake fixture
+executing that registration block discovers and passes `graphics.hdr_status` in
+Release. A private copied-header negative control makes retirement retain active
+HDR; the identical test then fails at the retirement assertion. The first fixture
+configure attempted an unavailable debug CRT; selecting Release for its compiler
+probe resolves that environment limitation. This is a focused registration check,
+not a full SDK test build. Results are included in the source validation record.
+
 ## Qualification
 
 On 2026-10-28, checkpoint `342686ee76dd5758e691a57f84ce9e0964441ef7`
