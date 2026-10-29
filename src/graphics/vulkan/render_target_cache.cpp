@@ -6495,33 +6495,50 @@ bool VulkanRenderTargetCache::SeedNativeHud(VulkanRenderTargetCache& scene,
   return true;
 }
 
-bool VulkanRenderTargetCache::CopyHdrScene(VkImage destination, uint32_t width, uint32_t height) {
-  if (GetPath() != Path::kHostRenderTargets)
-    return false;
-  auto* src = static_cast<VulkanRenderTarget*>(last_update_accumulated_render_targets()[1]);
-  if (!src || src->key().msaa_samples != xenos::MsaaSamples::k1X ||
-      GetColorVulkanFormat(src->key().GetColorFormat()) != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-      src->key().GetWidth() * draw_resolution_scale_x() < width ||
-      GetRenderTargetHeight(src->key().pitch_tiles_at_32bpp, src->key().msaa_samples) *
-              draw_resolution_scale_y() < height)
-    return false;
-  command_processor_.EndRenderPass();
-  const auto range = ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
-  const auto stage = src->current_stage_mask();
-  const auto access = src->current_access_mask();
-  const auto layout = src->current_layout();
-  command_processor_.PushImageMemoryBarrier(
-      src->image(), range, stage, VK_PIPELINE_STAGE_TRANSFER_BIT, access,
-      VK_ACCESS_TRANSFER_READ_BIT, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-  command_processor_.SubmitBarriers(true);
-  VkImageBlit copy{};
-  copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  copy.srcOffsets[1] = copy.dstOffsets[1] = {int32_t(width), int32_t(height), 1};
-  command_processor_.deferred_command_buffer().CmdVkBlitImage(src->image(), destination, copy);
-  command_processor_.PushImageMemoryBarrier(src->image(), range, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                            stage, VK_ACCESS_TRANSFER_READ_BIT, access,
-                                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout);
-  return true;
+bool VulkanRenderTargetCache::CopyColorSnapshot(const ui::vulkan::SnapshotSurface& destination) {
+  using namespace ui::vulkan;
+  if (GetPath() != Path::kHostRenderTargets) return false;
+  auto* attachment = static_cast<VulkanRenderTarget*>(last_update_accumulated_render_targets()[1]);
+  if (!attachment || attachment->key().is_depth ||
+      attachment->current_layout() == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+  const auto key = attachment->key();
+  const auto format = GetColorVulkanFormat(key.GetColorFormat());
+  // CreateRenderTarget gives precisely these single-sample color allocations
+  // TRANSFER_SRC usage. Their dimensions are the scaled image allocation, not
+  // the viewport/raster rectangle. Widen before multiplying to reject overflow.
+  const bool transferable = key.msaa_samples == xenos::MsaaSamples::k1X &&
+                            format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+  const auto samples = key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_
+      ? VK_SAMPLE_COUNT_4_BIT : VkSampleCountFlagBits(uint32_t(1) << uint32_t(key.msaa_samples));
+  const SnapshotSurface source{attachment->image(), format,
+      uint64_t(key.GetWidth()) * draw_resolution_scale_x(),
+      uint64_t(GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples)) * draw_resolution_scale_y(),
+      samples,
+      transferable ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : VkImageUsageFlags(0)};
+  struct Recording {
+    VulkanCommandProcessor& commands;
+    VulkanRenderTarget& attachment;
+    void Transition(SnapshotAccess next) {
+      commands.PushImageMemoryBarrier(attachment.image(),
+          util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
+          attachment.current_stage_mask(), next.stage, attachment.current_access_mask(), next.access,
+          attachment.current_layout(), next.layout);
+      attachment.SetUsage(next.stage, next.access, next.layout);
+    }
+    void Begin(SnapshotAccess read) {
+      commands.EndRenderPass();
+      Transition(read);
+      commands.SubmitBarriers(true);  // Includes the destination owner's pending transition.
+    }
+    void Copy(VkImage from, VkImage to, const VkImageCopy& region) {
+      commands.deferred_command_buffer().CmdVkCopyColorImage(from, to, region);
+    }
+    void Finish(SnapshotAccess next) { Transition(next); }
+  } recording{command_processor_, *attachment};
+  const SnapshotAccess draw{VulkanRenderTarget::kColorDrawStageMask,
+      VulkanRenderTarget::kColorDrawAccessMask, VulkanRenderTarget::kColorDrawLayout};
+  return RecordColorSnapshot(source, destination, uint32_t(destination.width),
+      uint32_t(destination.height), draw, recording);
 }
 
 }  // namespace rex::graphics::vulkan

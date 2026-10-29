@@ -1,0 +1,193 @@
+{
+  "sdk_base": "433f499a8b7ce6818382d01de315d37d809751f4",
+  "scope": "uncommitted status publication source; no production objects, DLLs or GPU execution",
+  "steps": [
+    {
+      "name": "hdr_status-compile",
+      "command": [
+        "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\llvm-23.1.3\\bin\\clang++.exe",
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-IC:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation\\include",
+        "C:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation\\tests\\hdr_status_test.cpp",
+        "-o",
+        "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-source-check\\hdr_status.exe"
+      ],
+      "cwd": "C:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation",
+      "exit": 0,
+      "seconds": 0.406
+    },
+    {
+      "name": "hdr_status-test",
+      "command": [
+        "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-source-check\\hdr_status.exe"
+      ],
+      "cwd": "C:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation",
+      "exit": 0,
+      "seconds": 0.297
+    },
+    {
+      "name": "hdr_request-compile",
+      "command": [
+        "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\llvm-23.1.3\\bin\\clang++.exe",
+        "-std=c++20",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-IC:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation\\include",
+        "C:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation\\tests\\hdr_request_test.cpp",
+        "-o",
+        "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-source-check\\hdr_request.exe"
+      ],
+      "cwd": "C:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation",
+      "exit": 0,
+      "seconds": 0.266
+    },
+    {
+      "name": "hdr_request-test",
+      "command": [
+        "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-source-check\\hdr_request.exe"
+      ],
+      "cwd": "C:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation",
+      "exit": 0,
+      "seconds": 0.078
+    },
+    {
+      "name": "vulkan_presenter-syntax",
+      "command": "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\llvm-23.1.3\\bin\\clang-cl.exe  -IC:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation\\include -IC:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation /nologo -TP -DNOMINMAX -DREXGLUE_BUILD_CONFIG=\\\"Release\\\" -DREX_HAS_D3D12=1 -DREX_HAS_FIDELITYFX_SDK=1 -DREX_HAS_VULKAN=1 -DREX_PLATFORM_WINDOWS=1 -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DWIN32_LEAN_AND_MEAN -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\include -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-build\\include -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\src -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\stb -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\fmt\\include -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\simde -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\simde\\simde -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\spdlog\\include -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\renderdoc -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\imgui -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-build\\thirdparty\\sdl3\\include-revision -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\sdl3\\include -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\utfcpp\\source -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\vulkan-headers\\include -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\vulkan-memory-allocator\\include -IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\dxc\\include -imsvcC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\tomlplusplus\\include -imsvcC:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-source\\thirdparty\\spirv-tools\\include --target=x86_64-pc-windows-msvc -fuse-ld=lld-link /clang:-msse4.1 /D_USE_STD_VECTOR_ALGORITHMS=0 /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -clang:-std=c++23 -MD -fno-strict-aliasing -ffp-model=strict -O3 -DNDEBUG -fno-char8_t /clang:-Wall /clang:-Wextra /Zs -- C:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation\\src\\ui\\vulkan\\vulkan_presenter.cpp",
+      "cwd": "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\ultrawide-digital-dash\\sdk-build",
+      "exit": 0,
+      "seconds": 3.766
+    }
+  ],
+  "source_integration_checks": "passed: empty during attempts, both private outputs reset, sole publication after final allocation, retirement clears before wait",
+  "sha256": {
+    "include/rex/ui/vulkan/hdr_status.h": "c320728fbb2c00904730eba637a893b22f70d006b1bcfe04a3051b6edeb7d21b",
+    "include/rex/ui/vulkan/presenter.h": "3f1e6404bd7ef250c707ceb614189324d1fc44e210c92e312b8f50d02c127140",
+    "src/ui/vulkan/vulkan_presenter.cpp": "5c1da3aad334fbd7d3feb61da8a0690a17d21713a51d57dbe4f8eb1e4da51efe",
+    "tests/hdr_status_test.cpp": "e8cb67a442a80ed03745e15229c4221ef0bcc2f6ce89323c5a3e320b1bfaf98a",
+    ".github/workflows/presentation-contracts.yml": "a1d1063300446e40010730d826eb0fc20625c3e9a1de6c6343015ebb0f9e8866",
+    "tests/CMakeLists.txt": "8a2683b242aaf963caf91e869ab01d1f94d59b8e64a2bbd8cb750d17bb09b5a8"
+  },
+  "validated_utc": "2026-10-29",
+  "qualification": "standalone contracts and production syntax only; no link, GPU completion, image comparison, VR, or independent provenance clearance",
+  "syntax_warnings": {
+    "count": 12,
+    "same_messages_as_previous_request_syntax_check": true,
+    "messages": [
+      "unknown argument ignored in clang-cl: '-ffp-model=strict' [-Wunknown-argument]",
+      "unknown argument ignored in clang-cl: '-fno-char8_t' [-Wunknown-argument]",
+      "argument unused during compilation: '-O3' [-Wunused-command-line-argument]",
+      "missing field 'pNext' initializer [-Wmissing-field-initializers]",
+      "unused parameter 'was_paintable' [-Wunused-parameter]",
+      "'u8path<std::basic_string<char>, 0>' is deprecated: warning STL4021: The std::filesystem::u8path() overloads are deprecated in C++20. The constructors of std::filesystem::path provide equivalent functionality via construction from u8string, u8string_view, or iterators with value_type char8_t. You can define _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING or _SILENCE_ALL_CXX20_DEPRECATION_WARNINGS to suppress this warning. [-Wdeprecated-declarations]",
+      "redeclaration of 'rexui_GuestOutputExportFlags' should not add 'dllexport' attribute [-Wdll-attribute-on-redeclaration]",
+      "redeclaration of 'rexui_GuestOutputStereoParams' should not add 'dllexport' attribute [-Wdll-attribute-on-redeclaration]",
+      "redeclaration of 'rexui_GuestOutputTrueStereoParams' should not add 'dllexport' attribute [-Wdll-attribute-on-redeclaration]",
+      "redeclaration of 'rexui_GuestOutputTrueStereoEyes' should not add 'dllexport' attribute [-Wdll-attribute-on-redeclaration]",
+      "redeclaration of 'rexui_GuestOutputSharpen' should not add 'dllexport' attribute [-Wdll-attribute-on-redeclaration]",
+      "redeclaration of 'rexui_SetNextGuestOutputLayers' should not add 'dllexport' attribute [-Wdll-attribute-on-redeclaration]"
+    ]
+  },
+  "cmake_registration": {
+    "scope": "isolated CMake fixture executes verbatim normal SDK contract-registration block, with unrelated SDK targets excluded; no production build or GPU",
+    "source_cmake_sha256": "8a2683b242aaf963caf91e869ab01d1f94d59b8e64a2bbd8cb750d17bb09b5a8",
+    "registration_fragment_sha256": "6e234fbba2b62806f0f3c8b183c6072638b2c1ee2ed58095f94a7c6ec69dbe6f",
+    "release_compile_command": "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\llvm-23.1.3\\bin\\clang++.exe -IC:/Users/soconnor/Documents/fh1-native/worktrees/reiglue-independent-presentation/include -O3 -DNDEBUG -std=gnu++20 -D_DLL -D_MT -Xclang --dependent-lib=msvcrt -UNDEBUG -o CMakeFiles\\hdr_status_test.dir\\hdr_status_test.cpp.obj -c C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-cmake-check\\fixture\\hdr_status_test.cpp",
+    "assertions_enabled": true,
+    "negative_control": "Private copied header changes Clear from unavailable to active HDR; identical status test failed at its retirement assertion. Production header unchanged.",
+    "steps": [
+      {
+        "name": "initial-configure",
+        "exit": 1,
+        "log": "configure.log",
+        "reason": "CMake compiler probe used Debug CRT msvcrtd.lib, unavailable in the provisioned xwin libraries; rerun with Release probe configuration."
+      },
+      {
+        "name": "configure-release",
+        "command": [
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\cmake-4.4.4\\bin\\cmake.exe",
+          "-S",
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-cmake-check\\fixture",
+          "-B",
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-cmake-check\\release-r2",
+          "-G",
+          "Ninja",
+          "-DCMAKE_BUILD_TYPE=Release",
+          "-DCMAKE_TRY_COMPILE_CONFIGURATION=Release",
+          "-DCMAKE_CXX_COMPILER=C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\llvm-23.1.3\\bin\\clang++.exe",
+          "-DCMAKE_MAKE_PROGRAM=C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\ninja-1.13.2\\ninja.exe"
+        ],
+        "exit": 0,
+        "seconds": 2.031,
+        "expected_failure": false
+      },
+      {
+        "name": "build-hdr-status",
+        "command": [
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\cmake-4.4.4\\bin\\cmake.exe",
+          "--build",
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-cmake-check\\release-r2",
+          "--target",
+          "hdr_status_test",
+          "--parallel",
+          "1"
+        ],
+        "exit": 0,
+        "seconds": 0.406,
+        "expected_failure": false
+      },
+      {
+        "name": "ctest-hdr-status",
+        "command": [
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\cmake-4.4.4\\bin\\ctest.exe",
+          "--test-dir",
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-cmake-check\\release-r2",
+          "-R",
+          "^graphics.hdr_status$",
+          "--output-on-failure"
+        ],
+        "exit": 0,
+        "seconds": 0.391,
+        "expected_failure": false
+      },
+      {
+        "name": "negative-compile",
+        "command": [
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\toolchain\\llvm-23.1.3\\bin\\clang++.exe",
+          "-std=c++20",
+          "-O3",
+          "-DNDEBUG",
+          "-UNDEBUG",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-IC:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-cmake-check\\negative-include",
+          "-IC:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation\\include",
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\worktrees\\reiglue-independent-presentation\\tests\\hdr_status_test.cpp",
+          "-o",
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-cmake-check\\negative-retirement.exe"
+        ],
+        "exit": 0,
+        "seconds": 0.313,
+        "expected_failure": false
+      },
+      {
+        "name": "negative-retirement",
+        "command": [
+          "C:\\Users\\soconnor\\Documents\\fh1-native\\build\\pinyon-audit\\hdr-status-cmake-check\\negative-retirement.exe"
+        ],
+        "exit": 3221226505,
+        "seconds": 0.531,
+        "expected_failure": true
+      }
+    ]
+  },
+  "independent_review": {
+    "receipt": "build/org-pr-duty/hdr-status-review/source-review.json",
+    "outcome": "No functional source blocker; standalone Linux GCC and Windows clang contracts plus presenter syntax independently passed. CMake registration followup is separately checked.",
+    "registration_recheck": "Passed: reviewer confirms assertion-enabled CTest registration and Threads::Threads linkage; no remaining source blocker."
+  }
+}

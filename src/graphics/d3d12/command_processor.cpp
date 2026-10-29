@@ -18,6 +18,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/util/fh1_hud.h>
+#include <rex/graphics/util/presentation_transform.h>
 REXCVAR_DECLARE(bool, forza_present_16_9);
 REXCVAR_DECLARE(double, forza_ultrawide_hud_edge_shift);
 REXCVAR_DECLARE(double, forza_ultrawide_hud_x);
@@ -2475,22 +2476,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 1280 &&
       regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
           xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
-    const float sx = float(REXCVAR_GET(forza_ultrawide_hud_x));
-    const float sy = float(REXCVAR_GET(forza_ultrawide_hud_y));
-    float edge_offset = 0;
-    const float edge_shift = float(REXCVAR_GET(forza_ultrawide_hud_edge_shift));
-    const int translation = Fh1HudTranslationRegister(vertex_shader->ucode_data_hash());
-    if (edge_shift != 0 && translation >= 0) {
-      float origin[4];
-      std::memcpy(origin, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + translation * 4], sizeof(origin));
-      edge_offset = edge_shift * Fh1HudEdgeAnchor(origin[0], origin[3]);
+    float anchor = 0;
+    const int slot = Fh1HudTranslationRegister(vertex_shader->ucode_data_hash());
+    if (slot >= 0) {
+      std::array<float, 4> transform_origin;
+      std::memcpy(transform_origin.data(), &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * slot],
+                  sizeof(transform_origin));
+      anchor = Fh1HudEdgeAnchor(transform_origin[0], transform_origin[3]);
     }
-    viewport_info.ndc_scale[0] *= sx;
-    viewport_info.ndc_scale[1] *= sy;
-    viewport_info.ndc_offset[0] =
-        viewport_info.ndc_offset[0] * sx + float(REXCVAR_GET(forza_ultrawide_hud_offset_x)) + edge_offset;
-    viewport_info.ndc_offset[1] =
-        viewport_info.ndc_offset[1] * sy + float(REXCVAR_GET(forza_ultrawide_hud_offset_y));
+    PresentationTransform::Hud(
+        REXCVAR_GET(forza_ultrawide_hud_x), REXCVAR_GET(forza_ultrawide_hud_y),
+        REXCVAR_GET(forza_ultrawide_hud_offset_x), REXCVAR_GET(forza_ultrawide_hud_offset_y),
+        REXCVAR_GET(forza_ultrawide_hud_edge_shift), anchor).Apply(viewport_info);
   }
 
   // Update viewport, scissor, blend factor and stencil reference.

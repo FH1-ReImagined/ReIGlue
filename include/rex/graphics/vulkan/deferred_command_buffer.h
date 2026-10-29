@@ -43,6 +43,11 @@ class DeferredCommandBuffer {
         WriteCommand(Command::kVkBlitImage, sizeof(ArgsVkBlitImage)));
     args.src = src; args.dst = dst; args.region = region;
   }
+  void CmdVkCopyColorImage(VkImage source, VkImage destination, const VkImageCopy& region) {
+    auto* packet = static_cast<ArgsVkCopyColorImage*>(
+        WriteCommand(Command::kVkCopyColorImage, sizeof(ArgsVkCopyColorImage)));
+    *packet = {source, destination, region};
+  }
   // A square cube view is populated from an integer-stride 2D-array resolve.
   void CmdFh1NativeCubeBlit(VkImage src, VkImage dst, const VkImageBlit& region) {
     auto& args = *reinterpret_cast<ArgsFh1NativeCubeBlit*>(
@@ -451,6 +456,7 @@ class DeferredCommandBuffer {
     kVkSetStencilWriteMask,
     kVkSetViewport,
     kHoistedCommands,
+    kVkCopyColorImage,
   };
 
   struct CommandHeader {
@@ -465,6 +471,10 @@ class DeferredCommandBuffer {
   struct ArgsVkBlitImage {
     VkImage src, dst;
     VkImageBlit region;
+  };
+  struct ArgsVkCopyColorImage {
+    VkImage source, destination;
+    VkImageCopy region;
   };
   static constexpr size_t kCommandHeaderSizeElements =
       (sizeof(CommandHeader) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);

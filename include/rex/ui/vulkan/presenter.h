@@ -22,6 +22,9 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/hdr_request.h>
+#include <rex/ui/vulkan/hdr_status.h>
+#include <rex/ui/vulkan/hdr_surface.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
@@ -58,12 +61,7 @@ class VulkanUIDrawContext final : public UIDrawContext {
   VkFormat render_pass_format_;
 };
 
-// From the latest swapchain: whether its surface offers scRGB, and whether
-// it is in use (present_hdr).
-struct HdrOutputState {
-  bool offered = false;
-  bool active = false;
-};
+// A complete connection's capability/output observation, not a GPU lifetime guard.
 HdrOutputState GetHdrOutputState();
 
 class VulkanPresenter final : public Presenter {
@@ -352,18 +350,7 @@ class VulkanPresenter final : public Presenter {
       VkSemaphore present_semaphore;
     };
 
-    // present_hdr: the swapchain is scRGB, and everything above paints into an
-    // SDR stand-in per swapchain image as it would into an SDR swapchain; one
-    // last pass decodes its sRGB and scales it to the paper white.
-    struct HdrImage {
-      VkImage image = VK_NULL_HANDLE;
-      VkDeviceMemory memory = VK_NULL_HANDLE;
-      // Sampled by the last pass, which decodes the sRGB.
-      VkImageView srgb_view = VK_NULL_HANDLE;
-      VkImageView swapchain_view = VK_NULL_HANDLE;
-      VkFramebuffer swapchain_framebuffer = VK_NULL_HANDLE;
-      VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-    };
+    using HdrImage = HdrSurface;
     static constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     static constexpr VkFormat kHdrStandInFormat = VK_FORMAT_B8G8R8A8_UNORM;
     static constexpr VkFormat kHdrStandInSrgbFormat = VK_FORMAT_B8G8R8A8_SRGB;
@@ -381,7 +368,8 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out, bool& hdr_out,
-        bool& capture_supported_out, bool& ui_surface_unusable_out);
+        bool& capture_supported_out, bool& hdr_offered_out, bool requested_hdr,
+        bool& ui_surface_unusable_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -454,6 +442,7 @@ class VulkanPresenter final : public Presenter {
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
     bool swapchain_hdr = false;
+    HdrConnectionRequest hdr_request;
     bool swapchain_capture_supported = false;
     // Per swapchain image when swapchain_hdr.
     std::vector<HdrImage> hdr_images;

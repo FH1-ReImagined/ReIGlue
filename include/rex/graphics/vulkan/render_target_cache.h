@@ -26,6 +26,7 @@
 #include <rex/hash.h>
 #include <rex/ui/vulkan/single_layout_descriptor_set_pool.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
+#include <rex/ui/vulkan/color_snapshot.h>
 
 namespace rex::graphics::vulkan {
 
@@ -131,7 +132,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   float raster_scale_y() const { return raster_scale_y_; }
   float raster_scale_x_ = 1.0f, raster_scale_y_ = 1.0f;
   bool SeedNativeHud(VulkanRenderTargetCache& scene, uint32_t width, uint32_t height);
-  bool CopyHdrScene(VkImage destination, uint32_t width, uint32_t height);
+  bool CopyColorSnapshot(const ui::vulkan::SnapshotSurface& destination);
+  VkImage ColorAttachmentImageForDiagnostics() const {
+    auto* color = static_cast<VulkanRenderTarget*>(last_update_accumulated_render_targets()[1]);
+    return color ? color->image() : VK_NULL_HANDLE;
+  }
   bool HasNativeHudColorTarget() const {
     return last_update_accumulated_render_targets()[1] != nullptr;
   }

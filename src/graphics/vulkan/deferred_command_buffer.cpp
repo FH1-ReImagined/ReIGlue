@@ -73,6 +73,15 @@ VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buf
     stream_remaining -= kCommandHeaderSizeElements;
 
     switch (header.command) {
+      case Command::kVkCopyColorImage: {
+        const auto* packet = reinterpret_cast<const ArgsVkCopyColorImage*>(stream);
+        const auto* device = command_processor_.GetVulkanDevice();
+        const auto copy = reinterpret_cast<PFN_vkCmdCopyImage>(
+            device->vulkan_instance()->functions().vkGetDeviceProcAddr(device->device(), "vkCmdCopyImage"));
+        assert_true(copy != nullptr);  // Vulkan 1.0 core entry point.
+        copy(command_buffer, packet->source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            packet->destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &packet->region);
+      } break;
       case Command::kFh1Dlss: {
         const auto& args = *reinterpret_cast<const ArgsFh1Dlss*>(stream);
         if (args.effect->UsesMetalFx()) {
