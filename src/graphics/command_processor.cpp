@@ -95,6 +95,13 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
     .allowed({"none", "fast", "some", "full"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_UINT64(readback_resolve_wait_range, 0, "GPU",
+                      "readback_resolve some and fast: resolves into this guest physical range, "
+                      "(address << 32) | length in bytes (0: none), wait for the GPU and are "
+                      "copied back as with full. A game sets it while the CPU reads what it "
+                      "resolves there (Forza Horizon's photo mode Big Shot reads each of its tiles "
+                      "from a front buffer, which the game resolves every frame).");
+
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
                     "When draw resolution scaling is active, sample from the center of each "
                     "scaled block during resolve readback downscale")
@@ -234,6 +241,16 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
   }
   return legacy_readback_resolve_enabled ? ReadbackResolveMode::kFast
                                          : ReadbackResolveMode::kDisabled;
+}
+
+// 0411 (#552): "some" copies a range back only when its key is new, and "fast" a frame late;
+// a range the game resolves every frame and now and then reads on the CPU needs the wait.
+bool CommandProcessor::IsReadbackWaitRange(uint32_t written_address,
+                                           uint32_t written_length) const {
+  const uint64_t range = REXCVAR_GET(readback_resolve_wait_range);
+  const uint64_t start = range >> 32, length = uint32_t(range);
+  return length && written_address < start + length &&
+         start < uint64_t(written_address) + written_length;
 }
 
 uint64_t CommandProcessor::GetReadbackResolveKey(uint32_t written_address,

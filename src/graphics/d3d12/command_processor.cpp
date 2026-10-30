@@ -3106,6 +3106,10 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  if (readback_mode != ReadbackResolveMode::kFull &&
+      IsReadbackWaitRange(written_address, written_length)) {
+    readback_mode = ReadbackResolveMode::kFull;  // 0411
+  }
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
