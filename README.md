@@ -20,7 +20,7 @@ message says what changes and why.
 
 [docs/reiglue/commits.md](docs/reiglue/commits.md) lists every commit and marks it:
 
-- **General** (110): Xenos GPU accuracy (most are Xenia fixes the SDK did not have), performance of
+- **General** (111): Xenos GPU accuracy (most are Xenia fixes the SDK did not have), performance of
   the GPU emulation and the runtime, input (racing wheels, controller remapping, keyboard and mouse,
   impulse triggers), runtime and platform fixes (Windows, macOS, audio, file system), diagnostics,
   codegen and build.

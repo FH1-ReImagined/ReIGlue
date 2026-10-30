@@ -317,6 +317,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
+  // FH1 (#536): resolves seen for the first time (readback_resolve = some) put in guest memory
+  // when the GPU has done their copy, without waiting for it (vulkan_readback_defer).
+  struct Fh1PendingReadback {
+    uint64_t submission = 0;  // the copy's
+    uint64_t key = 0;         // in readback_buffers_
+    uint32_t index = 0;       // its buffer
+    uint32_t address = 0;
+    uint32_t length = 0;
+    bool dropped = false;     // a later resolve wrote over the range first
+  };
+  std::deque<Fh1PendingReadback> fh1_pending_readbacks_;
+  // Puts in guest memory the copies the GPU has done.
+  void Fh1LandDoneReadbacks();
+  void Fh1WarnIncompleteReadback(uint32_t address, uint32_t length);
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -540,6 +554,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t last_used_frame = 0;
     // Resolve "some" mode keeps the first CPU copy until this entry is evicted.
     bool resolve_cpu_copy_valid = false;
+    // FH1 (#536): copies of this entry still on their way to guest memory (not evicted).
+    uint32_t pending_landings = 0;
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
