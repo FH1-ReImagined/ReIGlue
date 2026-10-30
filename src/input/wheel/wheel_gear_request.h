@@ -16,6 +16,15 @@
  * kGearRequestMs, then nothing: the paddles and a sequential shifter keep the gear they chose
  * until the lever moves. The lever's position when the wheel is first read is not a movement.
  *
+ * The lever crosses neutral between two gates (#468). The car's gears are numbered R 0, 1 to 8 and
+ * neutral 9 (its gear and the request, also car + 2240 in TU4), and the game takes a change for an
+ * upshift when the new gear's number is higher (sub_8250B318: the flag the cockpit's paddle
+ * animation reads, vehicle + 11717 in TU4; a change into neutral plays no animation). From neutral
+ * every gear is lower, so an H-pattern shift 2 > N > 3 played the paddle downshift animation (the
+ * paddles and a sequential shifter go 2 > 3). LeverThroughNeutral keeps the gear the lever left
+ * for wheel_shifter_neutral_ms in neutral: a lever that reaches another gate in that time is one
+ * change, 2 > 3; one that stays in neutral longer is neutral then.
+ *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */
@@ -26,8 +35,55 @@
 namespace rex::input::wheel {
 
 constexpr int kGearNoRequest = 10;  // the game's own "no request"; 9 and up read the same
+constexpr double kNeutralTransitMs = 400.0;  // wheel_shifter_neutral_ms's default
 constexpr double kGearRequestMs = 250.0;
 constexpr int kGearRequestReads = 4;
+
+// The car's gear number in the game for a lever gear: R 0, 1 to 8, neutral 9 (#468).
+inline int GameGearNumber(int gear) {
+  return gear == kGearReverse ? 0 : gear == kGearNeutral ? 9 : gear;
+}
+// Whether the game takes from > to for an upshift (sub_8250B318 compares the numbers).
+inline bool GameUpshift(int from, int to) { return GameGearNumber(to) > GameGearNumber(from); }
+
+// The lever on its way through neutral (#468).
+struct LeverHold {
+  int gear = kGearNeutral;      // the gear reported for the lever
+  double neutral_since = -1.0;  // when the lever left that gear for neutral; -1: it has not
+};
+
+// The lever's gear as the game should see it: neutral for less than `hold_ms` after a gear is still
+// that gear. `lever` is LeverGear's; now_ms a steady clock in milliseconds. hold_ms 0: as it is.
+inline int LeverThroughNeutral(LeverHold& h, int lever, double now_ms, double hold_ms) {
+  if (lever != kGearNeutral || hold_ms <= 0.0) {
+    h = LeverHold{lever, -1.0};
+    return lever;
+  }
+  if (h.gear == kGearNeutral) {
+    return kGearNeutral;
+  }
+  if (h.neutral_since < 0.0) {
+    h.neutral_since = now_ms;
+  }
+  if (now_ms - h.neutral_since < hold_ms) {
+    return h.gear;
+  }
+  h = LeverHold{};
+  return kGearNeutral;
+}
+
+// A clutch-rejected slot is not a gear to carry through neutral. Otherwise
+// pressing the clutch after leaving that slot would engage it with the lever
+// already in neutral.
+inline int EngageLeverGear(LeverHold& h, int lever, int engaged, double now_ms,
+                           double hold_ms, bool need_clutch, float clutch, float threshold) {
+  const int filtered = LeverThroughNeutral(h, lever, now_ms, hold_ms);
+  const int result = EngageGear(filtered, engaged, need_clutch, clutch, threshold);
+  if (result != filtered) {
+    h = LeverHold{result, -1.0};
+  }
+  return result;
+}
 
 struct GearRequest {
   bool started = false;

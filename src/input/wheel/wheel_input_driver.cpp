@@ -10,7 +10,9 @@
  * sends its force feedback through the kernel's XInputdFF* calls (wheel_ff.h), played here on SDL
  * haptics; one that takes it for a gamepad only sets the vibration motors, which give an
  * approximate spring and a vibration. The rumble plays as a fine or classic vibration
- * (wheel_rumble.h). Pedals and a shifter on their own USB devices are read with the first wheel
+ * (wheel_rumble.h), updated wheel_vibration_rate times a second whatever the frame rate
+ * (wheel_rumble_pace.h).
+ * Pedals and a shifter on their own USB devices are read with the first wheel
  * (wheel_devices.h); steering, buttons and force feedback stay on the wheel.
  *
  * @license     BSD 3-Clause License
@@ -43,6 +45,7 @@
 #include "wheel_min_force.h"
 #include "wheel_primary.h"
 #include "wheel_rumble.h"
+#include "wheel_rumble_pace.h"
 #include "wheel_thrustmaster.h"
 
 REXCVAR_DEFINE_STRING(wheel_mode, "auto", "Input",
@@ -139,6 +142,13 @@ REXCVAR_DEFINE_STRING(wheel_rumble_style, "fine", "Input",
                       "wheels with rim motors); fine falls back to classic on a wheel without room "
                       "for its effects")
     .allowed({"fine", "classic"});
+REXCVAR_DEFINE_INT32(wheel_vibration_rate, 60, "Input",
+                     "Vibration updates per second, 15 to 120: the rate the wheel's vibration is "
+                     "updated at, whatever the frame rate (a wheel that restarts a playing effect "
+                     "on every update buzzes at this rate). 60 was the smoothest on a Fanatec CSR "
+                     "Elite and a Simagic Alpha EVO Pro; lower it (30) if the vibration feels too "
+                     "strong")
+    .range(15, 120);
 REXCVAR_DEFINE_STRING(wheel_pedal_device, "", "Input",
                       "Pedals on their own USB device: empty finds a known pedal set (or one named "
                       "like pedals), a device name, SDL GUID or vid:pid picks one, none reads the "
@@ -160,6 +170,11 @@ REXCVAR_DEFINE_INT32(wheel_ffb_min_strength, 0, "Input",
                      "centre), stronger ones play as they are, so a light car still has weight "
                      "(0: off; before wheel_ffb_strength; not the spring, damper or rumble)")
     .range(0, 100);
+REXCVAR_DEFINE_INT32(wheel_shifter_neutral_ms, 400, "Input",
+                     "H-pattern: milliseconds the lever may cross neutral between two gates and "
+                     "still go from one gear to the other, so the game sees an upshift as one "
+                     "(its paddle animation), 0 to 2000; 0: neutral at once")
+    .range(0, 2000);
 REXCVAR_DEFINE_BOOL(wheel_shifter_follow_slot, true, "Input",
                     "H-pattern: the game takes the lever's slot whenever it sets the gear itself "
                     "(race and event starts and finishes), as on the Xbox; false: a gear engages "
@@ -307,10 +322,7 @@ FfStrengths Strengths() {
 
 // The H-pattern gear to report on thumb_rx (wheel_gear_request.h): on lever moves only, or the
 // engaged gear all the time with wheel_shifter_follow_slot. A new request is logged.
-int GearRequestOf(GearRequest& r, int engaged, bool game_read) {
-  const double now_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
+int GearRequestOf(GearRequest& r, int engaged, bool game_read, double now_ms) {
   const int before = r.request;
   const int out =
       GearToReport(r, engaged, now_ms, game_read, REXCVAR_GET(wheel_shifter_follow_slot));
@@ -531,12 +543,66 @@ void PlayWave(SDL_Haptic* haptic, int fx, const RumbleWave& wave, int& sent, boo
   e.periodic.magnitude = RumbleMagnitude(wave.level);
   if (e.periodic.magnitude != sent && SDL_UpdateHapticEffect(haptic, fx, &e)) {
     sent = e.periodic.magnitude;  // a failed update is sent again
+    g_ff_log.Vibrated(wave.level);
   }
   if (e.periodic.magnitude > 0 && (!running || restart)) {
     running = SDL_RunHapticEffect(haptic, fx, SDL_HAPTIC_INFINITY);
   } else if (e.periodic.magnitude <= 0 && running) {
     SDL_StopHapticEffect(haptic, fx);
     running = false;
+  }
+}
+
+// Seconds between two vibration updates, from wheel_vibration_rate (read on each update: cheap, and
+// a change of the setting applies at once).
+double VibrationPaceSeconds() { return RumblePaceSeconds(REXCVAR_GET(wheel_vibration_rate)); }
+
+// The game's level for one vibration effect, played at the fixed pace of wheel_rumble_pace.h
+// (#467): when an update is due, or at once with `now_too` (the forces back at full strength, or
+// faded out: the vibration stops with them) and when a vibration starts from silence, which plays
+// the game's level as it is now and starts the next interval. `restart` as for PlayWave.
+void PaceWave(SDL_Haptic* haptic, int fx, RumbleWave wave, RumblePace& pace, int& sent,
+              bool& running, bool restart, bool now_too, double now) {
+  if (!haptic || fx < 0) {
+    return;
+  }
+  const double step = VibrationPaceSeconds();
+  pace.Set(now, wave.level, step);
+  now_too = now_too || (!running && RumbleMagnitude(wave.level) > 0);
+  if (!now_too && !pace.Due(now, step)) {
+    return;
+  }
+  const float paced = pace.Take(now, step);
+  if (!now_too) {
+    wave.level = paced;
+  }
+  PlayWave(haptic, fx, wave, sent, running, restart);
+}
+
+// The vibration updates that came due since the game's last rumble (it sets its rumble once a
+// frame, and may stop setting it, as in a menu, after its last change), each wave at the level the
+// game asked for last. Called on every state poll (several a frame, also in menus).
+template <typename W>
+void PaceRumble(W& w, double now) {
+  if (!w.haptic) {
+    return;
+  }
+  const struct {
+    int fx;
+    uint16_t period_ms;
+    RumblePace& pace;
+    int& sent;
+    bool& running;
+  } waves[] = {{w.road_fx, kFineRoadPeriodMs, w.road_pace, w.road_magnitude, w.road_running},
+               {w.engine_fx, kFineEnginePeriodMs, w.engine_pace, w.engine_magnitude,
+                w.engine_running},
+               {w.sine_fx, kClassicPeriodMs, w.sine_pace, w.sine_magnitude, w.sine_running}};
+  const double step = VibrationPaceSeconds();
+  for (const auto& v : waves) {
+    if (v.fx >= 0 && v.pace.Due(now, step)) {
+      PaceWave(w.haptic, v.fx, RumbleWave{v.period_ms, v.pace.level()}, v.pace, v.sent, v.running,
+               false, false, now);
+    }
   }
 }
 
@@ -649,6 +715,9 @@ struct WheelInputDriver::Wheel {
   int road_fx = -1, engine_fx = -1;
   bool road_running = false, engine_running = false;
   int road_magnitude = -1, engine_magnitude = -1;
+  // Each vibration effect's level, sent wheel_vibration_rate times a second (wheel_rumble_pace.h,
+  // #467).
+  RumblePace road_pace, engine_pace, sine_pace;
   // Pedals and shifter on their own USB devices (the first wheel only, wheel_devices.h).
   AuxDevice pedals{AuxRole::kPedals};
   AuxDevice shifter_device{AuxRole::kShifter};
@@ -680,6 +749,8 @@ struct WheelInputDriver::Wheel {
   bool ffb = false;  // force feedback (wheel_primary.h: such a wheel comes first)
   int gear = kGearNeutral;  // the H-pattern gear engaged (EngageGear)
   GearRequest gear_request;  // what thumb_rx asks of the game (wheel_gear_request.h)
+  LeverHold lever_hold;      // the lever crossing neutral between two gates (#468)
+  int gears_logged = 0;      // H-pattern gear changes logged so far
   bool keystroke_poll = false;  // ComputeStateLocked for a keystroke: not a state the game reads
   bool shifter_logged = false;  // where the shifter is read was logged
   bool title_caps = false;  // the game read the capabilities, so it takes this for a wheel
@@ -1052,14 +1123,18 @@ void WheelInputDriver::ApplyRumbleLocked(Wheel& w, uint16_t left_motor, uint16_t
     return;
   }
   const float fade = game ? fade_.level : 1.0f;
+  // Paced (wheel_rumble_pace.h, #467), except when the forces come back whole or are faded out.
+  const bool now_too = w.restart_effects || fade == 0.0f;
+  const double now = FfNow();
   if (w.road_fx >= 0 && w.engine_fx >= 0) {  // fine (wheel_rumble.h)
     const FineRumble fine = FineRumbleOf(left_motor, right_motor, Strengths(), fade);
-    PlayWave(w.haptic, w.road_fx, fine.road, w.road_magnitude, w.road_running, w.restart_effects);
-    PlayWave(w.haptic, w.engine_fx, fine.engine, w.engine_magnitude, w.engine_running,
-             w.restart_effects);
+    PaceWave(w.haptic, w.road_fx, fine.road, w.road_pace, w.road_magnitude, w.road_running,
+             w.restart_effects, now_too, now);
+    PaceWave(w.haptic, w.engine_fx, fine.engine, w.engine_pace, w.engine_magnitude,
+             w.engine_running, w.restart_effects, now_too, now);
   } else {
-    PlayWave(w.haptic, w.sine_fx, ClassicRumble(left_motor, right_motor, Strengths(), fade),
-             w.sine_magnitude, w.sine_running, w.restart_effects);
+    PaceWave(w.haptic, w.sine_fx, ClassicRumble(left_motor, right_motor, Strengths(), fade),
+             w.sine_pace, w.sine_magnitude, w.sine_running, w.restart_effects, now_too, now);
   }
 }
 
@@ -1587,9 +1662,41 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
     const int buttons_n = aux_shifter ? w.shifter_device.num_buttons : w.num_buttons;
     auto held = [&](int n) { return n >= 0 && n < buttons_n && SDL_GetJoystickButton(sj, n); };
     if (shifter == "h") {
-      w.gear = EngageGear(LeverGear(m, held), w.gear, REXCVAR_GET(wheel_shifter_clutch), clutch,
-                          static_cast<float>(REXCVAR_GET(wheel_clutch_threshold)));
-      gear = GearRequestOf(w.gear_request, w.gear, !w.keystroke_poll);
+      const double now_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+      // A lever crossing neutral between two gates goes from one gear to the other (#468).
+      const double crossing_since = w.lever_hold.neutral_since;
+      const int before = w.gear;
+      w.gear = EngageLeverGear(w.lever_hold, LeverGear(m, held), w.gear, now_ms,
+                               REXCVAR_GET(wheel_shifter_neutral_ms),
+                               REXCVAR_GET(wheel_shifter_clutch), clutch,
+                               static_cast<float>(REXCVAR_GET(wheel_clutch_threshold)));
+      if (w.gear != before && !w.keystroke_poll && w.gears_logged < 16) {
+        // How the game takes the change, which its paddle animation shows (#468). A change into
+        // neutral plays none; one out of it is a downshift for the game whatever the gear.
+        auto name = [](int g) {
+          return g == kGearReverse ? std::string("R")
+                 : g == kGearNeutral ? std::string("N")
+                                     : std::to_string(g);
+        };
+        std::string how;
+        if (w.gear == kGearNeutral) {
+          how = "";
+        } else if (before == kGearNeutral) {
+          how = ", a downshift for the game (its neutral is above every gear)";
+        } else {
+          how = GameUpshift(before, w.gear) ? ", an upshift for the game"
+                                            : ", a downshift for the game";
+          if (crossing_since >= 0.0) {
+            how += fmt::format(" (the lever crossed neutral in {:.0f} ms)",
+                               now_ms - crossing_since);
+          }
+        }
+        REXLOG_INFO("Wheel: H-pattern {} > {}{}{}", name(before), name(w.gear), how,
+                    ++w.gears_logged == 16 ? "; the next changes are not logged" : "");
+      }
+      gear = GearRequestOf(w.gear_request, w.gear, !w.keystroke_poll, now_ms);
     } else {
       if (held(m.up)) buttons |= 0x0200;
       if (held(m.down)) buttons |= 0x0100;
@@ -1635,6 +1742,7 @@ X_RESULT WheelInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state)
   UpdateFadeLocked();
   for (auto& wheel : wheels_) {
     KeepPlaying(*wheel, game_ff_active_, FfNow());
+    PaceRumble(*wheel, FfNow());
   }
   if (game_ff_active_ && g_ff_log.SummaryDue(FfNow())) {
     // Every 10 s, what the game sent and what the wheel got (wheel_ff_log.h, #304), and whether the
