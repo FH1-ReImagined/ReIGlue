@@ -746,6 +746,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline fh1_resolve_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout fh1_resolve_layout_ = VK_NULL_HANDLE;
   bool Fh1SynchronizeResolve(uint32_t address, uint32_t length);
+  void Fh1NoteResolve(uint32_t address, uint32_t length);
   // FH1 (#380): ambient occlusion in the world's sun shadow mask (fh1_world_ao.cpp).
   struct Fh1WorldAo;
   Fh1WorldAo* fh1_world_ao_ = nullptr;

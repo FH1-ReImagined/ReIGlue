@@ -340,6 +340,7 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
       {"fh1_native", offsetof(SystemConstants, fh1_native), type_float4_},
       {"fh1_native_textures", offsetof(SystemConstants, fh1_native_textures), type_uint_},
+      {"fh1_full_raster_textures", offsetof(SystemConstants, fh1_full_raster_textures), type_uint_},
       {"fh1_vr_eye", offsetof(SystemConstants, fh1_vr_eye), type_float4_},
   };
   id_vector_temp_.clear();

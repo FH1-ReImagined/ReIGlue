@@ -1019,6 +1019,23 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       }
       fractional_texture = builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
           texture_resolution_scaled, screen_width);
+      // 0409: not a screen texture resolved from a raster that fills the scaled surface (the
+      // scene's; a startup movie frame drawn by the HUD, #539).
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantFh1FullRasterTextures));
+      const spv::Id full_raster = builder_->createBinOp(
+          spv::OpINotEqual, type_bool_,
+          builder_->createBinOp(
+              spv::OpBitwiseAnd, type_uint_,
+              builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                               uniform_system_constants_,
+                                                               id_vector_temp_),
+                                   spv::NoPrecision),
+              builder_->makeUintConstant(UINT32_C(1) << fetch_constant_index)),
+          const_uint_0_);
+      fractional_texture = builder_->createBinOp(
+          spv::OpLogicalAnd, type_bool_, fractional_texture,
+          builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, full_raster));
       for (unsigned i = 0; i < 2; ++i) {
         const float backing = float(i ? draw_resolution_scale_y_ : draw_resolution_scale_x_);
         const_texture_resolution_scale_reciprocal[i] = builder_->createTriOp(spv::OpSelect,
