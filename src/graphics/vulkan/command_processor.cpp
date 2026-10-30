@@ -4948,9 +4948,32 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     guest_output_width = std::min(guest_output_width, uint32_t(REXCVAR_GET(forza_native_width)));
     guest_output_height = std::min(guest_output_height, uint32_t(REXCVAR_GET(forza_native_height)));
   }
-  if (fh1_split_enabled_) {
+  // FH1 split (0409, #539): only a frame that drew the HUD/menu layer was resolved from the
+  // native HUD target, whose raster is the output size; at 1080p that is 1920x1080 of the
+  // 2560x1440 the 2x front buffer holds. A frame that never reached that layer (the legal
+  // screen before the startup movies, unscaled; a frame between two movies, from the scene)
+  // has the picture in its whole swap source: it keeps the active size above, and the
+  // presenter letterboxes it into the window as without the split. With the output size the
+  // legal screen filled only the top-left 1280x720 of a 1080p window.
+  if (fh1_split_enabled_ && fh1_native_hud_active_) {
     guest_output_width = REXCVAR_GET(fh1_output_width);
     guest_output_height = REXCVAR_GET(fh1_output_height);
+  }
+  if (fh1_split_enabled_) {
+    // Each change of size makes the presenter replace its output image. Log the first 16
+    // sizes, then every 256th change, so a size that kept changing would show in the log.
+    static uint32_t presented_width = 0, presented_height = 0, size_changes = 0;
+    if (guest_output_width != presented_width || guest_output_height != presented_height) {
+      ++size_changes;
+      if (size_changes <= 16 || size_changes % 256 == 0) {
+        REXGPU_INFO("FH1 split: frame {} presents {}x{} ({}), size change {}", frame_current_,
+                    guest_output_width, guest_output_height,
+                    fh1_native_hud_active_ ? "HUD layer" : "no HUD layer: scene or unscaled source",
+                    size_changes);
+      }
+      presented_width = guest_output_width;
+      presented_height = guest_output_height;
+    }
   }
   bool swap_source_scaled = frontbuffer_width_unscaled && frontbuffer_height_unscaled &&
                             (frontbuffer_width_scaled != frontbuffer_width_unscaled ||
@@ -7622,12 +7645,24 @@ bool VulkanCommandProcessor::IssueCopy() {
     uint32_t written_address, written_length;
     const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
+    if (resolved) Fh1NoteResolve(written_address, written_length);
     if (resolved && written_length && !Fh1SynchronizeResolve(written_address, written_length))
       REXGPU_ERROR("FH1 cross-scale resolve synchronization failed");
     return resolved;
   }
 
   return IssueCopy_ReadbackResolvePath();
+}
+
+// 0409 (#539): a screen resolve from the scene's raster fills the scaled surface; one from the
+// HUD target (raster fh1_output, at 1080p 1920x1080 of a 2560x1440 surface) only its top-left
+// part, which the HUD's shaders assume for every screen texture. Recorded in the texture cache
+// the HUD samples from (the scene's copy at another scale is mirrored there in full, too).
+void VulkanCommandProcessor::Fh1NoteResolve(uint32_t address, uint32_t length) {
+  if (!fh1_split_enabled_ || !length) return;
+  VulkanTextureCache* hud_textures =
+      fh1_native_hud_active_ || !fh1_other_textures_ ? texture_cache_.get() : fh1_other_textures_.get();
+  hud_textures->Fh1MarkFullRasterResolve(address, length, !fh1_native_hud_active_);
 }
 
 // Scaled resolves repeat 16-byte quads, with scale_x*scale_y host quads
@@ -7764,6 +7799,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                                      written_length)) {
     return false;
   }
+  Fh1NoteResolve(written_address, written_length);
 
   if (written_length && !Fh1SynchronizeResolve(written_address, written_length))
     REXGPU_ERROR("FH1 cross-scale resolve synchronization failed");
@@ -9939,6 +9975,14 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         native_textures |= 1u << i;
   dirty |= system_constants_.fh1_native_textures != native_textures;
   system_constants_.fh1_native_textures = native_textures;
+  // 0409: only the HUD target's shaders scale screen texture coordinates (fractional raster).
+  uint32_t full_raster_textures = 0;
+  if (fh1_split_enabled_ && fh1_native_hud_active_)
+    for (unsigned i = 0; i < 32; ++i)
+      if ((used_texture_mask & (1u << i)) && texture_cache_->IsActiveFh1FullRasterTexture(i))
+        full_raster_textures |= 1u << i;
+  dirty |= system_constants_.fh1_full_raster_textures != full_raster_textures;
+  system_constants_.fh1_full_raster_textures = full_raster_textures;
   // Patch 0396: VR true stereo's eye offset (Fh1StereoDrawOffset).
   for (unsigned i = 0; i < 4; ++i) {
     dirty |= system_constants_.fh1_vr_eye[i] != fh1_stereo_draw_eye_[i];
