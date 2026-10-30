@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-146 commits: 110 general (Performance 36, Xenos GPU 26, Input 17, Runtime and platform 14, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 36 Forza-specific (Upscaling and HUD 17, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+147 commits: 111 general (Performance 37, Xenos GPU 26, Input 17, Runtime and platform 14, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 36 Forza-specific (Upscaling and HUD 17, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147); see the README. Issue numbers
 (`#45`) in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
 
@@ -165,3 +165,4 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0406 | This branch | Vulkan: direct scaled depth texture uploads on NVIDIA ([#500](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/500)) | General | Performance | Sean O’Connor |
 | 0407 | This branch | RenderDoc: connect only to an already-loaded library ([#511](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/511)) | General | Runtime and platform | Sean O’Connor |
 | 0408 | This branch | D3D12: check both fence HRESULTs before waiting outside a submission ([ReIGlue #13](https://github.com/FH1-ReImagined/ReIGlue/issues/13)) | General | Runtime and platform | Sean O’Connor |
+| 0410 | This branch | Resolve readback `some`: first-seen resolves copied back when the GPU is done, not after a wait ([#536](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/536)) | General | Performance | Dyotson |

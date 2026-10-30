@@ -129,6 +129,9 @@ class SharedMemory {
   // FH1 (#384, texture packs): whether a page of the range holds data the GPU wrote
   // (resolves) that the CPU has not overwritten since, and the guest data itself (big-endian).
   bool IsRangeGpuWritten(uint32_t start, uint32_t length);
+  // FH1 (#536): whether every page of the range still holds what the GPU wrote (no CPU write
+  // since).
+  bool IsRangeAllGpuWritten(uint32_t start, uint32_t length);
   const uint8_t* GuestData(uint32_t start) const {
     return memory_.TranslatePhysical<const uint8_t*>(start);
   }

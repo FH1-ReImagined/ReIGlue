@@ -165,6 +165,17 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_skip_render_targets, true, "GPU/Vulkan",
                     "readback buffer was dropped (after the map or a menu)")
     .debug_only();
 
+REXCVAR_DEFINE_BOOL(vulkan_readback_defer, true, "GPU/Vulkan",
+                    "readback_resolve = some: put a resolve seen for the first time in guest "
+                    "memory when the GPU has done it (a frame or two later) instead of waiting "
+                    "for the GPU there; the game's pictures (car thumbnails, photos) still wait")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_readback_log_misses, false, "GPU/Vulkan",
+                    "readback_resolve = some/fast: log every resolve copied back on a cache miss "
+                    "(otherwise the first 20, then at most one every 10 s)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(fh1_frame_cost_csv, "", "GPU/Vulkan",
                       "Testing: write what the command processor did in every frame (draws, "
                       "textures, uploads, pipelines, render targets, waits) to this CSV file")
@@ -1040,6 +1051,36 @@ FrameCostState& GetFrameCostState() {
 fh1_readback_history::History& GetReadbackHistory() {
   static fh1_readback_history::History history;
   return history;
+}
+
+// FH1 (#536): which resolves readback_resolve some/fast copies back on a cache miss (a new
+// readback buffer: a key seen for the first time or back after its buffer was evicted), each
+// with when the key was resolved before. The miss waits for the GPU, so these are the
+// "resolve readbacks" GPU waits of the slow-frame lines.
+struct Fh1ReadbackMissLog {
+  struct Key {
+    uint64_t last_frame = 0;
+    uint64_t gap = 0;  // frames between the last two resolves of the key (0: first seen)
+    uint32_t resolves = 0;
+    uint32_t misses = 0;
+  };
+  std::unordered_map<uint64_t, Key> keys;
+  uint64_t logged = 0, suppressed = 0;
+  int64_t last_log_ms = 0;
+  // Every resolve of a readback mode (before any early return).
+  Key& Resolved(uint64_t key, uint64_t frame) {
+    if (keys.size() >= 4096) keys.clear();
+    Key& k = keys[key];
+    if (k.resolves && k.last_frame != frame) k.gap = frame - k.last_frame;
+    k.last_frame = frame;
+    ++k.resolves;
+    return k;
+  }
+};
+
+Fh1ReadbackMissLog& GetReadbackMissLog() {
+  static Fh1ReadbackMissLog log;
+  return log;
 }
 
 // FH1 (#45): closes the frame's cost counters (fh1_frame_cost.h); a line in the log when
@@ -2792,6 +2833,7 @@ void VulkanCommandProcessor::ShutdownSubmissionThread() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  fh1_pending_readbacks_.clear();
   Fh1WorldAoShutdown();
   ShutdownSubmissionThread();
   InvalidateAllVertexBufferResidency();
@@ -7754,6 +7796,57 @@ void main() {
   return true;
 }
 
+// FH1 (#167): this resolve is copied back for the CPU (readback_resolve), and draws of this
+// frame were skipped for pipelines still being built: what the game may read misses them.
+// Renders made once and kept (a car's picture, its livery, a photo) are made with
+// sync_pipeline_creation for that. A cold cache's boot and loads copy many first-seen
+// resolves this way, as before 0364.
+void VulkanCommandProcessor::Fh1WarnIncompleteReadback(uint32_t address, uint32_t length) {
+  if (frame_used_async_placeholder_pipeline_ && REXCVAR_GET(async_shader_compilation) &&
+      !REXCVAR_GET(sync_pipeline_creation)) {
+    const uint64_t incomplete = ++fh1_pipeline_lookahead::stats.incomplete_readbacks;
+    if (incomplete <= 10 || incomplete % 100 == 0) {
+      REXGPU_WARN("Pipelines: a resolve copied back for the CPU ({} bytes at {:08X}) missed "
+                  "draws whose pipelines were still being built ({} so far)",
+                  length, address, incomplete);
+    }
+  }
+}
+
+void VulkanCommandProcessor::Fh1LandDoneReadbacks() {
+  if (fh1_pending_readbacks_.empty()) return;
+  CheckSubmissionFenceAndDeviceLoss(0);
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  while (!fh1_pending_readbacks_.empty() &&
+         (device_lost_ || fh1_pending_readbacks_.front().submission <= submission_completed_)) {
+    const Fh1PendingReadback pending = fh1_pending_readbacks_.front();
+    fh1_pending_readbacks_.pop_front();
+    auto it = readback_buffers_.find(pending.key);
+    if (it == readback_buffers_.end()) continue;
+    ReadbackBuffer& readback = it->second;
+    if (readback.pending_landings) --readback.pending_landings;
+    // Not over what came later: a later resolve of the range (the GPU would load the older data
+    // back over it), or a write of the game's (it got the memory back for something else).
+    if (pending.dropped || device_lost_ || !readback.mapped_data[pending.index] ||
+        pending.length > readback.sizes[pending.index] ||
+        !shared_memory_->IsRangeAllGpuWritten(pending.address, pending.length)) {
+      continue;
+    }
+    fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().readback_ms);
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = readback.memories[pending.index];
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+    if (uint8_t* destination = memory_->TranslatePhysical(pending.address)) {
+      std::memcpy(destination, readback.mapped_data[pending.index], pending.length);
+    }
+  }
+}
+
 bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -7769,6 +7862,18 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     REXGPU_ERROR("FH1 cross-scale resolve synchronization failed");
   if (!written_length) {
     return true;
+  }
+  // FH1 (#536): a copy still on its way to guest memory that this resolve wrote over is dropped
+  // (putting the older data in guest memory would have the GPU load it back over this
+  // resolve); those done by now go to guest memory.
+  if (!fh1_pending_readbacks_.empty()) {
+    for (Fh1PendingReadback& pending : fh1_pending_readbacks_) {
+      if (pending.address < written_address + written_length &&
+          written_address < pending.address + pending.length) {
+        pending.dropped = true;
+      }
+    }
+    Fh1LandDoneReadbacks();
   }
 
   if (!memory_->TranslatePhysical(written_address)) {
@@ -7845,8 +7950,19 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (thumbnail_readback) {
     readback_mode = ReadbackResolveMode::kFull;
   }
+  // FH1 (#536): the other pictures the game reads on the CPU as soon as they are resolved keep
+  // the wait for the GPU on their first resolve (not vulkan_readback_defer): the photo
+  // (1280x720 RGBA8, encoded at SAVE), its 416x240 thumbnail, and the 256x256 target the car
+  // thumbnail is drawn with.
+  const bool picture_readback = copy_control.copy_src_select < 4 &&
+      ((dest_pitch.copy_dest_pitch == 1280 && dest_pitch.copy_dest_height == 720 &&
+        dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8) ||
+       (dest_pitch.copy_dest_pitch == 416 && dest_pitch.copy_dest_height == 240) ||
+       (dest_pitch.copy_dest_pitch == 256 && dest_pitch.copy_dest_height == 256));
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
   uint64_t resolve_key = GetReadbackResolveKey(written_address, written_length);
+  Fh1ReadbackMissLog& miss_log = GetReadbackMissLog();
+  Fh1ReadbackMissLog::Key& miss_key = miss_log.Resolved(resolve_key, frame_current_);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
   readback.last_used_frame = frame_current_;
   fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
@@ -8097,8 +8213,71 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                            readback.mapped_data[read_index] == nullptr)) {
     is_cache_miss = true;
     read_index = write_index;
-    fh1_frame_cost::Timer cost_timer(cost.readback_wait_ms);
-    if (!AwaitAllQueueOperationsCompletion()) {
+    const double waited_before = cost.readback_wait_ms;
+    const uint64_t submission = GetCurrentSubmission();
+    const uint64_t completed_before = submission_completed_;
+    // FH1 (#536): "some" copies a first-seen key back once. Waiting for the GPU here waits for
+    // everything queued before the copy (a fence on the copy alone signals no sooner: a
+    // queue's fence covers all earlier work): 10-25 ms with the GPU at its limit, each time a
+    // car comes into view (it gets new 64x64 and mipmap render targets, resolved again every
+    // frame, whose later resolves "some" never copies anyway). Put the data in guest memory
+    // when the GPU has done the copy instead, except for the pictures above.
+    const bool deferred = readback_mode == ReadbackResolveMode::kSome && !picture_readback &&
+                          REXCVAR_GET(vulkan_readback_defer);
+    bool awaited = true;
+    if (deferred) {
+      Fh1PendingReadback& pending = fh1_pending_readbacks_.emplace_back();
+      pending.submission = submission;
+      pending.key = resolve_key;
+      pending.index = write_index;
+      pending.address = written_address;
+      pending.length = written_length;
+      ++readback.pending_landings;
+    } else {
+      fh1_frame_cost::Timer cost_timer(cost.readback_wait_ms);
+      awaited = AwaitAllQueueOperationsCompletion();
+    }
+    ++miss_key.misses;
+    const int64_t now_ms = Fh1NowMs();
+    if (REXCVAR_GET(vulkan_readback_log_misses) || miss_log.logged < 20 ||
+        now_ms - miss_log.last_log_ms >= 10000) {
+      REXGPU_INFO(
+          "Readback miss ({}): frame {}, {:08X} +{} bytes, {} format {} {}x{} endian {}{}{}, "
+          "{}; {} misses, {} resolves of this key; {}{}",
+          readback_mode == ReadbackResolveMode::kSome ? "some" : "fast", frame_current_,
+          written_address, written_length,
+          copy_control.copy_src_select >= 4
+              ? std::string("depth")
+              : fmt::format("color{}", uint32_t(copy_control.copy_src_select)),
+          uint32_t(dest_info.copy_dest_format), uint32_t(dest_pitch.copy_dest_pitch),
+          uint32_t(dest_pitch.copy_dest_height), uint32_t(dest_info.copy_dest_endian),
+          dest_info.copy_dest_array ? " array" : "",
+          dest_info.copy_dest_slice ? fmt::format(" slice {}", uint32_t(dest_info.copy_dest_slice))
+                                    : std::string(),
+          miss_key.gap ? fmt::format("last resolved {} frames before", miss_key.gap)
+                       : std::string("first seen"),
+          miss_key.misses, miss_key.resolves,
+          deferred ? fmt::format("copied back when the GPU is done (submission {})", submission)
+                   : fmt::format("waited {:.1f} ms for the GPU (submissions {}-{})",
+                                 cost.readback_wait_ms - waited_before, completed_before + 1,
+                                 submission),
+          miss_log.suppressed ? fmt::format(" ({} misses not logged before)", miss_log.suppressed)
+                              : std::string());
+      ++miss_log.logged;
+      miss_log.suppressed = 0;
+      miss_log.last_log_ms = now_ms;
+    } else {
+      ++miss_log.suppressed;
+    }
+    if (!awaited) {
+      return true;
+    }
+    if (deferred) {
+      Fh1WarnIncompleteReadback(written_address, written_length);
+      ++cost.readbacks;
+      cost.readback_bytes += written_length;
+      readback.resolve_cpu_copy_valid = true;
+      readback.current_index = 1 - readback.current_index;
       return true;
     }
   }
@@ -8109,20 +8288,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     fh1_frame_cost::Timer cost_timer(cost.readback_ms);
     ++cost.readbacks;
     cost.readback_bytes += written_length;
-    // FH1 (#167): this resolve is copied back for the CPU (readback_resolve), and draws of this
-    // frame were skipped for pipelines still being built: what the game may read misses them.
-    // Renders made once and kept (a car's picture, its livery, a photo) are made with
-    // sync_pipeline_creation for that. A cold cache's boot and loads copy many first-seen
-    // resolves this way, as before 0364.
-    if (frame_used_async_placeholder_pipeline_ && REXCVAR_GET(async_shader_compilation) &&
-        !REXCVAR_GET(sync_pipeline_creation)) {
-      const uint64_t incomplete = ++fh1_pipeline_lookahead::stats.incomplete_readbacks;
-      if (incomplete <= 10 || incomplete % 100 == 0) {
-        REXGPU_WARN("Pipelines: a resolve copied back for the CPU ({} bytes at {:08X}) missed "
-                    "draws whose pipelines were still being built ({} so far)",
-                    written_length, written_address, incomplete);
-      }
-    }
+    Fh1WarnIncompleteReadback(written_address, written_length);
     VkMappedMemoryRange readback_memory_range = {};
     readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     readback_memory_range.memory = readback.memories[read_index];
@@ -8156,7 +8322,8 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
   for (auto it = buffer_map.begin(); it != buffer_map.end();) {
     ReadbackBuffer& readback = it->second;
     bool evict =
-        buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor;
+        (buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor) &&
+        !readback.pending_landings;
     if (!evict) {
       ++it;
       continue;
@@ -8831,6 +8998,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
       texture_transient_descriptor_sets_used_.pop_front();
     }
 
+    // FH1 (#536): the copies the GPU has done by now (with the frames in flight awaited above,
+    // every copy of three frames ago).
+    Fh1LandDoneReadbacks();
     EvictOldReadbackBuffers(readback_buffers_);
     EvictOldReadbackBuffers(memexport_readback_buffers_);
 
