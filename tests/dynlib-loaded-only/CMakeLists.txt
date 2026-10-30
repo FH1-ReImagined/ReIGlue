@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.25)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  project(dynlib_loaded_only LANGUAGES CXX)
+  enable_testing()
+endif()
+
+get_filename_component(sdk_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+if(WIN32)
+  set(dynlib_source "${sdk_root}/src/core/dynlib_win.cpp")
+else()
+  set(dynlib_source "${sdk_root}/src/core/dynlib_posix.cpp")
+endif()
+
+# Exercise the production OS loader without building the SDK or requiring a GPU.
+add_library(dynlib_fixture SHARED fixture.cpp)
+add_executable(dynlib_loaded_only_test dynlib_loaded_only_test.cpp ${dynlib_source})
+target_compile_features(dynlib_loaded_only_test PRIVATE cxx_std_23)
+target_include_directories(dynlib_loaded_only_test PRIVATE "${sdk_root}/include")
+target_link_libraries(dynlib_loaded_only_test PRIVATE ${CMAKE_DL_LIBS})
+if(MSVC)
+  target_compile_options(dynlib_loaded_only_test PRIVATE /UNDEBUG /EHsc)
+else()
+  target_compile_options(dynlib_loaded_only_test PRIVATE -UNDEBUG)
+endif()
+add_dependencies(dynlib_loaded_only_test dynlib_fixture)
+add_test(NAME dynlib.loaded_only
+  COMMAND dynlib_loaded_only_test "$<TARGET_FILE:dynlib_fixture>")
+set_tests_properties(dynlib.loaded_only PROPERTIES TIMEOUT 10)
