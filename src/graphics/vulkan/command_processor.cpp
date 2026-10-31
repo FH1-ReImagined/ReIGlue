@@ -7881,6 +7881,10 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (thumbnail_readback) {
     readback_mode = ReadbackResolveMode::kFull;
   }
+  if (readback_mode != ReadbackResolveMode::kFull &&
+      IsReadbackWaitRange(written_address, written_length)) {
+    readback_mode = ReadbackResolveMode::kFull;  // 0411
+  }
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
   uint64_t resolve_key = GetReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];

@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-147 commits: 110 general (Performance 36, Xenos GPU 26, Input 17, Runtime and platform 14, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+148 commits: 111 general (Performance 36, Xenos GPU 27, Input 17, Runtime and platform 14, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147); see the README. Issue numbers
 (`#45`) in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
 
@@ -166,3 +166,4 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0407 | This branch | RenderDoc: connect only to an already-loaded library ([#511](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/511)) | General | Runtime and platform | Sean O’Connor |
 | 0408 | This branch | D3D12: check both fence HRESULTs before waiting outside a submission ([ReIGlue #13](https://github.com/FH1-ReImagined/ReIGlue/issues/13)) | General | Runtime and platform | Sean O’Connor |
 | 0409 | This branch | FH1 split: startup movies whole at a 1080p output ([#539](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/539)) | **Forza** | Upscaling and HUD | Dyotson |
+| 0411 | This branch | Resolve readback: a range the game reads on the CPU waits for the GPU (`readback_resolve_wait_range`) ([#552](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/552)) | General | Xenos GPU | Dyotson |
