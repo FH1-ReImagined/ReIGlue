@@ -54,15 +54,25 @@ inline HandbrakePlan PlanHandbrake(const std::map<std::string, int>& wheel_axes,
   return {};
 }
 
-// The handbrake device among the joysticks (wheel_handbrake_device): a named one (PickNamed), else
-// the first known handbrake or one named like one (AuxRole::kOther); -1 for none. It is never taken
-// as a wheel.
-inline int PickHandbrakeDevice(const std::vector<JoyInfo>& joys, const std::string& setting) {
+// The handbrake device among the joysticks (wheel_handbrake_device): a named one (PickNamed, or a
+// known handbrake with no name of its own when the name matches nothing: PickNamelessOfRole,
+// `nameless` then true), else the first known handbrake or one named like one (AuxRole::kOther);
+// -1 for none. It is never taken as a wheel.
+inline int PickHandbrakeDevice(const std::vector<JoyInfo>& joys, const std::string& setting,
+                               bool* nameless = nullptr) {
   switch (ParseDeviceChoice(setting)) {
     case DeviceChoice::kNone:
       return -1;
-    case DeviceChoice::kNamed:
-      return PickNamed(joys, setting);
+    case DeviceChoice::kNamed: {
+      int i = PickNamed(joys, setting);
+      if (i < 0) {
+        i = PickNamelessOfRole(joys, AuxRole::kOther);
+        if (nameless) {
+          *nameless = i >= 0;
+        }
+      }
+      return i;
+    }
     case DeviceChoice::kAuto:
       break;
   }

@@ -32,6 +32,30 @@ inline int WheelDeviceMatch(const std::string& wheel_device, const JoyInfo& j) {
                                                                   : 0;
 }
 
+// How well wheel_device names each joystick (WheelDeviceMatch). When it names none by name, GUID
+// or vid:pid, the name may be one no joystick can have: the launcher lists a Thrustmaster wheel by
+// the product name Windows registers, the game's SDL 3 gets none for it (#562). The wheel-like
+// joysticks without a name of their own then count as named (1), the aux devices not.
+inline std::vector<int> WheelDeviceScores(const std::vector<JoyInfo>& joys,
+                                          const std::vector<bool>& wheel_like,
+                                          const std::vector<bool>& aux,
+                                          const std::string& wheel_device) {
+  std::vector<int> scores(joys.size());
+  bool any = false;
+  for (size_t i = 0; i < joys.size(); i++) {
+    scores[i] = WheelDeviceMatch(wheel_device, joys[i]);
+    any = any || scores[i] > 0;
+  }
+  if (!any && ParseDeviceChoice(wheel_device) == DeviceChoice::kNamed) {
+    for (size_t i = 0; i < joys.size(); i++) {
+      if (wheel_like[i] && !aux[i] && IsNamelessJoystick(joys[i])) {
+        scores[i] = 1;
+      }
+    }
+  }
+  return scores;
+}
+
 // The joysticks taken as wheels, the wheel first. wheel_like: the joystick is a wheel by itself
 // (IsWheelDevice); ffb: it has force feedback; aux: it is read as a pedal, shifter or handbrake
 // device.
@@ -39,16 +63,15 @@ inline std::vector<int> WheelOrder(const std::vector<JoyInfo>& joys,
                                    const std::vector<bool>& wheel_like,
                                    const std::vector<bool>& ffb, const std::vector<bool>& aux,
                                    const std::string& wheel_device) {
+  const std::vector<int> scores = WheelDeviceScores(joys, wheel_like, aux, wheel_device);
   std::vector<int> out;
   for (int i = 0; i < static_cast<int>(joys.size()); i++) {
-    const bool named = WheelDeviceMatch(wheel_device, joys[i]) > 0;
-    if (named || (wheel_like[i] && !aux[i])) {
+    if (scores[i] > 0 || (wheel_like[i] && !aux[i])) {
       out.push_back(i);
     }
   }
   auto key = [&](int i) {
-    return WheelDeviceMatch(wheel_device, joys[i]) * 4 + (ffb[i] ? 2 : 0) +
-           (joys[i].sdl_wheel ? 1 : 0);
+    return scores[i] * 4 + (ffb[i] ? 2 : 0) + (joys[i].sdl_wheel ? 1 : 0);
   };
   std::stable_sort(out.begin(), out.end(), [&](int a, int b) { return key(a) > key(b); });
   return out;
