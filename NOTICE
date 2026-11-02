@@ -26,6 +26,8 @@ Pinyon Shift
   Shift's approach; its DynamicLibrary integration and tests are authored here.
   The swap that no longer waits for the frame's replay (0414) follows its
   vulkan_present_on_submission_worker (ShiftGlue 960d853).
+  The thread placement by name on Linux (0415) follows its linux_thread_cores
+  (ShiftGlue 2849938), rule syntax and Steam Deck layout included.
 
 Downloaded at configure time, not stored in this repository (pinned revisions,
 SHA-256 checked; each license is installed beside the GPU library):
