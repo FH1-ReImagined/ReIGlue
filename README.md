@@ -20,7 +20,7 @@ message says what changes and why.
 
 [docs/reiglue/commits.md](docs/reiglue/commits.md) lists every commit and marks it:
 
-- **General** (113): Xenos GPU accuracy (most are Xenia fixes the SDK did not have), performance of
+- **General** (114): Xenos GPU accuracy (most are Xenia fixes the SDK did not have), performance of
   the GPU emulation and the runtime, input (racing wheels, controller remapping, keyboard and mouse,
   impulse triggers), runtime and platform fixes (Windows, macOS, audio, file system), diagnostics,
   codegen and build.
@@ -45,19 +45,21 @@ into a project (`0.10.0`) is the upstream one.
 
 ## Building
 
-As upstream, plus one step for the SDL submodule:
+As upstream, plus one step each for the SDL and FFmpeg submodules:
 
 ```sh
 git clone --branch fh1-0.10.0.24-r1 https://github.com/FH1-ReImagined/ReIGlue
 cd ReIGlue
 git submodule update --init --recursive --depth 1
 git -C thirdparty/sdl3 apply "$PWD"/patches/sdl3/*.patch
+git -C thirdparty/FFmpeg apply "$PWD"/patches/ffmpeg/*.patch
 cmake --preset linux-amd64
 cmake --build out/build/linux-amd64 --config Release
 ```
 
 `patches/sdl3/` holds the one change to SDL (0147: endless haptic effects stay endless on Windows
-and macOS), applied to the SDL commit the SDK records. Forza Horizon 1: ReImagined's
+and macOS), and `patches/ffmpeg/` the one change to FFmpeg (0413: the XMA decoder reports each
+frame's skip fields), each applied to the submodule commit the SDK records. Forza Horizon 1: ReImagined's
 `tools/build_rexglue_sdk.sh` does all of this, builds only the GPU plugin (`rexgpu-xenos`), the
 runtime (`rexruntime`) and the code generator (`rexglue`), and installs them over an installed
 ReXGlue nightly of the same commit, which keeps them ABI-compatible with it.
