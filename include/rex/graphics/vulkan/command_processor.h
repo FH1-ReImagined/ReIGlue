@@ -355,6 +355,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     VkFence fence;
     std::vector<VkSemaphore> wait_semaphores;
     std::vector<VkPipelineStageFlags> wait_stage_masks;
+    // A job without a command buffer (command_buffer.buffer null): work to run on the thread
+    // after the jobs before it, the presenter's publish step (vulkan_present_on_submission_thread).
+    std::function<void()> callback;
   };
   void SubmissionThread();
   VkResult ReplayAndSubmit(const CommandBuffer& buffer, const DeferredCommandBuffer::Streams& streams,
@@ -364,6 +367,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   // failed to).
   void AwaitSubmissionThread(uint64_t submission);
   void ShutdownSubmissionThread();
+  // FH1 (#476), after Pinyon Shift (ShiftGlue 960d853, BSD-3): with vulkan_present_on_submission_thread,
+  // the swap does not wait for the thread to replay the frame. The presenter's publish step (making
+  // the image the next to present, painting it, the VR export and the image's fence) is queued
+  // behind the frame's submission instead, and the next swap waits for it only if it has not run.
+  void DeferPresentStep(std::function<void()> step);
+  // Waits until every queued publish step has run.
+  void AwaitPresentSteps();
 
   union TextureDescriptorSetLayoutKey {
     uint32_t key;
@@ -669,6 +679,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::atomic<uint64_t> submission_thread_submitted_{0};
   std::atomic<bool> submission_thread_failed_{false};
   std::atomic<bool> submission_thread_device_lost_{false};
+  // The presenter whose publish steps run on the submission thread (nullptr: none), the steps
+  // queued so far (command processor thread) and the steps the thread has run.
+  ui::Presenter* present_deferred_presenter_ = nullptr;
+  uint64_t present_steps_queued_ = 0;
+  std::atomic<uint64_t> present_steps_done_{0};
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
