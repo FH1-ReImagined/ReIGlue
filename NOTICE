@@ -24,6 +24,8 @@ Pinyon Shift
   part of its macOS pixel-math tuning (0082), and the small code model on Linux
   x86-64 (0400). The already-loaded-only RenderDoc probe (0407) follows Pinyon
   Shift's approach; its DynamicLibrary integration and tests are authored here.
+  The swap that no longer waits for the frame's replay (0414) follows its
+  vulkan_present_on_submission_worker (ShiftGlue 960d853).
 
 Downloaded at configure time, not stored in this repository (pinned revisions,
 SHA-256 checked; each license is installed beside the GPU library):
