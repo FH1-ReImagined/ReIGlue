@@ -9,6 +9,8 @@
  * @license     BSD 3-Clause License
  */
 
+#include <cstring>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/cvar.h>
@@ -715,6 +717,51 @@ TEST_CASE("Physical heap vE0000000 (4KB pages, write-combine)", "[memory][physic
 
   // Should be 4KB aligned
   CHECK((addr % 4096) == 0);
+
+  heap->Release(addr, nullptr);
+}
+
+TEST_CASE("The 0xE0000000 view is physical memory 4KB in, as compiled code reaches it",
+          "[memory][physical]") {
+  auto& memory = GetTestMemory();
+  auto* heap = MutableHeap(memory.LookupHeap(0xE0000000));
+  REQUIRE(heap != nullptr);
+
+  // What generated code (REX_PHYS_HOST_OFFSET) and GuestPtr add is what the
+  // runtime mapped: 0 on Windows (placeholder views), Linux and x86-64 macOS.
+  CHECK(heap->host_address_offset() == rex::memory::detail::PhysicalHostOffset(0xE0000000));
+#if REX_PLATFORM_WIN32 && !REX_WIN32_ROUNDED_PHYSICAL_VIEW
+  CHECK(heap->host_address_offset() == 0);
+#endif
+
+  uint32_t addr = 0;
+  REQUIRE(heap->Alloc(
+      0x3000, 4096, rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
+      rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite, false, &addr));
+  const uint32_t physical = memory.GetPhysicalAddress(addr);
+  CHECK(physical == addr - 0xE0000000 + 0x1000);
+
+  uint8_t* base = memory.virtual_membase();
+  uint8_t* view = rex::memory::GuestPtr(base, addr);
+  uint8_t* physical_view = memory.TranslatePhysical(physical);
+  CHECK(view == memory.TranslateVirtual(addr));
+  CHECK(memory.HostToGuestVirtual(view) == addr);
+  CHECK(view != physical_view);
+
+  // Written through one view, read through the other, across the 4KB pages.
+  for (uint32_t i = 0; i < 0x3000; i += 4) {
+    const uint32_t value = 0xE0000000u ^ (addr + i);
+    std::memcpy(view + i, &value, sizeof(value));
+  }
+  bool physical_matches = true;
+  for (uint32_t i = 0; i < 0x3000; i += 4) {
+    uint32_t value;
+    std::memcpy(&value, physical_view + i, sizeof(value));
+    physical_matches = physical_matches && value == (0xE0000000u ^ (addr + i));
+  }
+  CHECK(physical_matches);
+  physical_view[0x1FFF] = 0x5A;
+  CHECK(view[0x1FFF] == 0x5A);
 
   heap->Release(addr, nullptr);
 }

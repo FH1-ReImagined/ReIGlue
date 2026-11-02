@@ -26,20 +26,32 @@ namespace rex::stream {
 class ByteStream;
 }  // namespace rex::stream
 
+// 1 in a Windows build for systems before Windows 10 version 1803 (CMake option
+// REXGLUE_WIN32_ROUNDED_PHYSICAL_VIEW): see PhysicalHostOffset.
+#ifndef REX_WIN32_ROUNDED_PHYSICAL_VIEW
+#define REX_WIN32_ROUNDED_PHYSICAL_VIEW 0
+#endif
+
 namespace rex::memory::detail {
 
-/// Compensates for host allocation granularity coarser than 4KB on the 0xE0
-/// physical heap. When the granularity exceeds 0x1000, the backing file maps the
-/// 0xE0 heap at a 0x1000-byte offset that the mapping API rounds away (Windows
-/// MapViewOfFileEx rounds down to 64KB; macOS arm64 uses 16KB pages), so guest
-/// accesses must add it back. This must agree with Memory::MapViews, which only
-/// sets host_address_offset when allocation_granularity() > 0x1000:
-///   - Windows:        64KB granularity  -> offset
+/// Compensates for a 0xE0 physical view mapped short of its 4KB offset. The
+/// 0xE0 heap starts 0x1000 bytes into physical memory; where the backing file
+/// can only be mapped at offsets coarser than that, the view is mapped rounded
+/// down and guest accesses must add the 0x1000 back. This must agree with
+/// Memory::MapViews and PhysicalHeap::Initialize (host_address_offset), and
+/// with REX_PHYS_HOST_OFFSET in the generated code:
+///   - Windows:        placeholder views (VirtualAlloc2, MapViewOfFile3) map it
+///                     at its exact offset -> no offset; Memory::Initialize
+///                     refuses a Windows without them (before 10 version 1803).
+///                     A build with REX_WIN32_ROUNDED_PHYSICAL_VIEW maps it
+///                     with MapViewOfFileEx, its offset rounded down to the
+///                     64KB granularity -> offset
 ///   - macOS arm64:    16KB granularity  -> offset
 ///   - macOS x86_64:    4KB granularity  -> no offset
 ///   - Linux (any):     4KB granularity  -> no offset (mmap handles it natively)
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
+#if (REX_PLATFORM_WIN32 && REX_WIN32_ROUNDED_PHYSICAL_VIEW) || \
+    (REX_PLATFORM_MAC && defined(__aarch64__))
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
 #else
   return 0u;

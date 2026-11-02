@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-152 commits: 115 general (Performance 38, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+153 commits: 116 general (Performance 39, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
 FFmpeg (0413); see the README. Issue numbers (`#45`)
 in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
@@ -163,6 +163,7 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0400 | This branch | Build (Linux): the small code model, large on request ([#473](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/473)) | General | Codegen and build | Dyotson |
 | 0403 | This branch | Racing wheels: the vibration at a fixed pace, whatever the frame rate ([#467](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/467)) | General | Input | Dyotson |
 | 0404 | This branch | Racing wheels: an H-pattern shift through neutral is one gear change ([#468](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/468)) | **Forza** | Input | Dyotson |
+| 0405 | This branch | Windows: the 0xE0000000 view at its exact 4 KB offset, guest accesses add nothing ([#477](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/477)) | General | Performance | Dyotson |
 | 0406 | This branch | Vulkan: direct scaled depth texture uploads on NVIDIA ([#500](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/500)) | General | Performance | Sean O’Connor |
 | 0407 | This branch | RenderDoc: connect only to an already-loaded library ([#511](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/511)) | General | Runtime and platform | Sean O’Connor |
 | 0408 | This branch | D3D12: check both fence HRESULTs before waiting outside a submission ([ReIGlue #13](https://github.com/FH1-ReImagined/ReIGlue/issues/13)) | General | Runtime and platform | Sean O’Connor |

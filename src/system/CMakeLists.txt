@@ -112,6 +112,10 @@ if(WIN32)
     target_link_libraries(rexruntime PRIVATE ws2_32)
     target_link_libraries(rexruntime PUBLIC dxgi dxguid)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(REXGLUE_WIN32_ROUNDED_PHYSICAL_VIEW)
+        # The generated code's REX_PHYS_HOST_OFFSET must match the runtime's view.
+        target_compile_definitions(rexruntime PUBLIC REX_WIN32_ROUNDED_PHYSICAL_VIEW=1)
+    endif()
 endif()
 
 if(REXGLUE_USE_D3D12)
