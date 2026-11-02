@@ -146,6 +146,11 @@ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::pat
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
                   size_t file_offset);
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length);
+// Whether MapFileView takes any multiple of page_size() as file_offset, not only
+// multiples of allocation_granularity(). Always on POSIX (mmap). On Windows only
+// from 10 version 1803 on: MapViewOfFileEx takes multiples of the 64KB granularity,
+// and a finer offset needs a placeholder view (VirtualAlloc2, MapViewOfFile3).
+bool MapFileViewTakesPageOffsets();
 
 inline size_t hash_combine(size_t seed) {
   return seed;

@@ -35,6 +35,7 @@
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+#include <rex/thread/cores.h>
 #include <rex/vec128.h>
 
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
@@ -441,6 +442,12 @@ X_STATUS XThread::Create() {
 
     // Set name immediately, if we have one.
     thread_->set_name(thread_name_);
+    // linux_thread_cores places guest threads by their entry function: their names carry a
+    // handle that changes from run to run.
+    if (creation_params_.start_address) {
+      rex::thread::SetCurrentThreadPlacementAlias(
+          fmt::format("Guest_{:08X}", creation_params_.start_address));
+    }
 
     PROFILE_THREAD_ENTER(thread_name_.c_str());
     PROFILE_THREAD_CREATED();

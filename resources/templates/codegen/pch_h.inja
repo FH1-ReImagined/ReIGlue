@@ -124,7 +124,16 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Memory Access
 //=============================================================================
 
-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+// The 0xE0000000 view starts 4 KB into physical memory. The runtime maps it
+// there (on Windows with placeholder views: Windows 10 version 1803 and later),
+// so a guest access is base + address. Apple silicon (16 KB pages) and Windows
+// builds for older systems (REX_WIN32_ROUNDED_PHYSICAL_VIEW, the SDK's CMake
+// option REXGLUE_WIN32_ROUNDED_PHYSICAL_VIEW) map it 4 KB short: accesses at or
+// above 0xE0000000 add 0x1000. rex::memory::detail::PhysicalHostOffset agrees.
+#ifndef REX_WIN32_ROUNDED_PHYSICAL_VIEW
+#define REX_WIN32_ROUNDED_PHYSICAL_VIEW 0
+#endif
+#if (REX_PLATFORM_WIN32 && REX_WIN32_ROUNDED_PHYSICAL_VIEW) || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define REX_PHYS_HOST_OFFSET(addr) 0u

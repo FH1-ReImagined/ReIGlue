@@ -34,6 +34,19 @@ Pinyon Shift
   part of its macOS pixel-math tuning (0082), and the small code model on Linux
   x86-64 (0400). The already-loaded-only RenderDoc probe (0407) follows Pinyon
   Shift's approach; its DynamicLibrary integration and tests are authored here.
+  The swap that no longer waits for the frame's replay (0414) follows its
+  vulkan_present_on_submission_worker (ShiftGlue 960d853).
+  The thread placement by name on Linux (0415) follows its linux_thread_cores
+  (ShiftGlue 2849938), rule syntax and Steam Deck layout included.
+
+ShiftGlue
+  https://github.com/arcanite24/shiftglue-sdk
+  Pinyon Shift's fork of ReXGlue. Its code is under ReXGlue's license, the
+  same text as LICENSE here (Copyright (c) 2026, Tom Clay, with the Xenia
+  notice), not under LICENSE-Pinyon-Shift, which covers the Pinyon Shift game
+  repository's own files. Adapted here (changes by Brandon G. Neri in
+  ShiftGlue): the 0xE0000000 view mapped at its exact offset on Windows, with
+  placeholder views (0405).
 
 ShiftGlue
   https://github.com/arcanite24/shiftglue-sdk

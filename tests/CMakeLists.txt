@@ -20,6 +20,11 @@ add_test(NAME vulkan.pipeline_retirement COMMAND pipeline_retirement_test)
 # PPC instruction tests (requires PPC toolchain)
 add_subdirectory(ppc)
 
+# linux_thread_cores: core lists, name matching and the auto layout, header only.
+add_executable(thread_cores_test thread_cores_test.cpp)
+target_include_directories(thread_cores_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME thread.cores COMMAND thread_cores_test)
+
 add_executable(wheel_gear_transit_test wheel_gear_transit_test.cpp)
 target_include_directories(wheel_gear_transit_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME input.wheel_gear_transit COMMAND wheel_gear_transit_test)
