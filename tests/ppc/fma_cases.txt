@@ -1,0 +1,35 @@
+# Cases whose expected values need vmaddfp/vnmsubfp with one rounding, as the console computes
+# them. Without FMA (a CPU without it, or REX_PPC_FMA=0) the generated code multiplies, then
+# adds, and these cases skip (resources/templates/codegen/_ppc_vmx.inja says how far that is off).
+# One test name a line, as ppc_tests lists them; rexglue recompile-tests refuses a name that
+# no test has.
+
+vmaddfp.test_1  # xenia-canary's: 1.1 * 1.1 + 1.1, 0x4013D70B with one rounding
+vmaddcfp128_destination.test_fused  # (1 + 2^-23) * (1 - 2^-23) - 1 = -2^-46, 0 rounded twice
+
+# Recorded on an Xbox 360 (instr_vmaddfp_hw.s, instr_vnmsubfp_hw.s): rounding, cancellation,
+# and products that underflow
+vmaddfp_hw.test_vmaddfp_1897_GEN
+vmaddfp_hw.test_vmaddfp_2072_GEN
+vmaddfp_hw.test_vmaddfp_2157_GEN
+vmaddfp_hw.test_vmaddfp_2169_GEN
+vmaddfp_hw.test_vmaddfp_7879_GEN
+vmaddfp_hw.test_vmaddfp_10551_GEN
+vmaddfp_hw.test_vmaddfp_11780_GEN
+vmaddfp_hw.test_vmaddfp_12391_GEN
+vmaddfp_hw.test_vmaddfp_14053_GEN
+vnmsubfp_hw.test_vnmsubfp_2071_GEN
+vnmsubfp_hw.test_vnmsubfp_2073_GEN
+vnmsubfp_hw.test_vnmsubfp_2077_GEN
+vnmsubfp_hw.test_vnmsubfp_3883_GEN
+vnmsubfp_hw.test_vnmsubfp_7673_GEN
+vnmsubfp_hw.test_vnmsubfp_11827_GEN
+vnmsubfp_hw.test_vnmsubfp_12295_GEN
+vnmsubfp_hw.test_vnmsubfp_12402_GEN
+vnmsubfp_hw.test_vnmsubfp_14252_GEN
+
+# The *_special.s cases: overflow of a rounded product, and the single rounding of the VMX128 forms
+vmaddfp_special.test_3
+vmaddfp128_special.test_2
+vmaddcfp128_special.test_2
+vnmsubfp128_special.test_2

@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-153 commits: 116 general (Performance 39, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+156 commits: 119 general (Performance 39, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
 FFmpeg (0413); see the README. Issue numbers (`#45`)
 in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
@@ -173,3 +173,6 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0413 | This branch | XMA decoder: a wave's warm-up frame mid-stream is not played (the engine note breaking up; FFmpeg patch in `patches/ffmpeg/`) | General | Runtime and platform | Scott |
 | 0414 | This branch | Vulkan: the swap does not wait for the frame's replay; the presenter's publish step runs on the submission thread (`vulkan_present_on_submission_thread`, off by default; idea from Pinyon Shift) ([#476](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/476)) | General | Performance | Dyotson |
 | 0415 | This branch | Linux: place threads on CPU cores by name (`linux_thread_cores`, off by default; guest threads by their entry function; an `auto` layout for a 4-core CPU such as a Steam Deck; idea from Pinyon Shift) ([#475](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/475)) | General | Performance | Dyotson |
+| 0416 | This branch | Codegen: vmaddfp and vnmsubfp round once, as on Xenon ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0417 | This branch | Codegen: vmaxfp and vminfp with Xenon's NaN, zero and denormal results ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0418 | This branch | Codegen: vmsum3fp128 and vmsum4fp128 always in Xenon's order ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |

@@ -299,7 +299,33 @@ std::string CategoryFromStem(std::string_view stem) {
   return "misc";
 }
 
-bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::string_view outDir) {
+/* Test names (as BuildHierarchicalName gives them), one a line, '#' to the end of a line is a
+   comment. */
+bool ReadTestNameList(const std::string& path, std::unordered_set<std::string>& names) {
+  std::ifstream in(path);
+  if (!in.is_open()) {
+    REXLOG_ERROR("Unable to open test list: {}", path);
+    return false;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    if (auto hash = line.find('#'); hash != std::string::npos)
+      line.resize(hash);
+    line = rex::string::trim_string(line);
+    if (!line.empty())
+      names.insert(line);
+  }
+  return true;
+}
+
+bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::string_view outDir,
+                    const std::string& fmaCasesPath) {
+  // Cases whose expected values need a multiply-add with one rounding: they skip at run time
+  // when the generated code multiplies, then adds (REX_PPC_FMA=0 or a CPU without FMA).
+  std::unordered_set<std::string> fmaCases;
+  if (!fmaCasesPath.empty() && !ReadTestNameList(fmaCasesPath, fmaCases))
+    return false;
+
   std::array<ui::KeyValueRow, 3> header_rows = {{
       {"Bin dir", std::string(binDir)},
       {"ASM dir", std::string(asmDir)},
@@ -425,6 +451,7 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
     for (const auto& spec : specs) {
       nlohmann::json testJson;
       testJson["name"] = BuildHierarchicalName(stem, spec.name);
+      testJson["needs_fma"] = fmaCases.erase(testJson["name"].get<std::string>()) > 0;
       testJson["category"] = category;
       testJson["stem"] = stem;
       testJson["symbol"] = spec.symbol;
@@ -435,6 +462,12 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
       templateData["tests"].push_back(testJson);
       ++totalTests;
     }
+  }
+
+  if (!fmaCases.empty()) {
+    for (const auto& name : fmaCases)
+      REXLOG_ERROR("{} names a test that does not exist: {}", fmaCasesPath, name);
+    return false;
   }
 
   codegen::TemplateRegistry registry;
@@ -456,6 +489,7 @@ struct RecompileTestsArgs {
   std::string bin_dir;
   std::string asm_dir;
   std::string output;
+  std::string fma_cases;
 };
 
 }  // namespace
@@ -474,9 +508,12 @@ void RegisterRecompileTests(CLI::App& parent, const CliContext& ctx, DeferredAct
   sub->add_option("--output", args->output, "Output path for recompile-tests")
       ->type_name("PATH")
       ->required();
+  sub->add_option("--fma-cases", args->fma_cases,
+                  "File naming the tests that need a multiply-add with one rounding")
+      ->type_name("PATH");
   sub->callback([args, &pending]() {
     pending = [args]() -> rex::Result<void> {
-      if (!RecompileTests(args->bin_dir, args->asm_dir, args->output)) {
+      if (!RecompileTests(args->bin_dir, args->asm_dir, args->output, args->fma_cases)) {
         return Err<void>(rex::ErrorCategory::Validation, "Test recompilation failed");
       }
       return rex::Ok();
