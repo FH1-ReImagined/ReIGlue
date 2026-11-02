@@ -153,7 +153,9 @@ class VulkanPresenter final : public Presenter {
                               uint32_t frontbuffer_height,
                               std::function<bool(GuestOutputRefreshContext& context)> refresher,
                               bool& is_8bpc_out_ref) override;
-  void GuestOutputRefreshSubmitted(uint32_t mailbox_index) override;
+  // The part of a refresh after the refresher's work is on the queue (Presenter's
+  // GuestOutputRefreshSubmittedCallback with a publish deferrer, #476).
+  void GuestOutputRefreshSubmitted(uint32_t mailbox_index);
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
 

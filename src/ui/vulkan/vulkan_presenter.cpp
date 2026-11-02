@@ -2808,6 +2808,11 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
+  // With a publish deferrer (#476), the deferred step closes the refresh (0419: a callback, not
+  // a virtual function, so ui::Presenter keeps the nightly's virtual table).
+  SetGuestOutputRefreshSubmittedCallback(
+      [this](uint32_t mailbox_index) { GuestOutputRefreshSubmitted(mailbox_index); });
+
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
   guest_output_image_sampler_bindings[0].binding = 0;
   guest_output_image_sampler_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
