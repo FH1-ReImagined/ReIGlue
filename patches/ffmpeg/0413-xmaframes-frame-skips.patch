@@ -1,0 +1,55 @@
+diff --git a/libavcodec/wmaprodec.c b/libavcodec/wmaprodec.c
+index 704c0a4..a2d38d3 100644
+--- a/libavcodec/wmaprodec.c
++++ b/libavcodec/wmaprodec.c
+@@ -238,6 +238,8 @@ typedef struct WMAProDecodeCtx {
+     WMAProChannelGrp chgroup[WMAPRO_MAX_CHANNELS];  ///< channel group information
+ 
+     WMAProChannelCtx channel[WMAPRO_MAX_CHANNELS];  ///< per channel data
++    int      start_skip;                    ///< last frame's start skip field, -1 = absent
++    int      end_skip;                      ///< last frame's end skip field, -1 = absent
+ } WMAProDecodeCtx;
+ 
+ typedef struct XMADecodeCtx {
+@@ -1460,6 +1462,7 @@ static int decode_frame(WMAProDecodeCtx *s, AVFrame *frame, int *got_frame_ptr)
+         ff_dlog(s->avctx, "drc_gain %i\n", s->drc_gain);
+     }
+ 
++    s->start_skip = s->end_skip = -1;
+     /** no idea what these are for, might be the number of samples
+         that need to be skipped at the beginning or end of a stream */
+     if (get_bits1(gb)) {
+@@ -1469,12 +1472,14 @@ static int decode_frame(WMAProDecodeCtx *s, AVFrame *frame, int *got_frame_ptr)
+         if (get_bits1(gb)) {
+             skip = get_bits(gb, av_log2(s->samples_per_frame * 2));
+             ff_dlog(s->avctx, "start skip: %i\n", skip);
++            s->start_skip = skip;
+         }
+ 
+         /** sometimes true for the last frame */
+         if (get_bits1(gb)) {
+             skip = get_bits(gb, av_log2(s->samples_per_frame * 2));
+             ff_dlog(s->avctx, "end skip: %i\n", skip);
++            s->end_skip = skip;
+         }
+ 
+     }
+@@ -2093,6 +2098,18 @@ static int xmaframes_decode_packet(AVCodecContext *avctx, void *data,
+     return avpkt->size;
+ }
+ 
++/**
++ *@brief The start and end skip fields (samples, -1 = absent) of the frame the xmaframes
++ * decoder decoded last. It plays them (the hardware drops them): the caller trims.
++ */
++int ff_xmaframes_frame_skips(AVCodecContext *avctx, int *start_skip, int *end_skip)
++{
++    const WMAProDecodeCtx *s = avctx->priv_data;
++    *start_skip = s->start_skip;
++    *end_skip = s->end_skip;
++    return 0;
++}
++
+ /**
+  *@brief wmapro decoder
+  */

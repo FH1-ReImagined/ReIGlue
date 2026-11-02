@@ -13,9 +13,10 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-150 commits: 113 general (Performance 37, Xenos GPU 27, Input 18, Runtime and platform 14, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
-`patches/sdl3/` holds the one patch to the SDL submodule (0147); see the README. Issue numbers
-(`#45`) in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
+153 commits: 116 general (Performance 39, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+`patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
+FFmpeg (0413); see the README. Issue numbers (`#45`)
+in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
 
 | # | Commit | Change | Scope | Area | Author |
 | --- | --- | --- | --- | --- | --- |
@@ -169,3 +170,6 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
 | 0409 | This branch | FH1 split: startup movies whole at a 1080p output ([#539](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/539)) | **Forza** | Upscaling and HUD | Dyotson |
 | 0411 | This branch | Resolve readback: a range the game reads on the CPU waits for the GPU (`readback_resolve_wait_range`) ([#552](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/552)) | General | Xenos GPU | Dyotson |
 | 0412 | This branch | Racing wheels: a device setting finds a device that has no name (matching by vid:pid, a known nameless pedal set, shifter, handbrake or wheel), and the log lists every joystick when one is missing ([#562](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/562)) | General | Input | Dyotson |
+| 0413 | This branch | XMA decoder: a wave's warm-up frame mid-stream is not played (the engine note breaking up; FFmpeg patch in `patches/ffmpeg/`) | General | Runtime and platform | Scott |
+| 0414 | This branch | Vulkan: the swap does not wait for the frame's replay; the presenter's publish step runs on the submission thread (`vulkan_present_on_submission_thread`, off by default; idea from Pinyon Shift) ([#476](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/476)) | General | Performance | Dyotson |
+| 0415 | This branch | Linux: place threads on CPU cores by name (`linux_thread_cores`, off by default; guest threads by their entry function; an `auto` layout for a 4-core CPU such as a Steam Deck; idea from Pinyon Shift) ([#475](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/475)) | General | Performance | Dyotson |

@@ -10,6 +10,7 @@
 */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include <rex/audio/xma/context.h>
@@ -32,6 +33,9 @@ extern "C" {
 #pragma warning(pop)
 #endif
 }  // extern "C"
+
+// The skip fields of the frame the xmaframes decoder decoded last (thirdparty/FFmpeg).
+extern "C" int ff_xmaframes_frame_skips(AVCodecContext* avctx, int* start_skip, int* end_skip);
 
 // Credits for most of this code goes to:
 // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
@@ -798,6 +802,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   if (decoded) {
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                  decoded_frame_.data());
+    int frame_start_skip = -1, frame_end_skip = -1;
+    ff_xmaframes_frame_skips(av_context_, &frame_start_skip, &frame_end_skip);
 
     // Realign the decoder's output onto the bitstream's sample numbering: the
     // samples of the frame just decoded run from kDecoderStartPadding into this
@@ -817,20 +823,37 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
                                  : 0;
     loop_start_skip_pending_ = false;
 
-    if (carry_valid_) {
-      std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
-      std::memcpy(raw_frame_.data() + carry_bytes, decoded_frame_.data(), pad_bytes);
+    // A frame whose start skip covers all of it opens a new wave mid-stream: FMOD chains waves
+    // through one context without clearing it (FH1's engine layers, as often as every 6 frames),
+    // each opening with the encoder's warm-up frame. The hardware drops those samples, so one wave
+    // runs straight into the next; played, they put the last wave's decaying tail and ~130 samples
+    // of silence between every two (the engine note breaking up). Decoded for the codec's state
+    // only; the carry waits for the next frame. A stream's own first frame (no carry) keeps the
+    // alignment above. REX_XMA_PLAY_START_SKIP=1: those frames played, as before.
+    static const bool play_start_skip = [] {
+      const char* v = std::getenv("REX_XMA_PLAY_START_SKIP");
+      return v && *v && *v != '0';
+    }();
+    const bool warm_up = !play_start_skip && carry_valid_ &&
+                         frame_start_skip >= static_cast<int>(kSamplesPerFrame) &&
+                         !is_loop_end_frame && decoded_start_skip == 0;
 
-      current_frame_remaining_subframes_ = 4 << data->is_stereo;
-      loop_frame_output_limit_ = pending_output_limit_;
-      current_frame_remaining_subframes_ -=
-          std::min(pending_start_skip_, current_frame_remaining_subframes_);
+    if (!warm_up) {
+      if (carry_valid_) {
+        std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+        std::memcpy(raw_frame_.data() + carry_bytes, decoded_frame_.data(), pad_bytes);
+
+        current_frame_remaining_subframes_ = 4 << data->is_stereo;
+        loop_frame_output_limit_ = pending_output_limit_;
+        current_frame_remaining_subframes_ -=
+            std::min(pending_start_skip_, current_frame_remaining_subframes_);
+      }
+
+      std::memcpy(carry_frame_.data(), decoded_frame_.data() + pad_bytes, carry_bytes);
+      carry_valid_ = true;
+      pending_output_limit_ = decoded_output_limit;
+      pending_start_skip_ = decoded_start_skip;
     }
-
-    std::memcpy(carry_frame_.data(), decoded_frame_.data() + pad_bytes, carry_bytes);
-    carry_valid_ = true;
-    pending_output_limit_ = decoded_output_limit;
-    pending_start_skip_ = decoded_start_skip;
   } else {
     // A dropped frame breaks the carry's adjacency; re-prime rather than splice
     // two blocks that are not neighbors.
