@@ -574,12 +574,19 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
   bool is_active = writable_properties.IsActive();
+  const uint32_t mailbox_index = guest_output_mailbox_writable_;
   if (is_active) {
-    if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
-                                frontbuffer_height, refresher, writable_properties.is_8bpc)) {
+    if (!RefreshGuestOutputImpl(mailbox_index, frontbuffer_width, frontbuffer_height, refresher,
+                                writable_properties.is_8bpc)) {
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
+      if (guest_output_publish_deferrer_) {
+        // The refresher may still have queued work referencing the image: its tracking is
+        // closed after that work (the deferred step), as without a deferrer.
+        guest_output_publish_deferrer_(
+            [this, mailbox_index]() { GuestOutputRefreshSubmitted(mailbox_index); });
+      }
       return false;
     }
     guest_output_active_last_refresh_ = true;
@@ -592,6 +599,20 @@ bool Presenter::RefreshGuestOutput(
     guest_output_active_last_refresh_ = false;
   }
 
+  if (guest_output_publish_deferrer_) {
+    guest_output_publish_deferrer_([this, is_active, mailbox_index]() {
+      if (is_active) {
+        GuestOutputRefreshSubmitted(mailbox_index);
+      }
+      PublishGuestOutput();
+    });
+  } else {
+    PublishGuestOutput();
+  }
+  return is_active;
+}
+
+void Presenter::PublishGuestOutput() {
   // Make the new image the next to present on the host (the "ready" one),
   // replacing the one already specified as the next (dropping it instead of
   // enqueueing the new image after it) to achieve the lowest latency (also,
@@ -661,8 +682,6 @@ bool Presenter::RefreshGuestOutput(
       host_gpu_loss_callback_(false, false);
     }
   }
-
-  return is_active;
 }
 
 void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
