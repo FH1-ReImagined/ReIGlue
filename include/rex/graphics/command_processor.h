@@ -264,6 +264,9 @@ class CommandProcessor {
   // image) then has a buffer per pass, so the rare copy is a first-seen key: "some" copies it
   // back, and "fast" does not hand the CPU the other pass's data of the previous resolve.
   uint64_t GetReadbackResolveKey(uint32_t written_address, uint32_t written_length) const;
+  // Whether the written range meets readback_resolve_wait_range: a range a game reads on the CPU
+  // right after resolving to it, which "some" and "fast" copy back as "full" does (0411).
+  bool IsReadbackWaitRange(uint32_t written_address, uint32_t written_length) const;
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 

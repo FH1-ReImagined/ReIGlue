@@ -165,7 +165,61 @@ struct JoyInfo {
   std::string guid;  // SDL's, 32 hex digits
   uint16_t vid = 0, pid = 0;
   bool sdl_wheel = false;  // SDL says it is a wheel (its list of wheel bases)
+  int axes = -1, buttons = -1, hats = -1;  // only known for the log (DescribeJoystick); -1: not
 };
+
+// Whether a joystick has no name of its own: none at all, or the vendor and product ids SDL falls
+// back to ("44F B669" from Windows for Thrustmaster's wheels, "0x044f/0xb669" from SDL 3). A name
+// setting cannot match it, and the launcher (SDL 2, DirectInput) shows it by the product name
+// Windows has in its registry: "Thrustmaster TX Racing Wheel" (#562).
+inline bool IsNamelessJoystick(const JoyInfo& j) {
+  std::string n = AuxLower(j.name);
+  for (size_t at; (at = n.find("0x")) != std::string::npos;) {
+    n.erase(at, 2);
+  }
+  std::vector<uint32_t> ids;
+  uint32_t cur = 0;
+  bool in_number = false;
+  for (char c : n) {
+    if (std::isxdigit(static_cast<unsigned char>(c))) {
+      cur = cur * 16 + (std::isdigit(static_cast<unsigned char>(c)) ? c - '0' : c - 'a' + 10);
+      in_number = true;
+    } else if ((c == ' ' || c == '/' || c == ':') && in_number) {
+      ids.push_back(cur);
+      cur = 0;
+      in_number = false;
+    } else {
+      return n.empty();
+    }
+  }
+  if (in_number) {
+    ids.push_back(cur);
+  }
+  return n.empty() || (ids.size() == 2 && ids[0] == j.vid && ids[1] == j.pid);
+}
+
+// One line for the log about a joystick: what a bug report needs to say why a setting did not
+// find it (the name, the ids, the GUID and the counts, when known).
+inline std::string DescribeJoystick(const JoyInfo& j) {
+  char buf[512];
+  std::snprintf(buf, sizeof(buf), "\"%s\" GUID(%s) VID(0x%04X) PID(0x%04X)", j.name.c_str(),
+                j.guid.c_str(), static_cast<unsigned>(j.vid), static_cast<unsigned>(j.pid));
+  std::string out = buf;
+  if (j.axes >= 0) {
+    std::snprintf(buf, sizeof(buf), " axes(%d) buttons(%d) hats(%d)", j.axes, j.buttons, j.hats);
+    out += buf;
+  }
+  if (j.sdl_wheel) {
+    out += ", SDL wheel";
+  }
+  if (IsNamelessJoystick(j)) {
+    out += ", no name of its own";
+  }
+  if (const AuxModel* m = FindAuxModel(j.vid, j.pid)) {
+    out += std::string(", known: ") + m->name;
+  }
+  return out;
+}
 
 // wheel_pedal_device / wheel_shifter_device: "" or "auto" finds one, "none" (also "off", "wheel")
 // reads them from the wheel, anything else names one.
@@ -209,6 +263,8 @@ struct AuxPick {
   int pedals = -1;
   int shifter = -1;
   std::vector<int> other;
+  bool pedals_nameless = false;   // found by its USB id, the setting's name matching nothing
+  bool shifter_nameless = false;  // (PickNamelessOfRole)
   bool IsAux(int i) const {
     return i == pedals || i == shifter || std::find(other.begin(), other.end(), i) != other.end();
   }
@@ -230,6 +286,21 @@ inline int PickNamed(const std::vector<JoyInfo>& joys, const std::string& settin
   return best;
 }
 
+// A name setting that matches no joystick (by name, GUID or vid:pid) can still mean one with no
+// name of its own, which no name matches: the launcher lists such a device by the product name
+// its Windows driver registers, the game's SDL gets none (Thrustmaster's, #562). The first
+// nameless joystick of a known model with this role stands for it; `skip` is one already taken.
+// A named device that is not connected stays missing: a joystick with a name never stands in.
+inline int PickNamelessOfRole(const std::vector<JoyInfo>& joys, AuxRole role, int skip = -1) {
+  for (int i = 0; i < static_cast<int>(joys.size()); i++) {
+    const AuxModel* m = FindAuxModel(joys[i].vid, joys[i].pid);
+    if (i != skip && m && m->role == role && IsNamelessJoystick(joys[i])) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 inline AuxPick PickAuxDevices(const std::vector<JoyInfo>& joys, const std::string& pedal_setting,
                               const std::string& shifter_setting) {
   AuxPick p;
@@ -237,9 +308,17 @@ inline AuxPick PickAuxDevices(const std::vector<JoyInfo>& joys, const std::strin
   const DeviceChoice sc = ParseDeviceChoice(shifter_setting);
   if (pc == DeviceChoice::kNamed) {
     p.pedals = PickNamed(joys, pedal_setting);
+    if (p.pedals < 0) {
+      p.pedals = PickNamelessOfRole(joys, AuxRole::kPedals);
+      p.pedals_nameless = p.pedals >= 0;
+    }
   }
   if (sc == DeviceChoice::kNamed) {
     p.shifter = PickNamed(joys, shifter_setting);
+    if (p.shifter < 0) {
+      p.shifter = PickNamelessOfRole(joys, AuxRole::kShifter, p.pedals);
+      p.shifter_nameless = p.shifter >= 0;
+    }
   }
   for (int i = 0; i < static_cast<int>(joys.size()); i++) {
     const AuxRole role = DetectAuxRole(joys[i].vid, joys[i].pid, joys[i].name);

@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -120,6 +121,24 @@ class TextureCache {
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
+  // FH1 split (0409, #539): screen resolves written from a raster that fills the scaled
+  // surface (the scene's), as opposed to the HUD target's fractional raster at a 1080p output,
+  // which fills only its top-left part. The HUD's shaders scale screen texture coordinates to
+  // that part, which must not happen for the former (a startup movie frame, resolved from the
+  // scene and drawn by the HUD). Set or cleared by each resolve, one bit per 4 KB page.
+  void Fh1MarkFullRasterResolve(uint32_t address, uint32_t length, bool full) {
+    if (!length || address >= SharedMemory::kBufferSize) return;
+    const uint32_t last = (std::min(address + (length - 1), SharedMemory::kBufferSize - 1)) >> 12;
+    for (uint32_t page = address >> 12; page <= last; ++page) {
+      if (full) fh1_full_raster_pages_[page >> 6] |= UINT64_C(1) << (page & 63);
+      else fh1_full_raster_pages_[page >> 6] &= ~(UINT64_C(1) << (page & 63));
+    }
+  }
+  bool IsActiveFh1FullRasterTexture(uint32_t index) const {
+    if (!IsActiveFh1ScreenTexture(index)) return false;
+    const uint32_t page = GetValidTextureBinding(index)->texture->key().base_page;
+    return (fh1_full_raster_pages_[page >> 6] >> (page & 63)) & 1;
+  }
   bool IsActiveFh1ScreenTexture(uint32_t index) const {
     const auto* binding = GetValidTextureBinding(index);
     if (!binding || !binding->texture || !binding->texture->key().scaled_resolve ||
@@ -640,6 +659,8 @@ class TextureCache {
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+  // FH1 split (0409): Fh1MarkFullRasterResolve's pages.
+  uint64_t fh1_full_raster_pages_[SharedMemory::kBufferSize >> (12 + 6)] = {};
 
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;

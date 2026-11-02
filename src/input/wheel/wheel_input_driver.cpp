@@ -498,6 +498,34 @@ std::vector<JoyInfo> JoyInfos(const SDL_JoystickID* ids, int count) {
   return out;
 }
 
+// Every SDL joystick the game sees, in the log: when a device the settings name is missing, what
+// there is instead (its name, ids, GUID, axes and buttons) is what a report needs (#562). Said
+// again only when the list changes. A gamepad is not opened for its counts.
+void LogJoysticks(const std::vector<SDL_JoystickID>& jids, std::vector<JoyInfo> joys) {
+  static std::string logged;
+  std::string key;
+  for (const JoyInfo& j : joys) {
+    key += DescribeJoystick(j) + "\n";
+  }
+  if (key == logged) {
+    return;
+  }
+  logged = key;
+  REXLOG_INFO("Wheel: SDL sees {} joystick(s)", joys.size());
+  for (size_t i = 0; i < joys.size(); i++) {
+    if (!SDL_IsGamepad(jids[i])) {
+      if (SDL_Joystick* joy = SDL_OpenJoystick(jids[i])) {  // already open: the same, counted
+        joys[i].axes = SDL_GetNumJoystickAxes(joy);
+        joys[i].buttons = SDL_GetNumJoystickButtons(joy);
+        joys[i].hats = SDL_GetNumJoystickHats(joy);
+        SDL_CloseJoystick(joy);
+      }
+    }
+    REXLOG_INFO("Wheel:   joystick {}: {}{}", i, DescribeJoystick(joys[i]),
+                SDL_IsGamepad(jids[i]) ? ", a gamepad (not opened)" : "");
+  }
+}
+
 // The shifter's gear buttons: on a shifter device its own (known model, then
 // wheel_shifter_device_buttons), else the wheel's.
 ShifterMap EffectiveShifter(uint16_t vid, uint16_t pid, const AuxDevice& shifter_device) {
@@ -814,8 +842,10 @@ void WheelInputDriver::RescanLocked() {
   const SDL_JoystickID pedal_jid = pick.pedals >= 0 ? ids[pick.pedals] : 0;
   const SDL_JoystickID shifter_jid = pick.shifter >= 0 ? ids[pick.shifter] : 0;
   // An analog handbrake on its own device (#303), which may also be the pedal or shifter device.
+  bool handbrake_nameless = false;
   const int handbrake = PickHandbrakeDevice(JoyInfos(ids, ids ? count : 0),
-                                            REXCVAR_GET(wheel_handbrake_device));
+                                            REXCVAR_GET(wheel_handbrake_device),
+                                            &handbrake_nameless);
   const SDL_JoystickID handbrake_jid = handbrake >= 0 ? ids[handbrake] : 0;
   // The wheels (wheel_primary.h): wheel-like devices that are not read as another's pedals,
   // shifter or handbrake, and the one wheel_device names. Ordered once they are open.
@@ -832,13 +862,15 @@ void WheelInputDriver::RescanLocked() {
     wanted.push_back(jids[i]);
   }
   SDL_free(ids);
-  // A device named in the settings that is not there: said once until it comes.
+  // A device named in the settings that is not there: said once until it comes, with every
+  // joystick the game does see (#562).
   static std::string logged_missing[3];
-  auto note_missing = [](int k, const char* key, const std::string& setting, bool found) {
+  auto note_missing = [&](int k, const char* key, const std::string& setting, bool found) {
     if (ParseDeviceChoice(setting) == DeviceChoice::kNamed && !found &&
         logged_missing[k] != setting) {
       logged_missing[k] = setting;
       REXLOG_INFO("Wheel: {} \"{}\" is not connected", key, setting);
+      LogJoysticks(jids, joys);
     } else if (found) {
       logged_missing[k].clear();
     }
@@ -847,6 +879,24 @@ void WheelInputDriver::RescanLocked() {
   note_missing(1, "wheel_shifter_device", REXCVAR_GET(wheel_shifter_device), shifter_jid != 0);
   note_missing(2, "wheel_handbrake_device", REXCVAR_GET(wheel_handbrake_device),
                handbrake_jid != 0);
+  // A setting's name that matches nothing, but a joystick with no name of its own is the known
+  // device of that role: it is taken for it (PickNamelessOfRole), said once.
+  static SDL_JoystickID logged_nameless[3];
+  auto note_nameless = [&](int k, const char* key, const std::string& setting, bool nameless,
+                           int index) {
+    const SDL_JoystickID jid = nameless && index >= 0 ? jids[index] : 0;
+    if (jid && logged_nameless[k] != jid) {
+      REXLOG_INFO("Wheel: {} \"{}\" matches no joystick by name; taking {}", key, setting,
+                  DescribeJoystick(joys[index]));
+    }
+    logged_nameless[k] = jid;
+  };
+  note_nameless(0, "wheel_pedal_device", REXCVAR_GET(wheel_pedal_device), pick.pedals_nameless,
+                pick.pedals);
+  note_nameless(1, "wheel_shifter_device", REXCVAR_GET(wheel_shifter_device),
+                pick.shifter_nameless, pick.shifter);
+  note_nameless(2, "wheel_handbrake_device", REXCVAR_GET(wheel_handbrake_device),
+                handbrake_nameless, handbrake);
   if (wheels_.empty() && wanted.empty() && !logged_none_) {
     logged_none_ = true;
     REXLOG_INFO("Wheel: no wheel among {} SDL joystick(s)", count);
@@ -876,6 +926,7 @@ void WheelInputDriver::RescanLocked() {
     }
   }
   const std::vector<int> order = WheelOrder(joys, wheel_like, ffb, aux, wheel_device);
+  const std::vector<int> wheel_scores = WheelDeviceScores(joys, wheel_like, aux, wheel_device);
   auto rank = [&](SDL_JoystickID jid) {
     for (size_t k = 0; k < order.size(); k++) {
       if (jids[order[k]] == jid) {
@@ -889,7 +940,10 @@ void WheelInputDriver::RescanLocked() {
   static SDL_JoystickID logged_primary = 0;
   if (!wheels_.empty() && wheels_[0]->jid != logged_primary) {
     logged_primary = wheels_[0]->jid;
-    const bool named = WheelDeviceMatch(wheel_device, JoyInfos(&logged_primary, 1)[0]) > 0;
+    bool named = false;
+    for (size_t i = 0; i < jids.size(); i++) {
+      named = named || (jids[i] == logged_primary && wheel_scores[i] > 0);
+    }
     if (named || wheels_.size() > 1) {
       REXLOG_INFO("Wheel: \"{}\" is the wheel (the first player's; {})", wheels_[0]->name,
                   named              ? "wheel_device"
@@ -898,12 +952,12 @@ void WheelInputDriver::RescanLocked() {
     }
   }
   if (ParseDeviceChoice(wheel_device) == DeviceChoice::kNamed &&
-      std::none_of(joys.begin(), joys.end(),
-                   [&](const JoyInfo& j) { return WheelDeviceMatch(wheel_device, j) > 0; })) {
+      std::none_of(wheel_scores.begin(), wheel_scores.end(), [](int s) { return s > 0; })) {
     static std::string logged_wheel_missing;
     if (logged_wheel_missing != wheel_device) {
       logged_wheel_missing = wheel_device;
       REXLOG_INFO("Wheel: wheel_device \"{}\" is not connected", wheel_device);
+      LogJoysticks(jids, joys);
     }
   }
   // The pedal device and the shifter device go with the first wheel; unplugged, the wheel's own

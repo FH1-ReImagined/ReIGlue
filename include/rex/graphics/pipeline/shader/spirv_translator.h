@@ -314,7 +314,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // ZW: inverse of that ratio for generated guest pixel coordinates.
     float fh1_native[4];
     uint32_t fh1_native_textures;
-    uint32_t fh1_padding[3];
+    // 0409: the fetch constants whose screen texture was resolved from a raster that fills the
+    // scaled surface; fractional-raster (HUD) shaders do not scale their coordinates.
+    uint32_t fh1_full_raster_textures;
+    uint32_t fh1_padding[2];
     // Patch 0396: VR true stereo: subtracted from the guest's clip-space position (the eye's
     // offset for the main view's 3D draws; zero for every other draw).
     float fh1_vr_eye[4];
@@ -902,6 +905,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramBlendConstant,
     kSystemConstantFh1Native,
     kSystemConstantFh1NativeTextures,
+    kSystemConstantFh1FullRasterTextures,
     kSystemConstantFh1VrEye,
   };
   spv::Id uniform_system_constants_;
