@@ -561,6 +561,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
+  // FH1 (#536): resolves of this size or more are not copied back without a wait (a car's targets
+  // are 4-64 KB; the thumbnail of a vinyl group, 256x128, is exactly this).
+  static constexpr uint32_t kDeferMaxBytes = 128 * 1024;
   static inline uint32_t AlignReadbackBufferSize(uint32_t size) {
     if (size < 1 * 1024 * 1024) {
       return rex::align(size, 256u * 1024u);
