@@ -32,3 +32,12 @@ add_test(NAME input.wheel_gear_transit COMMAND wheel_gear_transit_test)
 add_executable(wheel_rumble_pace_test wheel_rumble_pace_test.cpp)
 target_include_directories(wheel_rumble_pace_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME input.wheel_rumble_pace COMMAND wheel_rumble_pace_test)
+
+# The presenter's publish deferrer (#476, 0419): a fake presenter against the runtime, no GPU.
+add_executable(presenter_publish_deferrer_test presenter_publish_deferrer_test.cpp)
+target_include_directories(presenter_publish_deferrer_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(presenter_publish_deferrer_test PRIVATE rexruntime)
+# Next to the runtime library, which Windows loads from the program's folder.
+set_target_properties(presenter_publish_deferrer_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
+add_test(NAME ui.presenter_publish_deferrer COMMAND presenter_publish_deferrer_test)

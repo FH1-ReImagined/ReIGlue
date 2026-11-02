@@ -365,11 +365,13 @@ class Presenter {
   // RefreshGuestOutput. The deferrer must run the steps in order, each once the refresher's GPU
   // work is on the queue, and all before the next RefreshGuestOutput call. Set it only while no
   // refresh is in progress.
+  // 0419: the deferrer (and the backend's GuestOutputRefreshSubmittedCallback) are kept outside
+  // the object, and neither is a virtual function, so ui::Presenter's layout and virtual table
+  // stay the nightly's: the game's SDK overlay ships the nightly's headers, and code built
+  // against them (the game, its presenter tests) subclasses and calls this class.
   using GuestOutputPublishDeferrer = std::function<void(std::function<void()> step)>;
-  void SetGuestOutputPublishDeferrer(GuestOutputPublishDeferrer deferrer) {
-    guest_output_publish_deferrer_ = std::move(deferrer);
-  }
-  bool IsGuestOutputPublishDeferred() const { return bool(guest_output_publish_deferrer_); }
+  void SetGuestOutputPublishDeferrer(GuestOutputPublishDeferrer deferrer);
+  bool IsGuestOutputPublishDeferred() const;
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
@@ -700,8 +702,10 @@ class Presenter {
       std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) = 0;
   // With a publish deferrer, called at the start of the deferred step (also when the refresher
   // failed), once the refresher's GPU work is on the queue: for the backend's own tracking of the
-  // image's last use. Without a deferrer, RefreshGuestOutputImpl does this itself.
-  virtual void GuestOutputRefreshSubmitted(uint32_t mailbox_index) { (void)mailbox_index; }
+  // image's last use. Without a deferrer, RefreshGuestOutputImpl does this itself. A backend sets
+  // it once, before any refresh (a callback, not a virtual function: see 0419 above).
+  using GuestOutputRefreshSubmittedCallback = std::function<void(uint32_t mailbox_index)>;
+  void SetGuestOutputRefreshSubmittedCallback(GuestOutputRefreshSubmittedCallback callback);
 
   // For guest output capturing (for debugging use thus - shouldn't be adding
   // any noise like dithering that's not present in the original image),
@@ -992,7 +996,6 @@ class Presenter {
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
-  GuestOutputPublishDeferrer guest_output_publish_deferrer_;
   // Makes the writable image the ready one and paints it (the part of a refresh after the
   // refresher).
   void PublishGuestOutput();
