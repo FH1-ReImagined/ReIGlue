@@ -41,3 +41,11 @@ target_link_libraries(presenter_publish_deferrer_test PRIVATE rexruntime)
 set_target_properties(presenter_publish_deferrer_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
 add_test(NAME ui.presenter_publish_deferrer COMMAND presenter_publish_deferrer_test)
+
+# The log file's size limit (0421, FH1 #609): rolls over to <stem>.1<ext>, one roll kept.
+add_executable(log_file_sink_test log_file_sink_test.cpp)
+target_include_directories(log_file_sink_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(log_file_sink_test PRIVATE rexruntime)
+set_target_properties(log_file_sink_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
+add_test(NAME core.log_file_sink COMMAND log_file_sink_test)
