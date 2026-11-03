@@ -1046,10 +1046,14 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
 
     std::atomic<size_t> next_creation_index(0);
     warmup.Progress(0, pipeline_creations.size());
+    // 0422 (FH1 #609): about 32 progress lines a warm-up (every 16 pipelines at most), not one per
+    // 16 of thousands; the launcher's bar needs no more.
+    const size_t progress_step = std::max<size_t>(16, pipeline_creations.size() / 32);
     std::atomic<size_t> completed_pipeline_count(0);
     std::atomic<size_t> created_pipeline_count(0);
     auto creation_worker = [this, &pipeline_creations, &next_creation_index,
-                            &created_pipeline_count, &completed_pipeline_count, &warmup]() {
+                            &created_pipeline_count, &completed_pipeline_count, &warmup,
+                            progress_step]() {
       while (true) {
         size_t creation_index = next_creation_index.fetch_add(1);
         if (creation_index >= pipeline_creations.size()) {
@@ -1059,7 +1063,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
           created_pipeline_count.fetch_add(1);
         }
         const auto done = completed_pipeline_count.fetch_add(1) + 1;
-        if (done % 16 == 0 || done == pipeline_creations.size()) {
+        if (done % progress_step == 0 || done == pipeline_creations.size()) {
           warmup.Progress(done, pipeline_creations.size());
         }
       }
@@ -3762,13 +3766,26 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   // unsupported behavior that may be dangerous/crashing because pipelines can
   // be created from the disk storage.
 
+  // 0422 (FH1 #609): one line per pipeline was most of a player's log (the warm-up creates every
+  // stored one, ~1000 a session). The first ones stay at info; the rest are debug, and the warm-up's
+  // "Created N graphics pipelines" line and the 10 s "Pipelines: N built" lines count them.
+  constexpr uint32_t kPipelineInfoLines = 32;
+  static std::atomic<uint32_t> pipeline_lines{0};
+  const uint32_t pipeline_line = pipeline_lines.fetch_add(1, std::memory_order_relaxed) + 1;
+  const auto level =
+      pipeline_line <= kPipelineInfoLines ? spdlog::level::info : spdlog::level::debug;
   if (creation_arguments.pixel_shader) {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}, PS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash(),
-                creation_arguments.pixel_shader->shader().ucode_data_hash());
+    REX_LOG_IMPL(::rex::log::gpu(), level,
+                  "Creating graphics pipeline state with VS {:016X}, PS {:016X}",
+                  creation_arguments.vertex_shader->shader().ucode_data_hash(),
+                  creation_arguments.pixel_shader->shader().ucode_data_hash());
   } else {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash());
+    REX_LOG_IMPL(::rex::log::gpu(), level, "Creating graphics pipeline state with VS {:016X}",
+                  creation_arguments.vertex_shader->shader().ucode_data_hash());
+  }
+  if (pipeline_line == kPipelineInfoLines) {
+    REXGPU_INFO("Pipelines: further 'Creating graphics pipeline state' lines are at debug level "
+                "(log_level = \"debug\" shows them)");
   }
 
   const PipelineDescription& description = creation_arguments.pipeline->first;

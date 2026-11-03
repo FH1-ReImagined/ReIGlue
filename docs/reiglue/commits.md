@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-159 commits: 122 general (Performance 41, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 8, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+160 commits: 123 general (Performance 41, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 9, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
 FFmpeg (0413); see the README. Issue numbers (`#45`)
 in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
@@ -179,3 +179,4 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0418 | This branch | Codegen: vmsum3fp128 and vmsum4fp128 always in Xenon's order ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
 | 0419 | This branch | Presenter: the publish deferrer of 0414 outside the object, so `ui::Presenter` keeps the nightly's layout and virtual table (code built against the nightly's headers subclasses it) ([#476](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/476)) | General | Performance | Dyotson |
 | 0421 | This branch | Log: the log file rolls over at `log_file_max_mb` (50 MB; to `forza.1.log`, one roll kept; 0 = no limit) ([#609](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/609)) | General | Diagnostics | Dyotson |
+| 0422 | This branch | Log: the lines that filled players' logs are rarer: per-pipeline creation lines after the first 32 at debug level, about 32 warm-up progress lines, the scene/HUD size line when the sizes change ([#609](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/609)) | General | Diagnostics | Dyotson |

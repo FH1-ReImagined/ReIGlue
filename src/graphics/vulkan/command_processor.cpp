@@ -7082,10 +7082,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     fh1_seed_pending_ = false;
     if (!render_target_cache_->SeedNativeHud(*fh1_other_render_targets_, 1280, 720))
       return draw_fail("native_hud_seed");
-    if (frame_current_ % 120 == 0)
+    // 0422 (FH1 #609): when the sizes change, not every 120 frames (a line every two seconds).
+    const std::array<uint32_t, 4> sizes = {
+        1280 * fh1_other_render_targets_->draw_resolution_scale_x(),
+        720 * fh1_other_render_targets_->draw_resolution_scale_y(),
+        uint32_t(REXCVAR_GET(fh1_output_width)), uint32_t(REXCVAR_GET(fh1_output_height))};
+    static std::array<uint32_t, 4> logged_sizes{};
+    if (sizes != logged_sizes) {
+      logged_sizes = sizes;
       REXGPU_INFO("FH1 frame {}: world={}x{}, HUD={}x{}, scene transferred before UI", frame_current_,
-          1280 * fh1_other_render_targets_->draw_resolution_scale_x(), 720 * fh1_other_render_targets_->draw_resolution_scale_y(),
-          REXCVAR_GET(fh1_output_width), REXCVAR_GET(fh1_output_height));
+          sizes[0], sizes[1], sizes[2], sizes[3]);
+    }
   }
 
   bool hdr_menu_background = false;
