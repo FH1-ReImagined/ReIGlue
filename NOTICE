@@ -38,6 +38,10 @@ Pinyon Shift
   vulkan_present_on_submission_worker (ShiftGlue 960d853).
   The thread placement by name on Linux (0415) follows its linux_thread_cores
   (ShiftGlue 2849938), rule syntax and Steam Deck layout included.
+  The shader constant writes that change no value and leave the constant
+  buffers as they are (0426) follow its unchanged register writes dropped on
+  the decoder (gpu_record_elide_unchanged_registers, ShiftGlue 9bf779f),
+  without the decoder thread.
 
 ShiftGlue
   https://github.com/arcanite24/shiftglue-sdk

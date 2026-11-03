@@ -226,6 +226,17 @@ REXCVAR_DEFINE_BOOL(gpu_plain_register_ranges, true, "GPU/Vulkan",
                     "start)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// FH1 (#607, patch 0426), after Pinyon Shift's gpu_record_elide_unchanged_registers
+// (ShiftGlue 9bf779f, BSD-3), without the split command processor.
+REXCVAR_DEFINE_BOOL(gpu_elide_unchanged_registers, false, "GPU/Vulkan",
+                    "A write of float or bool/loop shader constants that leaves their values as "
+                    "they are does not make the next draw upload its constant buffers again "
+                    "(the game rewrites most constants with the values they have; fetch "
+                    "constants already work this way). Off by default: the comparison costs "
+                    "about what the uploads it avoids cost (FH1 #607). Read at each frame start; "
+                    "every 1,800 frames the log counts the unchanged writes")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(gpu_shader_translation_memo, true, "GPU/Vulkan",
                     "Each shader answers a draw that needs the same translation (modification) "
                     "as the last draw that used it without looking its translations up (read at "
@@ -3154,6 +3165,19 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // FH1 (#607, patch 0426): a shader constant written with the value it has. What depends on
+  // the constants (constant buffers, texture bindings, vertex buffer residency) depends on
+  // their values only, and CommandProcessor::WriteRegister only stores them.
+  if (fh1_elide_unchanged_ && index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    ++fh1_elide_counts_.registers;
+    ++fh1_elide_counts_.ranges;
+    if (register_file_->values[index] == value) {
+      ++fh1_elide_counts_.unchanged;
+      ++fh1_elide_counts_.unchanged_ranges;
+      return;
+    }
+  }
   // Only the shader constant blocks are handled here (WriteRegistersFromMem
   // relies on that for the other registers).
   CommandProcessor::WriteRegister(index, value);
@@ -3232,6 +3256,55 @@ class PlainRegisters {
 const PlainRegisters plain_registers;
 }  // namespace
 
+bool VulkanCommandProcessor::Fh1StoreChangedRegisters(uint32_t start_index, const uint32_t* base,
+                                                      uint32_t num_registers,
+                                                      uint32_t& first_index,
+                                                      uint32_t& last_index) {
+  // FH1 (#607, patch 0426): stores the range (big-endian in guest memory or the ring) and
+  // finds the first and the last register whose value it changed; false if none. Four
+  // registers at a time (a vec4 constant): a byte swap, a compare and a store only where one
+  // differs, about what the copy alone costs (copy_and_swap).
+  uint32_t* values = register_file_->values + start_index;
+  uint32_t first = UINT32_MAX, last = 0, changed = 0;
+  uint32_t i = 0;
+#if REX_ARCH_AMD64
+  const __m128i swap = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+  for (; i + 4 <= num_registers; i += 4) {
+    const __m128i value =
+        _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(base + i)), swap);
+    const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(values + i));
+    const uint32_t differ =
+        uint32_t(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(value, old)))) ^ 0xFu;
+    if (differ) {
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(values + i), value);
+      changed += rex::bit_count(differ);
+      first = std::min(first, i + uint32_t(rex::tzcnt(differ)));
+      last = i + 31 - uint32_t(rex::lzcnt(differ));
+    }
+  }
+#endif
+  for (; i < num_registers; ++i) {
+    uint32_t value = memory::load_and_swap<uint32_t>(base + i);
+    if (values[i] != value) {
+      values[i] = value;
+      first = std::min(first, i);
+      last = i;
+      ++changed;
+    }
+  }
+  Fh1ElideCounts& counts = fh1_elide_counts_;
+  counts.registers += num_registers;
+  counts.unchanged += num_registers - changed;
+  ++counts.ranges;
+  if (!changed) {
+    ++counts.unchanged_ranges;
+    return false;
+  }
+  first_index = start_index + first;
+  last_index = start_index + last;
+  return true;
+}
+
 void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                                    uint32_t num_registers) {
   if (!num_registers) {
@@ -3267,10 +3340,20 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    uint32_t first_index = start_index, last_index = end_index;
+    if (fh1_elide_unchanged_) {
+      // FH1 (#607, patch 0426): only the constants whose value changes invalidate the buffers
+      // (about three in four of the constant registers the game writes keep their value).
+      if (!Fh1StoreChangedRegisters(start_index, base, num_registers, first_index,
+                                    last_index)) {
+        return;
+      }
+    } else {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    }
     if (frame_open_) {
-      uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
-      uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t first_float_constant = (first_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t last_float_constant = (last_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       if (first_float_constant < 256) {
         uint32_t last_vertex_constant = std::min(last_float_constant, 255u);
         if (range_has_any_constant_usage(current_float_constant_map_vertex_, first_float_constant,
@@ -3295,7 +3378,16 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (fh1_elide_unchanged_) {
+      // FH1 (#607, patch 0426).
+      uint32_t first_index, last_index;
+      if (!Fh1StoreChangedRegisters(start_index, base, num_registers, first_index,
+                                    last_index)) {
+        return;
+      }
+    } else {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    }
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
     return;
@@ -9156,6 +9248,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // FH1 (#45, patch 0360): the packet loop stores the plain registers itself (the same
     // stores WriteRegistersFromMem and WriteRegister do for them).
     fh1_plain_registers_ = REXCVAR_GET(gpu_plain_register_ranges) ? plain_registers.bits() : nullptr;
+    // FH1 (#607, patch 0426): every constant buffer is invalid at a frame start, so the cvar
+    // can change here.
+    fh1_elide_unchanged_ = REXCVAR_GET(gpu_elide_unchanged_registers);
     // FH1 (#45, patch 0362).
     Shader::fh1_translation_memo_enabled = REXCVAR_GET(gpu_shader_translation_memo);
     Shader::fh1_translation_memo_verify = REXCVAR_GET(gpu_shader_translation_memo_verify);
@@ -9518,6 +9613,18 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     if (!cache_clear_requested_) {
       TrimRenderTargetsIfNeeded();
+    }
+    if (fh1_elide_unchanged_ && ++fh1_elide_frames_ >= 1800) {
+      // FH1 (#607, patch 0426).
+      const Fh1ElideCounts& counts = fh1_elide_counts_;
+      const double n = double(fh1_elide_frames_);
+      REXGPU_INFO("gpu_elide_unchanged_registers: a frame: {:.0f} of {:.0f} float and bool/loop "
+                  "constant registers written with their own value, {:.0f} of {:.0f} writes "
+                  "changed nothing",
+                  double(counts.unchanged) / n, double(counts.registers) / n,
+                  double(counts.unchanged_ranges) / n, double(counts.ranges) / n);
+      fh1_elide_counts_ = Fh1ElideCounts();
+      fh1_elide_frames_ = 0;
     }
     Fh1EndFrameCost(
         frame_current_,

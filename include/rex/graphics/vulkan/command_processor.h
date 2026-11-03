@@ -311,6 +311,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  bool Fh1StoreChangedRegisters(uint32_t start_index, const uint32_t* base, uint32_t num_registers,
+                                uint32_t& first_index, uint32_t& last_index);
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
 
@@ -665,6 +667,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::chrono::steady_clock::time_point fh1_incomplete_since_{};
   bool fh1_frame_skipped_critical_ = false;
   double fh1_pipeline_wait_left_ms_ = 0;
+  // FH1 (#607, patch 0426): gpu_elide_unchanged_registers (read at each frame start), and its
+  // counts since the last log line (every 1,800 frames): float and bool/loop constant
+  // registers written, those whose value did not change, ranges written and ranges in which
+  // nothing changed (the constant buffers stay as they are).
+  bool fh1_elide_unchanged_ = false;
+  struct Fh1ElideCounts {
+    uint64_t registers = 0, unchanged = 0, ranges = 0, unchanged_ranges = 0;
+  } fh1_elide_counts_;
+  uint32_t fh1_elide_frames_ = 0;
   bool Fh1SkipMustHoldFrame(bool has_pixel_shader, uint32_t color_mask, uint32_t host_vertex_count);
   int32_t Fh1PipelineWaitMs() const;
   // Guest frame index, since some transient resources can be reused across
