@@ -648,6 +648,16 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   }
   length = std::min(length, kBufferSize - physical_address_start);
   uint32_t physical_address_last = physical_address_start + (length - 1);
+  // FH1 (#614): CPU writes to watched memory and the time handling them (frame cost CSV).
+  struct FaultTimer {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~FaultTimer() {
+      fh1_frame_cost::GetBackground().AddCpuWriteFault(uint64_t(
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                start)
+              .count()));
+    }
+  } fault_timer;
 
   uint32_t page_first = physical_address_start >> page_size_log2_;
   uint32_t page_last = physical_address_last >> page_size_log2_;
