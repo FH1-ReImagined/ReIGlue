@@ -1197,15 +1197,33 @@ void VulkanPipelineCache::ImportShaderPrebuild(
       ++without_shaders;
       continue;
     }
+    if (entry.pixel_shader_hash) {
+      // FH1 (#164): the dirt map's seam-safe variants, as ApplyFh1DirtSeamModification gives
+      // them for the draw. Its check needs the analysis: done here for the listed shaders only.
+      VulkanShader* pixel_shader = shaders_.find(entry.pixel_shader_hash)->second;
+      if (!pixel_shader->is_ucode_analyzed() &&
+          SpirvShaderTranslator::IsFh1DirtSeamPixelShader(entry.pixel_shader_hash)) {
+        pixel_shader->AnalyzeUcode(ucode_disasm_buffer_);
+      }
+      SpirvShaderTranslator::Modification vertex_modification(
+          stored.description.vertex_shader_modification);
+      SpirvShaderTranslator::Modification pixel_modification(
+          stored.description.pixel_shader_modification);
+      ApplyFh1DirtSeamModification(pixel_shader, vertex_modification, pixel_modification);
+      stored.description.vertex_shader_modification = vertex_modification.value;
+      stored.description.pixel_shader_modification = pixel_modification.value;
+    }
     if (!known.insert(stored.description).second) {
       ++stored_already;
       continue;
     }
     stored.description_hash = stored.description.GetHash();
     descriptions.push_back(stored);
-    translations_needed.emplace(entry.vertex_shader_hash, entry.vertex_shader_modification);
+    translations_needed.emplace(entry.vertex_shader_hash,
+                                stored.description.vertex_shader_modification);
     if (entry.pixel_shader_hash) {
-      translations_needed.emplace(entry.pixel_shader_hash, entry.pixel_shader_modification);
+      translations_needed.emplace(entry.pixel_shader_hash,
+                                  stored.description.pixel_shader_modification);
     }
     ++added;
   }
@@ -1518,6 +1536,30 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
   // Bit 63 is reserved for the FH1 screen-raster variant in both stage layouts.
   if (render_target_cache_.UsesFractionalRaster()) modification.value |= UINT64_C(1) << 63;
   return modification;
+}
+
+void VulkanPipelineCache::ApplyFh1DirtSeamModification(
+    const Shader* pixel_shader, SpirvShaderTranslator::Modification& vertex_modification,
+    SpirvShaderTranslator::Modification& pixel_modification) {
+  // Without a geometry shader (that would not pass the extra output on) and without the point
+  // inputs and outputs (declared at the same locations).
+  if (!pixel_shader || !pixel_shader->is_ucode_analyzed() ||
+      vertex_modification.vertex.host_vertex_shader_type !=
+          Shader::HostVertexShaderType::kVertex ||
+      vertex_modification.vertex.output_point_parameters ||
+      pixel_modification.pixel.param_gen_point) {
+    return;
+  }
+  uint32_t interpolator = SpirvShaderTranslator::Fh1DirtSeamInterpolator(*pixel_shader);
+  if (interpolator == UINT32_MAX ||
+      !(vertex_modification.vertex.interpolator_mask & pixel_modification.pixel.interpolator_mask &
+        (UINT32_C(1) << interpolator))) {
+    return;
+  }
+  vertex_modification.vertex.fh1_dirt_seam = 1;
+  vertex_modification.vertex.fh1_dirt_seam_interpolator = interpolator;
+  pixel_modification.pixel.fh1_dirt_seam = 1;
+  pixel_modification.pixel.fh1_dirt_seam_interpolator = interpolator;
 }
 
 SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderModification(

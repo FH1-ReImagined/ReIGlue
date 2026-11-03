@@ -104,6 +104,12 @@ class VulkanPipelineCache {
   SpirvShaderTranslator::Modification GetCurrentPixelShaderModification(
       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
       reg::RB_DEPTHCONTROL normalized_depth_control) const;
+  // FH1 (#164): sets fh1_dirt_seam in both modifications when the pixel shader samples a car's
+  // dirt map (SpirvShaderTranslator::Fh1DirtSeamInterpolator) with an ordinary vertex shader and
+  // that interpolator; the pixel shader must have its microcode analyzed.
+  static void ApplyFh1DirtSeamModification(const Shader* pixel_shader,
+                                           SpirvShaderTranslator::Modification& vertex_modification,
+                                           SpirvShaderTranslator::Modification& pixel_modification);
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);

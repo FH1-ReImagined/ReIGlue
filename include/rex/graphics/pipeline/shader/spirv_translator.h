@@ -71,6 +71,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // FH1 (#164): also output the alternative u of a wrapped dirt-map coordinate (the .z
+      // of this interpolator) for the pixel shader's seam-safe sampling (Fh1DirtSeamInterpolator).
+      uint32_t fh1_dirt_seam : 1;
+      uint32_t fh1_dirt_seam_interpolator : 4;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -91,6 +95,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
       DepthStencilMode depth_stencil_mode : 3;
       // Part of the shader/pipeline key so strict and contracted variants differ.
       uint32_t allow_contraction : 1;
+      // FH1 (#164): seam-safe sampling of the dirt map's u (the .z of this interpolator), with
+      // the alternative u the vertex shader outputs when its fh1_dirt_seam is set.
+      uint32_t fh1_dirt_seam : 1;
+      uint32_t fh1_dirt_seam_interpolator : 4;
     } pixel;
     uint64_t value = 0;
 
@@ -465,6 +473,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // Converts the color value externally clamped to [0, 31.875] to 7e3 floating
   // point, with zeros in bits 10:31, rounding to the nearest even.
+  // FH1 (#164): the interpolator whose .z a car pixel shader uses as the u of its dirt map
+  // (the map is wrapped round the car with u from an angle, so the triangles across the front
+  // centre line interpolate u the long way round), or UINT32_MAX for any other shader.
+  static uint32_t Fh1DirtSeamInterpolator(const Shader& pixel_shader);
+  // Whether the microcode hash is one of those car pixel shaders' (the first check of the above).
+  static bool IsFh1DirtSeamPixelShader(uint64_t ucode_data_hash);
+
   static spv::Id PreClampedFloat32To7e3(SpirvBuilder& builder, spv::Id f32_scalar,
                                         spv::Id ext_inst_glsl_std_450);
   // Same as PreClampedFloat32To7e3, but clamps the input to [0, 31.875].
@@ -958,6 +973,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id output_point_coordinates_;
   // VS, only when needed - float.
   spv::Id output_point_size_;
+  // FH1 (#164): VS output or PS input, the dirt map's alternative u (frac(u + 0.5)) in x, only
+  // with the fh1_dirt_seam modification - float4.
+  spv::Id input_output_fh1_dirt_seam_;
 
   enum OutputPerVertexMember : unsigned int {
     kOutputPerVertexMemberPosition,
@@ -1000,6 +1018,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // float3.
   spv::Id var_main_tfetch_gradients_h_;
   spv::Id var_main_tfetch_gradients_v_;
+  // FH1 (#164), PS with fh1_dirt_seam: the interpolated u and its seam-safe replacement - float.
+  spv::Id var_main_fh1_dirt_seam_u_;
+  spv::Id var_main_fh1_dirt_seam_safe_u_;
   // float4[register_count()].
   spv::Id var_main_registers_;
   // Memory export variables are created only when needed.

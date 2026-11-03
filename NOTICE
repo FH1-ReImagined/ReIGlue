@@ -59,6 +59,14 @@ ShiftGlue
   vmaxfp and vminfp with its NaN, zero and denormal rules (0417), and
   vmsum3fp128 and vmsum4fp128 summed in float64 in vectors (0418).
 
+ReGPU
+  https://github.com/zer0ducksgiven/ReGPU, https://github.com/FH1-ReImagined/ReGPU
+  Scott's Direct3D 12 Xenos renderer, MIT License. No ReGPU code is included. The
+  seam-safe sampling of the car paint's dirt map (0423) follows the idea of its
+  Forza Motorsport 2 port (zer0ducksgiven/Forza-Motorsport-2-ReGPU 916b085): the
+  vertex shader also outputs frac(u + 0.5), and the pixel shader takes whichever u
+  changes less across the pixel.
+
 Downloaded at configure time, not stored in this repository (pinned revisions,
 SHA-256 checked; each license is installed beside the GPU library):
   NVIDIA DLSS SDK headers and loader (NVIDIA's license in that SDK), for 0046.

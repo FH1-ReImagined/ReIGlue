@@ -975,6 +975,28 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       rex::bit_scan_forward(coordinates_needed_components, &coordinate_component_index);
       coordinates[coordinate_component_index] = coordinates_operand;
     }
+    // FH1 (#164): the car's dirt map at its seam-safe u (StartFragmentShaderInMain), while the
+    // register still holds the interpolated u.
+    if (var_main_fh1_dirt_seam_u_ != spv::NoResult &&
+        instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        instr.dimension == xenos::FetchOpDimension::k2D) {
+      const InstructionOperand& coordinates_source = instr.operands[0];
+      if (coordinates_source.storage_source == InstructionStorageSource::kRegister &&
+          coordinates_source.storage_addressing_mode ==
+              InstructionStorageAddressingMode::kAbsolute &&
+          coordinates_source.storage_index ==
+              GetSpirvShaderModification().pixel.fh1_dirt_seam_interpolator &&
+          !coordinates_source.is_negated && !coordinates_source.is_absolute_value &&
+          coordinates_source.GetComponent(0) == SwizzleSource::kZ) {
+        spv::Id is_interpolated_u = builder_->createBinOp(
+            spv::OpFOrdEqual, type_bool_, coordinates[0],
+            builder_->createLoad(var_main_fh1_dirt_seam_u_, spv::NoPrecision));
+        coordinates[0] = builder_->createTriOp(
+            spv::OpSelect, type_float_, is_interpolated_u,
+            builder_->createLoad(var_main_fh1_dirt_seam_safe_u_, spv::NoPrecision),
+            coordinates[0]);
+      }
+    }
     spv::Id texture_resolution_scaled = spv::NoResult;
     uint32_t revert_resolution_scale_axes =
         uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
