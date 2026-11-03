@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #include <rex/assert.h>
@@ -287,6 +289,62 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 namespace rex {
 namespace ui {
 
+namespace {
+// 0419: the publish deferrer and the backend's refresh-submitted callback of each presenter
+// (#476), outside the object so that ui::Presenter keeps the nightly's layout and virtual table.
+// The table is only touched while no refresh of that presenter is in progress (setting a
+// deferrer) or by the refreshing thread; the mutex is for presenters on other threads.
+struct GuestOutputPublishDeferral {
+  Presenter::GuestOutputPublishDeferrer deferrer;
+  std::function<void(uint32_t mailbox_index)> refresh_submitted;
+};
+std::mutex guest_output_publish_deferrals_mutex;
+std::unordered_map<const Presenter*, GuestOutputPublishDeferral> guest_output_publish_deferrals;
+
+GuestOutputPublishDeferral GetGuestOutputPublishDeferral(const Presenter* presenter) {
+  std::lock_guard<std::mutex> lock(guest_output_publish_deferrals_mutex);
+  auto it = guest_output_publish_deferrals.find(presenter);
+  return it != guest_output_publish_deferrals.end() ? it->second : GuestOutputPublishDeferral();
+}
+}  // namespace
+
+void Presenter::SetGuestOutputPublishDeferrer(GuestOutputPublishDeferrer deferrer) {
+  std::lock_guard<std::mutex> lock(guest_output_publish_deferrals_mutex);
+  if (deferrer) {
+    guest_output_publish_deferrals[this].deferrer = std::move(deferrer);
+    return;
+  }
+  auto it = guest_output_publish_deferrals.find(this);
+  if (it != guest_output_publish_deferrals.end()) {
+    it->second.deferrer = nullptr;
+    if (!it->second.refresh_submitted) {
+      guest_output_publish_deferrals.erase(it);
+    }
+  }
+}
+
+bool Presenter::IsGuestOutputPublishDeferred() const {
+  std::lock_guard<std::mutex> lock(guest_output_publish_deferrals_mutex);
+  auto it = guest_output_publish_deferrals.find(this);
+  return it != guest_output_publish_deferrals.end() && it->second.deferrer;
+}
+
+void Presenter::SetGuestOutputRefreshSubmittedCallback(
+    GuestOutputRefreshSubmittedCallback callback) {
+  std::lock_guard<std::mutex> lock(guest_output_publish_deferrals_mutex);
+  if (callback) {
+    guest_output_publish_deferrals[this].refresh_submitted = std::move(callback);
+    return;
+  }
+  auto it = guest_output_publish_deferrals.find(this);
+  if (it != guest_output_publish_deferrals.end()) {
+    it->second.refresh_submitted = nullptr;
+    if (!it->second.deferrer) {
+      guest_output_publish_deferrals.erase(it);
+    }
+  }
+}
+
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
   rex::FatalError("Graphics device lost (probably due to an internal error)");
@@ -296,6 +354,11 @@ Presenter::~Presenter() {
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
   assert_false(is_executing_ui_drawers_);
+
+  {
+    std::lock_guard<std::mutex> lock(guest_output_publish_deferrals_mutex);
+    guest_output_publish_deferrals.erase(this);
+  }
 
 #if REX_PLATFORM_WIN32
   if (dxgi_ui_tick_thread_.joinable()) {
@@ -574,12 +637,22 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
   bool is_active = writable_properties.IsActive();
+  const uint32_t mailbox_index = guest_output_mailbox_writable_;
+  // Copied for this refresh: the step queued below may run after the deferrer is replaced.
+  const GuestOutputPublishDeferral deferral = GetGuestOutputPublishDeferral(this);
   if (is_active) {
-    if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
-                                frontbuffer_height, refresher, writable_properties.is_8bpc)) {
+    if (!RefreshGuestOutputImpl(mailbox_index, frontbuffer_width, frontbuffer_height, refresher,
+                                writable_properties.is_8bpc)) {
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
+      if (deferral.deferrer && deferral.refresh_submitted) {
+        // The refresher may still have queued work referencing the image: its tracking is
+        // closed after that work (the deferred step), as without a deferrer.
+        deferral.deferrer([refresh_submitted = deferral.refresh_submitted, mailbox_index]() {
+          refresh_submitted(mailbox_index);
+        });
+      }
       return false;
     }
     guest_output_active_last_refresh_ = true;
@@ -592,6 +665,21 @@ bool Presenter::RefreshGuestOutput(
     guest_output_active_last_refresh_ = false;
   }
 
+  if (deferral.deferrer) {
+    deferral.deferrer(
+        [this, is_active, mailbox_index, refresh_submitted = deferral.refresh_submitted]() {
+          if (is_active && refresh_submitted) {
+            refresh_submitted(mailbox_index);
+          }
+          PublishGuestOutput();
+        });
+  } else {
+    PublishGuestOutput();
+  }
+  return is_active;
+}
+
+void Presenter::PublishGuestOutput() {
   // Make the new image the next to present on the host (the "ready" one),
   // replacing the one already specified as the next (dropping it instead of
   // enqueueing the new image after it) to achieve the lowest latency (also,
@@ -661,8 +749,6 @@ bool Presenter::RefreshGuestOutput(
       host_gpu_loss_callback_(false, false);
     }
   }
-
-  return is_active;
 }
 
 void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {

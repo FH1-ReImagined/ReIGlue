@@ -46,6 +46,16 @@ if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
     message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
 endif()
 
+# Guest memory on Windows: the 0xE0000000 view starts 4 KB into physical memory. By default
+# it is mapped there with placeholder views (VirtualAlloc2, MapViewOfFile3), so guest accesses
+# are base + address and the build needs Windows 10 version 1803 or later. This option keeps the
+# path for older Windows: the view is mapped 64 KB-aligned, 4 KB short, and every access at or
+# above 0xE0000000 adds the 0x1000 back (a compare and a select on most of a game's accesses).
+if(WIN32)
+    option(REXGLUE_WIN32_ROUNDED_PHYSICAL_VIEW
+        "Windows before 10 version 1803: add 0x1000 to guest accesses at 0xE0000000 and up" OFF)
+endif()
+
 if (REXGLUE_ENABLE_FIDELITYFX AND
     NOT (REXGLUE_USE_VULKAN OR REXGLUE_USE_D3D12))
     message(FATAL_ERROR
@@ -162,6 +172,11 @@ if(WIN32)
         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
     endif()
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
+    if(REXGLUE_WIN32_ROUNDED_PHYSICAL_VIEW)
+        # The runtime and every caller of <rex/system/xmemory.h> or the generated code must agree;
+        # rexruntime passes it on to the games (src/system/CMakeLists.txt).
+        add_compile_definitions(REX_WIN32_ROUNDED_PHYSICAL_VIEW=1)
+    endif()
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")

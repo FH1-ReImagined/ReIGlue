@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-151 commits: 114 general (Performance 37, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 7, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+158 commits: 121 general (Performance 41, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
 FFmpeg (0413); see the README. Issue numbers (`#45`)
 in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
@@ -163,6 +163,7 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0400 | This branch | Build (Linux): the small code model, large on request ([#473](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/473)) | General | Codegen and build | Dyotson |
 | 0403 | This branch | Racing wheels: the vibration at a fixed pace, whatever the frame rate ([#467](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/467)) | General | Input | Dyotson |
 | 0404 | This branch | Racing wheels: an H-pattern shift through neutral is one gear change ([#468](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/468)) | **Forza** | Input | Dyotson |
+| 0405 | This branch | Windows: the 0xE0000000 view at its exact 4 KB offset, guest accesses add nothing ([#477](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/477)) | General | Performance | Dyotson |
 | 0406 | This branch | Vulkan: direct scaled depth texture uploads on NVIDIA ([#500](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/500)) | General | Performance | Sean O’Connor |
 | 0407 | This branch | RenderDoc: connect only to an already-loaded library ([#511](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/511)) | General | Runtime and platform | Sean O’Connor |
 | 0408 | This branch | D3D12: check both fence HRESULTs before waiting outside a submission ([ReIGlue #13](https://github.com/FH1-ReImagined/ReIGlue/issues/13)) | General | Runtime and platform | Sean O’Connor |
@@ -171,3 +172,9 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0411 | This branch | Resolve readback: a range the game reads on the CPU waits for the GPU (`readback_resolve_wait_range`) ([#552](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/552)) | General | Xenos GPU | Dyotson |
 | 0412 | This branch | Racing wheels: a device setting finds a device that has no name (matching by vid:pid, a known nameless pedal set, shifter, handbrake or wheel), and the log lists every joystick when one is missing ([#562](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/562)) | General | Input | Dyotson |
 | 0413 | This branch | XMA decoder: a wave's warm-up frame mid-stream is not played (the engine note breaking up; FFmpeg patch in `patches/ffmpeg/`) | General | Runtime and platform | Scott |
+| 0414 | This branch | Vulkan: the swap does not wait for the frame's replay; the presenter's publish step runs on the submission thread (`vulkan_present_on_submission_thread`, off by default; idea from Pinyon Shift) ([#476](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/476)) | General | Performance | Dyotson |
+| 0415 | This branch | Linux: place threads on CPU cores by name (`linux_thread_cores`, off by default; guest threads by their entry function; an `auto` layout for a 4-core CPU such as a Steam Deck; idea from Pinyon Shift) ([#475](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/475)) | General | Performance | Dyotson |
+| 0416 | This branch | Codegen: vmaddfp and vnmsubfp round once, as on Xenon ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0417 | This branch | Codegen: vmaxfp and vminfp with Xenon's NaN, zero and denormal results ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0418 | This branch | Codegen: vmsum3fp128 and vmsum4fp128 always in Xenon's order ([#478](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/478)) | General | Codegen and build | Dyotson |
+| 0419 | This branch | Presenter: the publish deferrer of 0414 outside the object, so `ui::Presenter` keeps the nightly's layout and virtual table (code built against the nightly's headers subclasses it) ([#476](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/476)) | General | Performance | Dyotson |

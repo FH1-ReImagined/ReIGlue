@@ -149,6 +149,14 @@ REXCVAR_DEFINE_BOOL(vulkan_threaded_submission, true, "GPU/Vulkan",
                     "them on a thread of their own instead of the GPU command processor's")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_present_on_submission_thread, false, "GPU/Vulkan",
+                    "With vulkan_threaded_submission, do not make every swap wait for the "
+                    "submission thread to replay the frame: the presenter's step after the swap "
+                    "(publishing the image, painting it) runs on that thread behind the "
+                    "frame's submission, and the next swap waits for it only if it has not run "
+                    "(idea and design from Pinyon Shift, BSD-3)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 0, "GPU/Vulkan",
                      "Maximum queued frames (1-3); nonpositive uses 2 on NVIDIA, 3 otherwise")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -2785,6 +2793,20 @@ void VulkanCommandProcessor::SubmissionThread() {
       job = std::move(submission_thread_jobs_.front());
       submission_thread_jobs_.pop_front();
     }
+    if (job.callback) {
+      // The presenter's publish step: after the frame's submission, which is on the queue now.
+      // After a failure the picture is not shown; the step is still counted so nobody waits.
+      if (!submission_thread_failed_.load(std::memory_order_relaxed)) {
+        job.callback();
+      }
+      job.callback = nullptr;
+      {
+        std::lock_guard<std::mutex> lock(submission_thread_mutex_);
+        present_steps_done_.fetch_add(1, std::memory_order_release);
+      }
+      submission_thread_done_cond_.notify_all();
+      continue;
+    }
     // After a failure the following submissions are dropped: their fences are never waited for
     // (the command processor treats the device as lost).
     if (!submission_thread_failed_.load(std::memory_order_relaxed)) {
@@ -2821,6 +2843,28 @@ void VulkanCommandProcessor::AwaitSubmissionThread(uint64_t submission) {
   });
 }
 
+void VulkanCommandProcessor::DeferPresentStep(std::function<void()> step) {
+  SubmissionJob job;
+  job.submission = 0;
+  job.callback = std::move(step);
+  ++present_steps_queued_;
+  {
+    std::lock_guard<std::mutex> lock(submission_thread_mutex_);
+    submission_thread_jobs_.push_back(std::move(job));
+  }
+  submission_thread_request_cond_.notify_one();
+}
+
+void VulkanCommandProcessor::AwaitPresentSteps() {
+  if (present_steps_done_.load(std::memory_order_acquire) == present_steps_queued_) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(submission_thread_mutex_);
+  submission_thread_done_cond_.wait(lock, [this] {
+    return present_steps_done_.load(std::memory_order_acquire) == present_steps_queued_;
+  });
+}
+
 void VulkanCommandProcessor::ShutdownSubmissionThread() {
   if (!submission_thread_) {
     return;
@@ -2841,6 +2885,11 @@ void VulkanCommandProcessor::ShutdownContext() {
   fh1_pending_readbacks_.clear();
   Fh1WorldAoShutdown();
   ShutdownSubmissionThread();
+  if (present_deferred_presenter_) {
+    // The thread ran every queued step before it ended.
+    present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
+    present_deferred_presenter_ = nullptr;
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -4885,6 +4934,25 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  // FH1 (#476): the presenter's publish step (after the swap's refresh) runs on the submission
+  // thread behind the frame's submission, instead of the swap waiting for the replay. Hot-reload:
+  // switching it off waits for the queued steps first.
+  if (submission_thread_ && REXCVAR_GET(vulkan_present_on_submission_thread)) {
+    if (present_deferred_presenter_ != presenter) {
+      if (present_deferred_presenter_) {
+        AwaitPresentSteps();
+        present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
+      }
+      presenter->SetGuestOutputPublishDeferrer(
+          [this](std::function<void()> step) { DeferPresentStep(std::move(step)); });
+      present_deferred_presenter_ = presenter;
+    }
+  } else if (present_deferred_presenter_) {
+    AwaitPresentSteps();
+    present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
+    present_deferred_presenter_ = nullptr;
+  }
+
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
@@ -5094,6 +5162,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           ? hdr_scene.view
           : VK_NULL_HANDLE;
 
+  // The previous frame's publish step owns the presenter's mailbox until it has run; a frame
+  // later it nearly always has.
+  AwaitPresentSteps();
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
@@ -5655,8 +5726,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
         EndSubmission(true);
-        // With threaded submission, they must be in the queue, not only handed over.
-        AwaitSubmissionThread(GetCurrentSubmission() - 1);
+        // With threaded submission, they must be in the queue, not only handed over. With
+        // vulkan_present_on_submission_thread the presenter's step that needs that runs on the
+        // thread behind them, and nothing waits here.
+        if (!present_deferred_presenter_) {
+          AwaitSubmissionThread(GetCurrentSubmission() - 1);
+        }
         return true;
       });
 

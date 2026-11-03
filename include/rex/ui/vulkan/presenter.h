@@ -153,6 +153,9 @@ class VulkanPresenter final : public Presenter {
                               uint32_t frontbuffer_height,
                               std::function<bool(GuestOutputRefreshContext& context)> refresher,
                               bool& is_8bpc_out_ref) override;
+  // The part of a refresh after the refresher's work is on the queue (Presenter's
+  // GuestOutputRefreshSubmittedCallback with a publish deferrer, #476).
+  void GuestOutputRefreshSubmitted(uint32_t mailbox_index);
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
 
@@ -210,12 +213,19 @@ class VulkanPresenter final : public Presenter {
     // whether the image has previously been written. If an image is active
     // after a refresh, it can be assumed that this is true.
     bool ever_successfully_refreshed = false;
+    // Whether the last refresher succeeded, for GuestOutputRefreshSubmitted (which may run
+    // later, on another thread, but always before the next refresh of this image).
+    bool last_refresher_succeeded = false;
+    // The frame tag (rexui_SetNextGuestOutputTag) at the time of the refresh: the command
+    // processor clears it as soon as the swap returns, before a deferred step runs.
+    uint32_t last_refresh_tag = 0;
 
     void SetToNewImage(const std::shared_ptr<GuestOutputImage>& new_image, uint64_t new_version) {
       image = new_image;
       version = new_version;
       last_refresher_submission = 0;
       ever_successfully_refreshed = false;
+      last_refresher_succeeded = false;
     }
   };
 

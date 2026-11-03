@@ -1262,6 +1262,21 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
+  }
+  image_instance.last_refresher_succeeded = refresher_succeeded;
+  image_instance.last_refresh_tag = guest_output_export::next_tag.load(std::memory_order_relaxed);
+  // With a publish deferrer (#476) the refresher's work reaches the queue later: the step that
+  // follows it runs GuestOutputRefreshSubmitted after that.
+  if (!IsGuestOutputPublishDeferred()) {
+    GuestOutputRefreshSubmitted(mailbox_index);
+  }
+  return refresher_succeeded;
+}
+
+void VulkanPresenter::GuestOutputRefreshSubmitted(uint32_t mailbox_index) {
+  GuestOutputImageInstance& image_instance = guest_output_images_[mailbox_index];
+  const bool refresher_succeeded = image_instance.last_refresher_succeeded;
+  if (refresher_succeeded) {
     // Patch 0391: the refresher's commands are in the queue now; a consumer that submits to the
     // same queue after this point reads the finished image.
     if (guest_output_export::enabled.load(std::memory_order_relaxed)) {
@@ -1269,7 +1284,7 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
       guest_output_export::latest = image_instance.image;
       RexGuestOutputFrame& frame = guest_output_export::latest_frame;
       ++frame.serial;
-      frame.tag = guest_output_export::next_tag.load(std::memory_order_relaxed);
+      frame.tag = image_instance.last_refresh_tag;
       frame.width = image_instance.image->extent().width;
       frame.height = image_instance.image->extent().height;
       frame.image = image_instance.image->image();
@@ -1310,8 +1325,6 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
       fence_acqusition.SubmissionSucceededSignalFailed();
     }
   }
-
-  return refresher_succeeded;
 }
 
 namespace {
@@ -2794,6 +2807,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 bool VulkanPresenter::InitializeSurfaceIndependent() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+
+  // With a publish deferrer (#476), the deferred step closes the refresh (0419: a callback, not
+  // a virtual function, so ui::Presenter keeps the nightly's virtual table).
+  SetGuestOutputRefreshSubmittedCallback(
+      [this](uint32_t mailbox_index) { GuestOutputRefreshSubmitted(mailbox_index); });
 
   VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
   guest_output_image_sampler_bindings[0].binding = 0;
