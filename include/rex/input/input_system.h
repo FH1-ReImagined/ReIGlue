@@ -14,6 +14,7 @@
 #include <atomic>
 #include <bitset>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -74,7 +75,7 @@ class InputSystem : public system::IInputSystem {
   /// changed.
   void RefreshDevices();
   InputDriver* DriverForDevice(DeviceId id);
-  const DeviceInfo* DeviceInfoFor(DeviceId id) const;
+  std::optional<DeviceInfo> DeviceInfoFor(DeviceId id) const;
   /// The device that speaks for a user, preferring the one most recently in
   /// the player's hands.
   DeviceId ChooseDeviceForUser(uint32_t user_index) const;
