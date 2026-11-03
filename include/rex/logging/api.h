@@ -248,6 +248,18 @@ LogConfig BuildLogConfig(const std::string& cli_level,
 
 void ApplyLogCvarOverrides(LogConfig& config);
 
+/**
+ * The size at which the log file rolls over (log_file_max_mb in bytes; 0 = no limit).
+ */
+uint64_t LogFileMaxBytes();
+
+/**
+ * The file sink InitLogging uses: appends to `path`; with a nonzero `max_bytes`, at that size the
+ * file rolls over to <stem>.1<ext> (forza.log to forza.1.log, replacing an older one) and a new
+ * file starts, so the two together stay under twice `max_bytes`.
+ */
+spdlog::sink_ptr MakeFileSink(const std::filesystem::path& path, uint64_t max_bytes);
+
 const LogConfig& LoggingConfig();
 
 std::map<std::string, std::string> ParseCategoryLevelsFromConfig(

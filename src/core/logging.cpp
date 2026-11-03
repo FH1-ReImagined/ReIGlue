@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <toml++/toml.hpp>
@@ -41,6 +42,15 @@ REXCVAR_DEFINE_STRING(log_level, "info", "Log",
     .allowed({"trace", "debug", "info", "warn", "error", "critical", "off"});
 
 REXCVAR_DEFINE_STRING(log_file, "", "Log", "Log file path (empty = auto sequential naming)");
+
+// 0421 (FH1 #609): a log that grows without limit (a fault or a message in a loop) fills the disk and
+// cannot be attached to a report. At this size the file rolls over to <name>.1<ext> (forza.log to
+// forza.1.log) and a new one starts; one roll is kept, so a session's log stays under twice this.
+REXCVAR_DEFINE_INT32(log_file_max_mb, 50, "Log",
+                     "Size in MB at which the log file rolls over to <name>.1<ext>; one roll is kept, "
+                     "so the log takes at most twice this (0 = no limit)")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets level to trace)")
     .debug_only();
@@ -134,6 +144,24 @@ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_di
   }
   return logs_dir / fmt::format("{}_{:03d}.log", app_name, max_seq + 1);
 }
+
+}  // namespace
+
+uint64_t LogFileMaxBytes() {
+  const int32_t mb = REXCVAR_GET(log_file_max_mb);
+  return mb > 0 ? uint64_t(mb) * 1024 * 1024 : 0;
+}
+
+spdlog::sink_ptr MakeFileSink(const std::filesystem::path& path, uint64_t max_bytes) {
+  // Appends, as before: a file another process (an old game still running) kept stays whole.
+  if (max_bytes == 0) {
+    return std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.string(), false);
+  }
+  return std::make_shared<spdlog::sinks::rotating_file_sink_mt>(path.string(),
+                                                                static_cast<size_t>(max_bytes), 1);
+}
+
+namespace {
 
 std::vector<spdlog::sink_ptr> BuildDefaultSinks() {
   std::vector<spdlog::sink_ptr> sinks;
@@ -268,7 +296,7 @@ void InitLogging(const LogConfig& config) {
     resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
-    auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(resolved_path.string(), false);
+    spdlog::sink_ptr sink = MakeFileSink(resolved_path, LogFileMaxBytes());
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
