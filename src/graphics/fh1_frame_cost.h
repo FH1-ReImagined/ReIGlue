@@ -53,6 +53,16 @@ struct Frame {
   double readback_wait_ms = 0;  // their waits for the GPU (also in gpu_wait_ms)
   uint32_t readbacks_skipped = 0;  // scene render targets back after a gap, not copied (0181)
   uint32_t readbacks_deferred = 0;  // of readbacks: copied when the GPU was done, no wait (#536)
+  // FH1 (#614): fh1_frame_cost_csv only. Work of other threads in the frame (Background), and
+  // what the frame end did with the picture.
+  uint32_t bg_pipelines = 0;     // real pipelines built on any thread (placeholders not counted)
+  double bg_pipeline_ms = 0;     // their driver time, summed
+  double bg_pipeline_max_ms = 0; // the longest one
+  uint32_t cpu_write_faults = 0;  // CPU writes to watched guest memory (any thread)
+  double cpu_write_fault_ms = 0;  // their invalidation callbacks
+  uint32_t held = 0;           // not presented: draws were skipped for pipelines not ready
+  uint32_t skipped_draws = 0;  // draws skipped for them
+  uint32_t queued_ahead = 0;   // pipelines the lookahead started
 
   void Add(const Frame& o) {
     ms += o.ms;
@@ -85,8 +95,50 @@ struct Frame {
     readback_wait_ms += o.readback_wait_ms;
     readbacks_skipped += o.readbacks_skipped;
     readbacks_deferred += o.readbacks_deferred;
+    bg_pipelines += o.bg_pipelines;
+    bg_pipeline_ms += o.bg_pipeline_ms;
+    bg_pipeline_max_ms = std::max(bg_pipeline_max_ms, o.bg_pipeline_max_ms);
+    cpu_write_faults += o.cpu_write_faults;
+    cpu_write_fault_ms += o.cpu_write_fault_ms;
+    held += o.held;
+    skipped_draws += o.skipped_draws;
+    queued_ahead += o.queued_ahead;
   }
 };
+
+// FH1 (#614): counters of other threads (pipeline creation threads, guest threads), taken at
+// every frame end (Take) for the frame cost CSV.
+struct Background {
+  std::atomic<uint64_t> pipelines{0};
+  std::atomic<uint64_t> pipeline_us{0};
+  std::atomic<uint64_t> pipeline_max_us{0};
+  std::atomic<uint64_t> cpu_write_faults{0};
+  std::atomic<uint64_t> cpu_write_fault_us{0};
+
+  void AddPipeline(uint64_t us) {
+    pipelines.fetch_add(1, std::memory_order_relaxed);
+    pipeline_us.fetch_add(us, std::memory_order_relaxed);
+    uint64_t max = pipeline_max_us.load(std::memory_order_relaxed);
+    while (us > max && !pipeline_max_us.compare_exchange_weak(max, us, std::memory_order_relaxed)) {
+    }
+  }
+  void AddCpuWriteFault(uint64_t us) {
+    cpu_write_faults.fetch_add(1, std::memory_order_relaxed);
+    cpu_write_fault_us.fetch_add(us, std::memory_order_relaxed);
+  }
+  void Take(Frame& f) {
+    f.bg_pipelines = uint32_t(pipelines.exchange(0, std::memory_order_relaxed));
+    f.bg_pipeline_ms = double(pipeline_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+    f.bg_pipeline_max_ms = double(pipeline_max_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+    f.cpu_write_faults = uint32_t(cpu_write_faults.exchange(0, std::memory_order_relaxed));
+    f.cpu_write_fault_ms = double(cpu_write_fault_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+  }
+};
+
+inline Background& GetBackground() {
+  static Background background;
+  return background;
+}
 
 // The open frame's counters (command processor thread).
 inline Frame& Current() {
