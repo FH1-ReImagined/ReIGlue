@@ -38,6 +38,11 @@ Pinyon Shift
   vulkan_present_on_submission_worker (ShiftGlue 960d853).
   The thread placement by name on Linux (0415) follows its linux_thread_cores
   (ShiftGlue 2849938), rule syntax and Steam Deck layout included.
+  The GPU command processor decoded on one thread and recorded on another
+  (0420, gpu_split_command_processor) follows its gpu_record_thread (ShiftGlue
+  9362a07): the shadow register file, the ordering rules for the packets the
+  CPU sees, draws as plain records (7440c33) and unchanged register writes
+  dropped on the decoder (9bf779f).
 
 ShiftGlue
   https://github.com/arcanite24/shiftglue-sdk
