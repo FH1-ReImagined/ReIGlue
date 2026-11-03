@@ -1063,6 +1063,8 @@ struct FrameCostState {
   fh1_frame_cost::Summary summary;
   std::FILE* csv = nullptr;
   bool csv_tried = false;
+  // FH1 (#614): the lookahead's totals at the previous frame end (per-frame deltas for the CSV).
+  uint64_t skipped_frames = 0, skipped_draws = 0, queued_ahead = 0;
 };
 
 FrameCostState& GetFrameCostState() {
@@ -1146,15 +1148,29 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
             "texture_evicted_bytes,upload_bytes,upload_ms,shaders,shader_ms,pipelines,pipeline_ms,"
             "render_targets,render_target_bytes,render_target_ms,render_target_trims,"
             "texture_total_mb,render_target_total_mb,render_target_count,readbacks,readback_bytes,"
-            "readback_ms,readback_wait_ms,readbacks_skipped,cpu_per_frame,readbacks_deferred\n",
+            "readback_ms,readback_wait_ms,readbacks_skipped,cpu_per_frame,readbacks_deferred,"
+            "bg_pipelines,bg_pipeline_ms,bg_pipeline_max_ms,cpu_write_faults,cpu_write_fault_ms,"
+            "held,skipped_draws,queued_ahead\n",
             state.csv);
       }
     }
   }
   if (state.csv) {
+    // FH1 (#614): the other threads' work and the frame end's hold, for the CSV only.
+    fh1_frame_cost::GetBackground().Take(frame);
+    {
+      const auto& la = fh1_pipeline_lookahead::stats;
+      frame.held = uint32_t(la.skipped_frames - state.skipped_frames);
+      frame.skipped_draws = uint32_t(la.skipped_draws - state.skipped_draws);
+      frame.queued_ahead = uint32_t(la.queued_ahead - state.queued_ahead);
+      state.skipped_frames = la.skipped_frames;
+      state.skipped_draws = la.skipped_draws;
+      state.queued_ahead = la.queued_ahead;
+    }
     std::fprintf(state.csv,
                  "%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%u,%u,%llu,%.3f,%u,%llu,%.3f,%u,%llu,%llu,%.3f,%u,"
-                 "%.3f,%u,%.3f,%u,%llu,%.3f,%u,%.1f,%.1f,%u,%u,%llu,%.3f,%.3f,%u,%d,%u\n",
+                 "%.3f,%u,%.3f,%u,%llu,%.3f,%u,%.1f,%.1f,%u,%u,%llu,%.3f,%.3f,%u,%d,%u,"
+                 "%u,%.3f,%.3f,%u,%.3f,%u,%u,%u\n",
                  std::chrono::duration<double>(
                      std::chrono::system_clock::now().time_since_epoch())
                      .count(),
@@ -1170,7 +1186,9 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
                  double(render_target_bytes) / 1048576.0, render_target_count, frame.readbacks,
                  (unsigned long long)frame.readback_bytes, frame.readback_ms,
                  frame.readback_wait_ms, frame.readbacks_skipped, int(frame.cpu_per_frame),
-                 frame.readbacks_deferred);
+                 frame.readbacks_deferred, frame.bg_pipelines, frame.bg_pipeline_ms,
+                 frame.bg_pipeline_max_ms, frame.cpu_write_faults, frame.cpu_write_fault_ms,
+                 frame.held, frame.skipped_draws, frame.queued_ahead);
     if (frame_index % 300 == 0) std::fflush(state.csv);
   }
   if (state.report.OnFrame(frame, t)) {

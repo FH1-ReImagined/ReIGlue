@@ -4284,7 +4284,13 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info,
                                                   nullptr, &pipeline);
   } else {
+    const auto create_start = std::chrono::steady_clock::now();
     CreatePipelineWithDriverCache(description, pipeline_create_info, pipeline, create_result);
+    // FH1 (#614): each real pipeline's driver time, whichever thread built it (frame cost CSV).
+    fh1_frame_cost::GetBackground().AddPipeline(uint64_t(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                              create_start)
+            .count()));
   }
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
