@@ -6933,6 +6933,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                    *pixel_shader, interpolator_mask,
                                                    ps_param_gen_pos, normalized_depth_control)
                                              : SpirvShaderTranslator::Modification(0);
+    VulkanPipelineCache::ApplyFh1DirtSeamModification(pixel_shader, vertex_shader_modification,
+                                                      pixel_shader_modification);
 
     // Translate the shaders now to obtain the sampler bindings.
     vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
