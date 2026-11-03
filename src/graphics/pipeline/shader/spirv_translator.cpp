@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <utility>
@@ -24,10 +25,12 @@
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include "fh1_dirt_seam_shaders.h"
 #include <rex/math.h>
 #include <rex/string/buffer.h>
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
+REXCVAR_DECLARE(bool, fh1_dirt_seam_fix);
 
 
 
@@ -127,6 +130,43 @@ std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
   return translation.translated_binary();
 }
 
+bool SpirvShaderTranslator::IsFh1DirtSeamPixelShader(uint64_t ucode_data_hash) {
+  return REXCVAR_GET(fh1_dirt_seam_fix) &&
+         std::binary_search(std::begin(fh1::kDirtSeamPixelShaders),
+                            std::end(fh1::kDirtSeamPixelShaders), ucode_data_hash);
+}
+
+uint32_t SpirvShaderTranslator::Fh1DirtSeamInterpolator(const Shader& pixel_shader) {
+  if (pixel_shader.type() != xenos::ShaderType::kPixel ||
+      !IsFh1DirtSeamPixelShader(pixel_shader.ucode_data_hash())) {
+    return UINT32_MAX;
+  }
+  // The dirt map and its mask, two 2D fetches of different textures, both at the .zw of the
+  // same interpolator (the pixel shader's registers start as its interpolators).
+  uint32_t first_fetch_constant[xenos::kMaxInterpolators];
+  std::fill(std::begin(first_fetch_constant), std::end(first_fetch_constant), UINT32_MAX);
+  for (const Shader::TextureBinding& binding : pixel_shader.texture_bindings()) {
+    const ParsedTextureFetchInstruction& fetch = binding.fetch_instr;
+    const InstructionOperand& coordinates = fetch.operands[0];
+    if (fetch.opcode != ucode::FetchOpcode::kTextureFetch ||
+        fetch.dimension != xenos::FetchOpDimension::k2D ||
+        coordinates.storage_source != InstructionStorageSource::kRegister ||
+        coordinates.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute ||
+        coordinates.storage_index >= xenos::kMaxInterpolators || coordinates.is_negated ||
+        coordinates.is_absolute_value || coordinates.GetComponent(0) != SwizzleSource::kZ ||
+        coordinates.GetComponent(1) != SwizzleSource::kW) {
+      continue;
+    }
+    uint32_t& first = first_fetch_constant[coordinates.storage_index];
+    if (first == UINT32_MAX) {
+      first = binding.fetch_constant;
+    } else if (binding.fetch_constant != first) {
+      return coordinates.storage_index;
+    }
+  }
+  return UINT32_MAX;
+}
+
 void SpirvShaderTranslator::Reset() {
   ShaderTranslator::Reset();
 
@@ -146,6 +186,9 @@ void SpirvShaderTranslator::Reset() {
   std::fill(input_output_interpolators_.begin(), input_output_interpolators_.end(), spv::NoResult);
   output_point_coordinates_ = spv::NoResult;
   output_point_size_ = spv::NoResult;
+  input_output_fh1_dirt_seam_ = spv::NoResult;
+  var_main_fh1_dirt_seam_u_ = spv::NoResult;
+  var_main_fh1_dirt_seam_safe_u_ = spv::NoResult;
   output_per_vertex_member_count_ = 0;
   output_per_vertex_member_clip_distance_ = UINT32_MAX;
   output_per_vertex_member_cull_distance_ = UINT32_MAX;
@@ -1764,6 +1807,22 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     }
   }
 
+  // FH1 (#164): the dirt map's alternative u, after the other outputs with a location (the pixel
+  // shader declares its input after its own inputs, the same ones when fh1_dirt_seam is set).
+  if (shader_modification.vertex.fh1_dirt_seam &&
+      shader_modification.vertex.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kVertex &&
+      input_output_interpolators_[shader_modification.vertex.fh1_dirt_seam_interpolator] !=
+          spv::NoResult) {
+    input_output_fh1_dirt_seam_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassOutput, type_float4_, "xe_out_fh1_dirt_seam");
+    builder_->addDecoration(input_output_fh1_dirt_seam_, spv::DecorationLocation,
+                            int(output_location));
+    builder_->addDecoration(input_output_fh1_dirt_seam_, spv::DecorationInvariant);
+    main_interface_.push_back(input_output_fh1_dirt_seam_);
+    ++output_location;
+  }
+
   // Create the gl_PerVertex output for used system outputs.
   uint32_t clip_distance_count = shader_modification.GetVertexClipDistanceCount();
   uint32_t cull_distance_count = shader_modification.GetVertexCullDistanceCount();
@@ -2493,6 +2552,27 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
 void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
   Modification shader_modification = GetSpirvShaderModification();
 
+  // FH1 (#164): the dirt map's alternative u, frac(u + 0.5), for the pixel shader's seam-safe
+  // sampling (StartFragmentShaderInMain).
+  if (input_output_fh1_dirt_seam_ != spv::NoResult) {
+    spv::Id u = builder_->createCompositeExtract(
+        builder_->createLoad(
+            input_output_interpolators_[shader_modification.vertex.fh1_dirt_seam_interpolator],
+            spv::NoPrecision),
+        type_float_, 2);
+    spv::Id alternative_u = builder_->createUnaryBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450Fract,
+        builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, u,
+                                           builder_->makeFloatConstant(0.5f)));
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(alternative_u);
+    id_vector_temp_.push_back(const_float_0_);
+    id_vector_temp_.push_back(const_float_0_);
+    id_vector_temp_.push_back(const_float_0_);
+    builder_->createStore(builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+                          input_output_fh1_dirt_seam_);
+  }
+
   id_vector_temp_.clear();
   id_vector_temp_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
   spv::Id position_ptr =
@@ -2987,6 +3067,23 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       }
       ++input_location;
     }
+
+    // FH1 (#164): the dirt map's alternative u from the vertex shader, sampled where the dirt
+    // map's u is (the same centroid choice).
+    uint32_t fh1_dirt_seam_interpolator = shader_modification.pixel.fh1_dirt_seam_interpolator;
+    if (shader_modification.pixel.fh1_dirt_seam && !shader_modification.pixel.param_gen_point &&
+        input_output_interpolators_[fh1_dirt_seam_interpolator] != spv::NoResult) {
+      input_output_fh1_dirt_seam_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassInput, type_float4_, "xe_in_fh1_dirt_seam");
+      builder_->addDecoration(input_output_fh1_dirt_seam_, spv::DecorationLocation,
+                              int(input_location));
+      if (shader_modification.pixel.interpolators_centroid &
+          (UINT32_C(1) << fh1_dirt_seam_interpolator)) {
+        builder_->addDecoration(input_output_fh1_dirt_seam_, spv::DecorationCentroid);
+      }
+      main_interface_.push_back(input_output_fh1_dirt_seam_);
+      ++input_location;
+    }
   }
 
   bool float24_depth_conversion = IsWritingFloat24Depth();
@@ -3295,6 +3392,41 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             : const_float4_0_,
         builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
                                     id_vector_temp_));
+  }
+
+  // FH1 (#164): seam-safe dirt map u. The car's dirt map is wrapped round the body, its u taken
+  // from an angle in the vertex shader, so u is about 1 on one side of the front centre line and
+  // about 0 on the other: the triangles across that line interpolate it the long way round and
+  // squeeze the whole map into them (a thin line down the bonnet once the car has dirt). The
+  // vertex shader also outputs frac(u + 0.5), continuous across that line; where it changes less
+  // across the pixel quad than u, it (minus 0.5, the same texel with the map's wrapping) is the
+  // u. Elsewhere both are the same texel and u is kept. Chosen here, in uniform control flow, for
+  // the derivatives. Idea from ReGPU's Forza Motorsport 2 port (Scott, MIT).
+  if (input_output_fh1_dirt_seam_ != spv::NoResult) {
+    uint32_t fh1_dirt_seam_interpolator =
+        GetSpirvShaderModification().pixel.fh1_dirt_seam_interpolator;
+    spv::Id u = builder_->createCompositeExtract(
+        builder_->createLoad(input_output_interpolators_[fh1_dirt_seam_interpolator],
+                             spv::NoPrecision),
+        type_float_, 2);
+    spv::Id alternative_u = builder_->createCompositeExtract(
+        builder_->createLoad(input_output_fh1_dirt_seam_, spv::NoPrecision), type_float_, 0);
+    builder_->addCapability(spv::CapabilityDerivativeControl);
+    spv::Id alternative_is_continuous = builder_->createBinOp(
+        spv::OpFOrdLessThan, type_bool_,
+        builder_->createUnaryOp(spv::OpFwidthCoarse, type_float_, alternative_u),
+        builder_->createUnaryOp(spv::OpFwidthCoarse, type_float_, u));
+    spv::Id safe_u = builder_->createTriOp(
+        spv::OpSelect, type_float_, alternative_is_continuous,
+        builder_->createNoContractionBinOp(spv::OpFSub, type_float_, alternative_u,
+                                           builder_->makeFloatConstant(0.5f)),
+        u);
+    var_main_fh1_dirt_seam_u_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassFunction, type_float_, "xe_var_fh1_dirt_seam_u");
+    builder_->createStore(u, var_main_fh1_dirt_seam_u_);
+    var_main_fh1_dirt_seam_safe_u_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassFunction, type_float_, "xe_var_fh1_dirt_seam_safe_u");
+    builder_->createStore(safe_u, var_main_fh1_dirt_seam_safe_u_);
   }
 
   // Pixel parameters.

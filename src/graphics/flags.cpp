@@ -62,6 +62,12 @@ REXCVAR_DEFINE_INT32(forza_native_height, 0, "GPU",
     .range(0, 5040)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// FH1 (#164): seam-safe sampling of the car paint's dirt map (SpirvShaderTranslator::
+// Fh1DirtSeamInterpolator), idea from ReGPU's Forza Motorsport 2 port (MIT).
+REXCVAR_DEFINE_BOOL(fh1_dirt_seam_fix, true, "GPU",
+                    "FH1: sample the car paint's dirt map without a seam down the bonnet's centre "
+                    "line (Vulkan)");
+
 // Built-in FH1 ultrawide presentation, adapted from Pinyon Shift (BSD-3-Clause).
 REXCVAR_DEFINE_BOOL(forza_present_16_9, false, "GPU",
                     "Use FH1's 16:9 source aspect before presentation");

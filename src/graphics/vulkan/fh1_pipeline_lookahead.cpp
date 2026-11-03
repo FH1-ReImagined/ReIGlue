@@ -457,6 +457,8 @@ void VulkanCommandProcessor::Fh1PipelineLookahead() {
                                                            ps_param_gen_pos,
                                                            normalized_depth_control)
              : SpirvShaderTranslator::Modification(0);
+      VulkanPipelineCache::ApplyFh1DirtSeamModification(ps, vertex_shader_modification,
+                                                        pixel_shader_modification);
       auto* vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
           vs->GetOrCreateTranslation(vertex_shader_modification.value));
       auto* pixel_shader_translation =
