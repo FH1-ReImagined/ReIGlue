@@ -52,6 +52,7 @@ struct Frame {
   double readback_ms = 0;  // their buffers and copies
   double readback_wait_ms = 0;  // their waits for the GPU (also in gpu_wait_ms)
   uint32_t readbacks_skipped = 0;  // scene render targets back after a gap, not copied (0181)
+  uint32_t readbacks_deferred = 0;  // of readbacks: copied when the GPU was done, no wait (#536)
 
   void Add(const Frame& o) {
     ms += o.ms;
@@ -83,6 +84,7 @@ struct Frame {
     readback_ms += o.readback_ms;
     readback_wait_ms += o.readback_wait_ms;
     readbacks_skipped += o.readbacks_skipped;
+    readbacks_deferred += o.readbacks_deferred;
   }
 };
 

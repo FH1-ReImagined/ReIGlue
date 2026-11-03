@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-157 commits: 120 general (Performance 40, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
+158 commits: 121 general (Performance 41, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 7, Workarounds and defaults 3) and 37 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 3, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
 FFmpeg (0413); see the README. Issue numbers (`#45`)
 in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
@@ -168,6 +168,7 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0407 | This branch | RenderDoc: connect only to an already-loaded library ([#511](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/511)) | General | Runtime and platform | Sean O’Connor |
 | 0408 | This branch | D3D12: check both fence HRESULTs before waiting outside a submission ([ReIGlue #13](https://github.com/FH1-ReImagined/ReIGlue/issues/13)) | General | Runtime and platform | Sean O’Connor |
 | 0409 | This branch | FH1 split: startup movies whole at a 1080p output ([#539](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/539)) | **Forza** | Upscaling and HUD | Dyotson |
+| 0410 | This branch | Resolve readback `some`: first-seen resolves of per-frame render targets (a car's) copied back when the GPU is done, not after a wait ([#536](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/536)) | General | Performance | Dyotson |
 | 0411 | This branch | Resolve readback: a range the game reads on the CPU waits for the GPU (`readback_resolve_wait_range`) ([#552](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/552)) | General | Xenos GPU | Dyotson |
 | 0412 | This branch | Racing wheels: a device setting finds a device that has no name (matching by vid:pid, a known nameless pedal set, shifter, handbrake or wheel), and the log lists every joystick when one is missing ([#562](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/562)) | General | Input | Dyotson |
 | 0413 | This branch | XMA decoder: a wave's warm-up frame mid-stream is not played (the engine note breaking up; FFmpeg patch in `patches/ffmpeg/`) | General | Runtime and platform | Scott |
