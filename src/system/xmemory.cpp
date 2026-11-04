@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <cstring>
 #include <utility>
 
@@ -65,6 +67,83 @@ size_t ViewOffsetGranularity() {
 }
 
 }  // namespace
+
+// FH1 (#640): what the guest's memory costs the host, in the log. Guest Release and
+// Decommit keep the host memory (Windows cannot decommit pages of a mapped view, and the
+// POSIX path does the same), so the host commit is the high-water mark of every range the
+// guest ever committed: on Windows it is charged against the commit limit (RAM + page
+// file) until the game exits; on Linux the guest memory file holds the pages written.
+// Kept here, outside the classes, so the SDK headers (and so the ABI) stay as they are.
+namespace guest_commit {
+
+constexpr uint64_t kFileBytes = 0x120000000ull;  // the views' backing file, 4.5 GB
+constexpr uint32_t kGranuleShift = 12;           // 4 KB
+constexpr size_t kWords = size_t(kFileBytes >> kGranuleShift) / 64;
+constexpr uint64_t kLogStep = uint64_t(64) << 20;
+
+std::atomic<uint64_t> host_bits[kWords];
+std::atomic<uint64_t> host_bytes{0};
+std::atomic<uint64_t> next_log{kLogStep};
+// Committed now, by the guest's own page tables: virtual heaps and physical memory (the
+// physical views at 0xA0000000 and up commit through the physical heap, counted once).
+std::atomic<int64_t> virtual_bytes{0};
+std::atomic<int64_t> physical_bytes{0};
+
+uint64_t Mb(uint64_t bytes) {
+  return (bytes + (uint64_t(1) << 19)) >> 20;
+}
+
+void MarkHost(uint64_t file_offset, uint64_t length) {
+  if (!length || file_offset >= kFileBytes)
+    return;
+  const uint64_t end = std::min(kFileBytes, file_offset + length);
+  uint64_t added = 0;
+  for (uint64_t g = file_offset >> kGranuleShift; g < ((end - 1) >> kGranuleShift) + 1;) {
+    const size_t word = size_t(g >> 6);
+    const uint32_t bit = uint32_t(g & 63);
+    const uint64_t last = std::min<uint64_t>(64, bit + (((end - 1) >> kGranuleShift) + 1 - g));
+    const uint64_t mask =
+        (last == 64 ? ~uint64_t(0) : (uint64_t(1) << last) - 1) & ~((uint64_t(1) << bit) - 1);
+    const uint64_t before = host_bits[word].fetch_or(mask, std::memory_order_relaxed);
+    added += uint64_t(std::popcount(mask & ~before)) << kGranuleShift;
+    g += last - bit;
+  }
+  if (!added)
+    return;
+  const uint64_t total = host_bytes.fetch_add(added, std::memory_order_relaxed) + added;
+  uint64_t due = next_log.load(std::memory_order_relaxed);
+  if (total < due || !next_log.compare_exchange_strong(due, (total / kLogStep + 1) * kLogStep,
+                                                       std::memory_order_relaxed)) {
+    return;
+  }
+  REXSYS_INFO(
+      "Guest memory: {} MB committed on the host (the most the game has used; kept until it "
+      "exits), {} MB in use now ({} MB virtual, {} MB physical)",
+      Mb(total), Mb(uint64_t(std::max<int64_t>(0, virtual_bytes + physical_bytes))),
+      Mb(uint64_t(std::max<int64_t>(0, virtual_bytes))),
+      Mb(uint64_t(std::max<int64_t>(0, physical_bytes))));
+}
+
+// The backing file offset of a heap's guest address. Physical views (0xA0000000 and up) are
+// aliases of the physical heap, which counts their memory: ~0 for them.
+uint64_t FileOffset(bool physical_heap, bool physical_alias, uint32_t guest_address) {
+  if (physical_heap)
+    return 0x100000000ull + guest_address;
+  if (physical_alias)
+    return ~uint64_t(0);
+  // 0x90000000 (4 KB pages) maps the same file range as 0x80000000 (64 KB pages).
+  if (guest_address >= 0x90000000u)
+    return 0x80000000ull + (guest_address - 0x90000000u);
+  return guest_address;
+}
+
+void Count(bool physical_heap, bool physical_alias, int64_t bytes) {
+  if (!bytes || physical_alias)
+    return;
+  (physical_heap ? physical_bytes : virtual_bytes).fetch_add(bytes, std::memory_order_relaxed);
+}
+
+}  // namespace guest_commit
 
 /**
  * Memory map:
@@ -254,6 +333,7 @@ bool Memory::Initialize() {
   rex::memory::AllocFixed(heaps_.physical.TranslateRelative(0), heaps_.physical.heap_size(),
                           rex::memory::AllocationType::kCommit,
                           rex::memory::PageAccess::kReadWrite);
+  guest_commit::MarkHost(0x100000000ull, heaps_.physical.heap_size());
 
   // Install MMIO handler for physical address translation and MMIO ranges
   mmio_handler_ = runtime::MMIOHandler::Install(
@@ -1388,10 +1468,15 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
       return false;
     }
   }
+  const bool physical_heap = this == &memory_->heaps_.physical;
+  const bool physical_alias = !physical_heap && heap_type_ == memory::HeapType::kGuestPhysical;
 
   // Set page state.
+  int64_t committed_pages = 0;
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
+    committed_pages += int64_t((allocation_type & memory::kMemoryAllocationCommit) != 0) -
+                       int64_t((page_entry.state & memory::kMemoryAllocationCommit) != 0);
     if (allocation_type & memory::kMemoryAllocationReserve) {
       if (!page_entry.state) {
         unreserved_page_count_--;
@@ -1403,6 +1488,13 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     page_entry.allocation_protect = protect;
     page_entry.current_protect = protect;
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
+  }
+  guest_commit::Count(physical_heap, physical_alias, committed_pages << page_size_shift_);
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    guest_commit::MarkHost(
+        guest_commit::FileOffset(physical_heap, physical_alias,
+                                 heap_base_ + (start_page_number << page_size_shift_)),
+        uint64_t(page_count) << page_size_shift_);
   }
 
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
@@ -1564,6 +1656,16 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     page_entry.current_protect = protect;
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
   }
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    // The range was free: every page is newly committed.
+    const bool physical_heap = this == &memory_->heaps_.physical;
+    const bool physical_alias = !physical_heap && heap_type_ == memory::HeapType::kGuestPhysical;
+    guest_commit::Count(physical_heap, physical_alias, int64_t(page_count) << page_size_shift_);
+    guest_commit::MarkHost(
+        guest_commit::FileOffset(physical_heap, physical_alias,
+                                 heap_base_ + (start_page_number << page_size_shift_)),
+        uint64_t(page_count) << page_size_shift_);
+  }
 
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
     return false;
@@ -1603,9 +1705,17 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
   }*/
 
   // Perform table change.
+  int64_t decommitted_pages = 0;
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
+    decommitted_pages += (page_entry.state & memory::kMemoryAllocationCommit) != 0;
     page_entry.state &= ~memory::kMemoryAllocationCommit;
+  }
+  {
+    const bool physical_heap = this == &memory_->heaps_.physical;
+    guest_commit::Count(physical_heap,
+                        !physical_heap && heap_type_ == memory::HeapType::kGuestPhysical,
+                        -(decommitted_pages << page_size_shift_));
   }
 
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
@@ -1664,10 +1774,18 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 
   // Perform table change.
   uint32_t end_page_number = base_page_number + base_page_entry.region_page_count - 1;
+  int64_t released_pages = 0;
   for (uint32_t page_number = base_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
+    released_pages += (page_entry.state & memory::kMemoryAllocationCommit) != 0;
     page_entry.qword = 0;
     unreserved_page_count_++;
+  }
+  {
+    const bool physical_heap = this == &memory_->heaps_.physical;
+    guest_commit::Count(physical_heap,
+                        !physical_heap && heap_type_ == memory::HeapType::kGuestPhysical,
+                        -(released_pages << page_size_shift_));
   }
 
   if (!SyncHostPageAccess(base_page_number, end_page_number)) {
