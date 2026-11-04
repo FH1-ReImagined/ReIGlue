@@ -49,3 +49,11 @@ target_link_libraries(log_file_sink_test PRIVATE rexruntime)
 set_target_properties(log_file_sink_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
 add_test(NAME core.log_file_sink COMMAND log_file_sink_test)
+
+# InputSystem thread safety and unchanged device refresh (0425, FH1 #590, #420).
+add_executable(input_system_concurrency_test input_system_concurrency_test.cpp)
+target_include_directories(input_system_concurrency_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(input_system_concurrency_test PRIVATE rexruntime)
+set_target_properties(input_system_concurrency_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
+add_test(NAME input.system_concurrency COMMAND input_system_concurrency_test)

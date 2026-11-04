@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
@@ -57,17 +59,49 @@ std::array<std::atomic<uint32_t>, kMaxGuestUsers> physical_disconnects{};
 // XN_SYS_INPUTDEVICESCHANGED
 constexpr uint32_t kXNotificationSystemInputDevicesChanged = 0x00000012;
 
+// 0425: InputSystem synchronization (#590, #420). The guest main thread polls GetStateForUI
+// concurrently with the simulation/physics thread calling SetTriggerRumble. A recursive mutex
+// keyed by InputSystem pointer synchronizes all access to device lists, drivers and assignments
+// without altering class layout in public headers.
+struct InputSystemSync {
+  std::recursive_mutex mutex;
+};
+
+std::mutex g_input_systems_mutex;
+std::unordered_map<const InputSystem*, std::unique_ptr<InputSystemSync>> g_input_systems;
+
+std::unique_lock<std::recursive_mutex> LockInputSystem(const InputSystem* system) {
+  InputSystemSync* sync = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_input_systems_mutex);
+    auto& ptr = g_input_systems[system];
+    if (!ptr) {
+      ptr = std::make_unique<InputSystemSync>();
+    }
+    sync = ptr.get();
+  }
+  return std::unique_lock<std::recursive_mutex>(sync->mutex);
+}
+
+void UnregisterInputSystem(const InputSystem* system) {
+  std::lock_guard<std::mutex> lock(g_input_systems_mutex);
+  g_input_systems.erase(system);
+}
+
 }  // namespace
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
-InputSystem::~InputSystem() = default;
+InputSystem::~InputSystem() {
+  UnregisterInputSystem(this);
+}
 
 X_STATUS InputSystem::Setup() {
   return X_STATUS_SUCCESS;
 }
 
 void InputSystem::Shutdown() {
+  auto lock = LockInputSystem(this);
   // device_owners_ holds raw driver pointers.
   devices_.clear();
   device_owners_.clear();
@@ -75,10 +109,12 @@ void InputSystem::Shutdown() {
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  auto lock = LockInputSystem(this);
   drivers_.push_back(std::move(driver));
 }
 
 void InputSystem::AttachWindow(rex::ui::Window* window) {
+  auto lock = LockInputSystem(this);
   window_ = window;
   for (auto& driver : drivers_) {
     driver->OnWindowAvailable(window);
@@ -86,12 +122,14 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
 }
 
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+  auto lock = LockInputSystem(this);
   for (auto& driver : drivers_) {
     driver->set_is_active_callback(callback);
   }
 }
 
 void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
+  auto lock = LockInputSystem(this);
   assignment_ = std::move(assignment);
   if (assignment_) {
     assignment_->OnDevicesChanged(devices_);
@@ -99,6 +137,7 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
 }
 
 void InputSystem::RefreshDevices() {
+  auto lock = LockInputSystem(this);
   std::vector<DeviceInfo> seen;
   std::vector<InputDriver*> owners;
   std::vector<DeviceInfo> enumerated;
@@ -172,6 +211,10 @@ void InputSystem::RefreshDevices() {
     }
   }
 
+  if (!changed) {
+    return;
+  }
+
   std::vector<size_t> order(seen.size());
   for (size_t i = 0; i < order.size(); i++) {
     order[i] = i;
@@ -194,6 +237,7 @@ void InputSystem::RefreshDevices() {
 }
 
 InputDriver* InputSystem::DriverForDevice(DeviceId id) {
+  auto lock = LockInputSystem(this);
   for (size_t i = 0; i < devices_.size(); i++) {
     if (devices_[i].id == id) {
       return device_owners_[i];
@@ -202,16 +246,18 @@ InputDriver* InputSystem::DriverForDevice(DeviceId id) {
   return nullptr;
 }
 
-const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+std::optional<DeviceInfo> InputSystem::DeviceInfoFor(DeviceId id) const {
+  auto lock = LockInputSystem(this);
   for (const auto& device : devices_) {
     if (device.id == id) {
-      return &device;
+      return device;
     }
   }
-  return nullptr;
+  return std::nullopt;
 }
 
 DeviceId InputSystem::ChooseDeviceForUser(uint32_t user_index) const {
+  auto lock = LockInputSystem(this);
   if (!assignment_) {
     return DeviceId::kInvalid;
   }
@@ -232,7 +278,12 @@ DeviceId InputSystem::ChooseDeviceForUser(uint32_t user_index) const {
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
-  if (!out_caps || !assignment_) {
+  if (!out_caps) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  auto lock = LockInputSystem(this);
+  if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
@@ -246,6 +297,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 void InputSystem::UpdateConnectedUser(uint32_t user_index, bool connected) {
+  auto lock = LockInputSystem(this);
   if (user_index >= kMaxGuestUsers || connected_users_.test(user_index) == connected) {
     return;
   }
@@ -284,6 +336,7 @@ void InputSystem::UpdateConnectedUser(uint32_t user_index, bool connected) {
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  auto lock = LockInputSystem(this);
 
   // A dialog owns the controller.
   if (ui_input_blockers_.load() > 0) {
@@ -308,6 +361,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
 X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  auto lock = LockInputSystem(this);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -352,10 +406,12 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
 }
 
 void InputSystem::AddUIInputBlocker() {
+  auto lock = LockInputSystem(this);
   ui_input_blockers_.fetch_add(1);
 }
 
 void InputSystem::RemoveUIInputBlocker() {
+  auto lock = LockInputSystem(this);
   // Whatever is held right now stays masked until released, so the press that
   // dismissed the dialog is not also read as a press in the game.
   X_INPUT_STATE state = {};
@@ -373,6 +429,7 @@ bool InputSystem::GetVibrationEnabled() const {
 }
 
 void InputSystem::ToggleVibration() {
+  auto lock = LockInputSystem(this);
   REXCVAR_SET(vibration, !REXCVAR_GET(vibration));
   // The guest's next SetState may never come while a motor is running.
   X_INPUT_VIBRATION silence = {};
@@ -430,15 +487,40 @@ X_INPUT_VIBRATION InputSystem::ModifyVibrationLevel(const X_INPUT_VIBRATION* vib
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
-  if (!assignment_ || !vibration) {
+  if (!vibration) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  RefreshDevices();
-  std::vector<DeviceId> ids;
-  assignment_->DevicesForUser(user_index, ids);
-
+  struct RumbleTarget {
+    InputDriver* driver = nullptr;
+    DeviceId id = DeviceId::kInvalid;
+    bool synthetic = false;
+  };
+  std::vector<RumbleTarget> targets;
   const X_INPUT_VIBRATION modified = ModifyVibrationLevel(vibration);
+
+  {
+    auto lock = LockInputSystem(this);
+    if (!assignment_) {
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    }
+
+    std::vector<DeviceId> ids;
+    assignment_->DevicesForUser(user_index, ids);
+
+    for (DeviceId id : ids) {
+      auto* driver = DriverForDevice(id);
+      auto info = DeviceInfoFor(id);
+      if (!driver || !info) {
+        continue;
+      }
+      targets.push_back({driver, id, info->synthetic});
+    }
+  }
+
+  if (targets.empty()) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
 
   // Every pad on this user belongs to the same player, so all of them buzz.
   // Only pads decide the result: synthetic devices accept any vibration and
@@ -447,15 +529,10 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   bool any_synthetic = false;
   bool pad_rumbled = false;
   X_RESULT pad_error = X_ERROR_DEVICE_NOT_CONNECTED;
-  for (DeviceId id : ids) {
-    auto* driver = DriverForDevice(id);
-    const DeviceInfo* info = DeviceInfoFor(id);
-    if (!driver || !info) {
-      continue;
-    }
+  for (const auto& target : targets) {
     X_INPUT_VIBRATION per_device = modified;
-    X_RESULT result = driver->SetDeviceVibration(id, &per_device);
-    if (info->synthetic) {
+    X_RESULT result = target.driver->SetDeviceVibration(target.id, &per_device);
+    if (target.synthetic) {
       any_synthetic = true;
       continue;
     }
@@ -474,22 +551,38 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 
 int InputSystem::SetTriggerRumble(uint32_t user_mask, uint16_t left, uint16_t right,
                                   uint32_t duration) {
-  if (!assignment_) return 0;
-  if (!GetVibrationEnabled() || ui_input_blockers_.load() > 0) left = right = 0;
-  RefreshDevices();
+  if (!GetVibrationEnabled() || ui_input_blockers_.load() > 0) {
+    left = right = 0;
+  }
+
+  std::vector<std::pair<sdl::SDLInputDriver*, DeviceId>> targets;
+  {
+    auto lock = LockInputSystem(this);
+    if (!assignment_) return 0;
+
+    for (uint32_t user = 0; user < kMaxGuestUsers; ++user) {
+      if (!(user_mask & (1u << user))) continue;
+      std::vector<DeviceId> ids;
+      assignment_->DevicesForUser(user, ids);
+      for (DeviceId id : ids) {
+        auto* driver = dynamic_cast<sdl::SDLInputDriver*>(DriverForDevice(id));
+        if (driver) {
+          targets.emplace_back(driver, id);
+        }
+      }
+    }
+  }
+
+  if (targets.empty()) {
+    return 0;
+  }
+
   int count = 0;
   bool failed = false;
-  for (uint32_t user = 0; user < kMaxGuestUsers; ++user) {
-    if (!(user_mask & (1u << user))) continue;
-    std::vector<DeviceId> ids;
-    assignment_->DevicesForUser(user, ids);
-    for (DeviceId id : ids) {
-      auto* driver = dynamic_cast<sdl::SDLInputDriver*>(DriverForDevice(id));
-      if (!driver) continue;
-      const int result = driver->SetDeviceTriggerRumble(id, left, right, duration);
-      if (result > 0) ++count;
-      if (result < 0) failed = true;
-    }
+  for (const auto& target : targets) {
+    const int result = target.first->SetDeviceTriggerRumble(target.second, left, right, duration);
+    if (result > 0) ++count;
+    if (result < 0) failed = true;
   }
   return failed ? -1 : count;
 }
@@ -497,6 +590,7 @@ int InputSystem::SetTriggerRumble(uint32_t user_mask, uint16_t left, uint16_t ri
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  auto lock = LockInputSystem(this);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
