@@ -806,6 +806,10 @@ class Shader {
     // If there was some failure during preparation on the implementation side.
     void MakeInvalid() { is_valid_ = false; }
 
+    // FH1 (#640): frees the translated binary once the host has its own copy (a Vulkan shader
+    // module). translated_binary() is empty after this.
+    void ReleaseTranslatedBinary() { std::vector<uint8_t>().swap(translated_binary_); }
+
    private:
     friend class Shader;
     friend class ShaderTranslator;
