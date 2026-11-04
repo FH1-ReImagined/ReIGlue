@@ -63,6 +63,11 @@ struct Frame {
   uint32_t held = 0;           // not presented: draws were skipped for pipelines not ready
   uint32_t skipped_draws = 0;  // draws skipped for them
   uint32_t queued_ahead = 0;   // pipelines the lookahead started
+  // FH1 (#536): host buffers for resolve readbacks created and freed (evicted), and the time of
+  // the frees (the creations' is in readback_ms).
+  uint32_t readback_buffers_created = 0;
+  uint32_t readback_buffers_freed = 0;
+  double readback_free_ms = 0;
 
   void Add(const Frame& o) {
     ms += o.ms;
@@ -103,6 +108,9 @@ struct Frame {
     held += o.held;
     skipped_draws += o.skipped_draws;
     queued_ahead += o.queued_ahead;
+    readback_buffers_created += o.readback_buffers_created;
+    readback_buffers_freed += o.readback_buffers_freed;
+    readback_free_ms += o.readback_free_ms;
   }
 };
 
