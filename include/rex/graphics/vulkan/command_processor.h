@@ -568,6 +568,25 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t pending_landings = 0;
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+  // FH1 (#536): resolve readback host buffers kept for the next miss instead of freed
+  // (vulkan_readback_reuse_buffers): "some" gives a key's buffer back once its copy is in guest
+  // memory, and an evicted key's buffers come here too, so a miss takes one of these instead of
+  // a new allocation, and an eviction frees nothing.
+  struct Fh1SpareReadback {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapping = nullptr;
+    uint32_t size = 0;
+    uint64_t submission = 0;  // usable again when this submission is done
+    uint64_t frame = 0;       // given back in this frame
+  };
+  std::vector<Fh1SpareReadback> fh1_spare_readbacks_;
+  uint64_t fh1_spare_readback_bytes_ = 0;
+  bool Fh1TakeSpareReadback(ReadbackBuffer& readback, uint32_t index, uint32_t size);
+  void Fh1GiveBackReadback(ReadbackBuffer& readback, uint32_t index, uint64_t submission);
+  void Fh1DestroySpareReadbacks(uint64_t older_than_frame);
+  static constexpr uint64_t kSpareReadbackMaxBytes = 64 * 1024 * 1024;
+  static constexpr uint64_t kSpareReadbackAgeFrames = 600;
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;

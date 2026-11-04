@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-162 commits: 124 general (Performance 41, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 10, Workarounds and defaults 3) and 38 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 4, Texture packs 2, Shader-hash effects 1).
+163 commits: 125 general (Performance 42, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 10, Workarounds and defaults 3) and 38 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 4, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
 FFmpeg (0413); see the README. Issue numbers (`#45`)
 in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
@@ -182,3 +182,4 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0422 | This branch | Log: the lines that filled players' logs are rarer: per-pipeline creation lines after the first 32 at debug level, about 32 warm-up progress lines, the scene/HUD size line when the sizes change ([#609](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/609)) | General | Diagnostics | Dyotson |
 | 0423 | This branch | Frame cost CSV (`fh1_frame_cost_csv`, testing): pipelines built on any thread and their driver time, frames held back for pipelines, skipped draws, lookahead starts and CPU writes to watched memory, per frame ([#614](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/614)) | General | Diagnostics | Dyotson |
 | 0424 | This branch | Car paint: the dirt map sampled without the seam down the bonnet's centre line (`fh1_dirt_seam_fix`, Vulkan: the car vertex shaders also output the map's u shifted by half a turn, the pixel shaders take whichever changes less across the pixel; idea from ReGPU) ([#164](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/164)) | **Forza** | Game-specific fixes | Dyotson |
+| 0426 | This branch | Resolve readback `some`: the host buffers of resolve readbacks reused (`vulkan_readback_reuse_buffers`, on): a buffer goes back to a pool once its copy is in guest memory or its key is evicted, and a miss takes one from there, so misses and evictions no longer allocate and free memory on the command processor thread and no buffer is kept for a key after its copy; the frame cost CSV counts the buffers created and freed ([#536](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/536)) | General | Performance | Dyotson |

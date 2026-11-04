@@ -195,6 +195,13 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_defer_all, false, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
+REXCVAR_DEFINE_BOOL(vulkan_readback_reuse_buffers, true, "GPU/Vulkan",
+                    "readback_resolve = some: keep the host buffers of resolve readbacks for the "
+                    "next cache miss instead of freeing them (a buffer is given back once its copy "
+                    "is in guest memory, or when its key is evicted), so misses and evictions do "
+                    "not allocate and free memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_log_misses, false, "GPU/Vulkan",
                     "readback_resolve = some/fast: log every resolve copied back on a cache miss "
                     "(otherwise the first 20, then at most one every 10 s)")
@@ -1150,7 +1157,8 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
             "texture_total_mb,render_target_total_mb,render_target_count,readbacks,readback_bytes,"
             "readback_ms,readback_wait_ms,readbacks_skipped,cpu_per_frame,readbacks_deferred,"
             "bg_pipelines,bg_pipeline_ms,bg_pipeline_max_ms,cpu_write_faults,cpu_write_fault_ms,"
-            "held,skipped_draws,queued_ahead\n",
+            "held,skipped_draws,queued_ahead,readback_buffers_created,readback_buffers_freed,"
+            "readback_free_ms\n",
             state.csv);
       }
     }
@@ -1170,7 +1178,7 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
     std::fprintf(state.csv,
                  "%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%u,%u,%llu,%.3f,%u,%llu,%.3f,%u,%llu,%llu,%.3f,%u,"
                  "%.3f,%u,%.3f,%u,%llu,%.3f,%u,%.1f,%.1f,%u,%u,%llu,%.3f,%.3f,%u,%d,%u,"
-                 "%u,%.3f,%.3f,%u,%.3f,%u,%u,%u\n",
+                 "%u,%.3f,%.3f,%u,%.3f,%u,%u,%u,%u,%u,%.3f\n",
                  std::chrono::duration<double>(
                      std::chrono::system_clock::now().time_since_epoch())
                      .count(),
@@ -1188,7 +1196,9 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
                  frame.readback_wait_ms, frame.readbacks_skipped, int(frame.cpu_per_frame),
                  frame.readbacks_deferred, frame.bg_pipelines, frame.bg_pipeline_ms,
                  frame.bg_pipeline_max_ms, frame.cpu_write_faults, frame.cpu_write_fault_ms,
-                 frame.held, frame.skipped_draws, frame.queued_ahead);
+                 frame.held, frame.skipped_draws, frame.queued_ahead,
+                 frame.readback_buffers_created, frame.readback_buffers_freed,
+                 frame.readback_free_ms);
     if (frame_index % 300 == 0) std::fflush(state.csv);
   }
   if (state.report.OnFrame(frame, t)) {
@@ -2917,6 +2927,7 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   DestroyScratchBuffer();
 
+  Fh1DestroySpareReadbacks(UINT64_MAX);
   for (auto& readback_pair : readback_buffers_) {
     ReadbackBuffer& readback = readback_pair.second;
     for (uint32_t i = 0; i < 2; ++i) {
@@ -7971,21 +7982,108 @@ void VulkanCommandProcessor::Fh1LandDoneReadbacks() {
     if (readback.pending_landings) --readback.pending_landings;
     // Not over what came later: a later resolve of the range (the GPU would load the older data
     // back over it), or a write of the game's (it got the memory back for something else).
-    if (pending.dropped || device_lost_ || !readback.mapped_data[pending.index] ||
-        pending.length > readback.sizes[pending.index] ||
-        !shared_memory_->IsRangeAllGpuWritten(pending.address, pending.length)) {
+    if (!pending.dropped && !device_lost_ && readback.mapped_data[pending.index] &&
+        pending.length <= readback.sizes[pending.index] &&
+        shared_memory_->IsRangeAllGpuWritten(pending.address, pending.length)) {
+      fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().readback_ms);
+      VkMappedMemoryRange range = {};
+      range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      range.memory = readback.memories[pending.index];
+      range.offset = 0;
+      range.size = VK_WHOLE_SIZE;
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+      if (uint8_t* destination = memory_->TranslatePhysical(pending.address)) {
+        std::memcpy(destination, readback.mapped_data[pending.index], pending.length);
+      }
+    }
+    // "some" copies a key once: its buffer is free now.
+    if (!readback.pending_landings && REXCVAR_GET(vulkan_readback_reuse_buffers)) {
+      Fh1GiveBackReadback(readback, pending.index, pending.submission);
+    }
+  }
+}
+
+// FH1 (#536): a miss of "some" used to create a dedicated host buffer (vkAllocateMemory and
+// vkMapMemory) and the eviction of its key 60 frames after its last resolve freed it, about one
+// of each a second in traffic and in a race (cars coming into and going out of view). The
+// buffer is only needed until its copy is in guest memory: keep it for the next miss instead.
+bool VulkanCommandProcessor::Fh1TakeSpareReadback(ReadbackBuffer& readback, uint32_t index,
+                                                  uint32_t size) {
+  for (size_t i = fh1_spare_readbacks_.size(); i-- > 0;) {
+    Fh1SpareReadback& spare = fh1_spare_readbacks_[i];
+    if (spare.size != size || spare.submission > submission_completed_) continue;
+    readback.buffers[index] = spare.buffer;
+    readback.memories[index] = spare.memory;
+    readback.mapped_data[index] = spare.mapping;
+    readback.sizes[index] = spare.size;
+    readback.submission_written[index] = 0;
+    readback.written_size[index] = 0;
+    fh1_spare_readback_bytes_ -= spare.size;
+    spare = fh1_spare_readbacks_.back();
+    fh1_spare_readbacks_.pop_back();
+    return true;
+  }
+  return false;
+}
+
+// The buffer `index` of `readback` (its GPU work done by `submission`) to the spares, or freed
+// when they are full. The slot is empty afterwards.
+void VulkanCommandProcessor::Fh1GiveBackReadback(ReadbackBuffer& readback, uint32_t index,
+                                                 uint64_t submission) {
+  if (readback.memories[index] == VK_NULL_HANDLE) return;
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (readback.buffers[index] != VK_NULL_HANDLE && readback.mapped_data[index] &&
+      fh1_spare_readback_bytes_ + readback.sizes[index] <= kSpareReadbackMaxBytes) {
+    Fh1SpareReadback& spare = fh1_spare_readbacks_.emplace_back();
+    spare.buffer = readback.buffers[index];
+    spare.memory = readback.memories[index];
+    spare.mapping = readback.mapped_data[index];
+    spare.size = readback.sizes[index];
+    spare.submission = submission;
+    spare.frame = frame_current_;
+    fh1_spare_readback_bytes_ += spare.size;
+  } else {
+    fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
+    fh1_frame_cost::Timer cost_timer(cost.readback_free_ms);
+    ++cost.readback_buffers_freed;
+    if (readback.mapped_data[index]) dfn.vkUnmapMemory(device, readback.memories[index]);
+    if (readback.buffers[index] != VK_NULL_HANDLE) {
+      dfn.vkDestroyBuffer(device, readback.buffers[index], nullptr);
+    }
+    dfn.vkFreeMemory(device, readback.memories[index], nullptr);
+  }
+  readback.buffers[index] = VK_NULL_HANDLE;
+  readback.memories[index] = VK_NULL_HANDLE;
+  readback.mapped_data[index] = nullptr;
+  readback.sizes[index] = 0;
+  readback.submission_written[index] = 0;
+  readback.written_size[index] = 0;
+}
+
+// Spares given back before `older_than_frame` (all of them with UINT64_MAX, at shutdown, after
+// the GPU is idle).
+void VulkanCommandProcessor::Fh1DestroySpareReadbacks(uint64_t older_than_frame) {
+  if (fh1_spare_readbacks_.empty()) return;
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (size_t i = fh1_spare_readbacks_.size(); i-- > 0;) {
+    Fh1SpareReadback& spare = fh1_spare_readbacks_[i];
+    if (older_than_frame != UINT64_MAX &&
+        (spare.frame >= older_than_frame || spare.submission > submission_completed_)) {
       continue;
     }
-    fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().readback_ms);
-    VkMappedMemoryRange range = {};
-    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    range.memory = readback.memories[pending.index];
-    range.offset = 0;
-    range.size = VK_WHOLE_SIZE;
-    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
-    if (uint8_t* destination = memory_->TranslatePhysical(pending.address)) {
-      std::memcpy(destination, readback.mapped_data[pending.index], pending.length);
-    }
+    fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
+    fh1_frame_cost::Timer cost_timer(cost.readback_free_ms);
+    ++cost.readback_buffers_freed;
+    dfn.vkUnmapMemory(device, spare.memory);
+    dfn.vkDestroyBuffer(device, spare.buffer, nullptr);
+    dfn.vkFreeMemory(device, spare.memory, nullptr);
+    fh1_spare_readback_bytes_ -= spare.size;
+    spare = fh1_spare_readbacks_.back();
+    fh1_spare_readbacks_.pop_back();
   }
 }
 
@@ -8034,6 +8132,11 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
+    if (readback.buffers[index] == VK_NULL_HANDLE && readback.memories[index] == VK_NULL_HANDLE &&
+        REXCVAR_GET(vulkan_readback_reuse_buffers) &&
+        Fh1TakeSpareReadback(readback, index, size)) {
+      return true;
+    }
     VkBuffer new_buffer = VK_NULL_HANDLE;
     VkDeviceMemory new_memory = VK_NULL_HANDLE;
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
@@ -8042,6 +8145,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       REXGPU_ERROR("Failed to create a {} MB Vulkan resolve readback buffer", size >> 20);
       return false;
     }
+    ++fh1_frame_cost::Current().readback_buffers_created;
 
     void* new_mapping = nullptr;
     if (dfn.vkMapMemory(device, new_memory, 0, VK_WHOLE_SIZE, 0, &new_mapping) != VK_SUCCESS) {
@@ -8527,6 +8631,11 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       readback.resolve_cpu_copy_valid = true;
     }
   }
+  // FH1 (#536): "some" copies a key once (waited for above): its buffer is free now.
+  if (readback_mode == ReadbackResolveMode::kSome && readback.resolve_cpu_copy_valid &&
+      !readback.pending_landings && REXCVAR_GET(vulkan_readback_reuse_buffers)) {
+    Fh1GiveBackReadback(readback, read_index, GetCurrentSubmission());
+  }
 
   readback.current_index = 1 - readback.current_index;
   return true;
@@ -8544,6 +8653,7 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
   for (auto it = buffer_map.begin(); it != buffer_map.end();) {
     ReadbackBuffer& readback = it->second;
     bool evict =
@@ -8553,7 +8663,14 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
       ++it;
       continue;
     }
+    if (&buffer_map == &readback_buffers_ && REXCVAR_GET(vulkan_readback_reuse_buffers)) {
+      // The work of a buffer last written by a resolve of this key is done by now, or by the
+      // current submission ("fast" copies every resolve, up to the last frame).
+      for (uint32_t i = 0; i < 2; ++i) Fh1GiveBackReadback(readback, i, GetCurrentSubmission());
+    }
+    fh1_frame_cost::Timer cost_timer(cost.readback_free_ms);
     for (uint32_t i = 0; i < 2; ++i) {
+      if (readback.memories[i] != VK_NULL_HANDLE) ++cost.readback_buffers_freed;
       if (readback.mapped_data[i] && readback.memories[i] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[i]);
       }
@@ -9228,6 +9345,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     Fh1LandDoneReadbacks();
     EvictOldReadbackBuffers(readback_buffers_);
     EvictOldReadbackBuffers(memexport_readback_buffers_);
+    if (frame_current_ > kSpareReadbackAgeFrames) {
+      Fh1DestroySpareReadbacks(frame_current_ - kSpareReadbackAgeFrames);
+    }
 
     primitive_processor_->BeginFrame();
 
