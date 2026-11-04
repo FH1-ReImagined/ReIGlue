@@ -121,10 +121,14 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
   memory_ = memory;
   guest_ptr_ = guest_ptr;
 
-  // Allocate ffmpeg stuff:
+  // Allocate ffmpeg stuff. A packet's data is always xma_frame_ (PreparePacket); its buffer
+  // reference wraps that array, so FFmpeg uses the frame in place (a packet without one is
+  // copied on every send) and the context owns no buffer of its own (FH1 #640: this was an
+  // unused 128 KB allocation for each of the 320 contexts).
   av_packet_ = av_packet_alloc();
   assert_not_null(av_packet_);
-  av_packet_->buf = av_buffer_alloc(128 * 1024);
+  av_packet_->buf =
+      av_buffer_create(xma_frame_.data(), xma_frame_.size(), [](void*, uint8_t*) {}, nullptr, 0);
 
   // find the XMA2 audio decoder
   av_codec_ = avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
@@ -133,15 +137,9 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
     return 1;
   }
 
-  av_context_ = avcodec_alloc_context3(av_codec_);
-  if (!av_context_) {
-    REXAPU_ERROR("XmaContext {}: Couldn't allocate context", id);
-    return 1;
-  }
-
-  // Initialize these to 0. They'll actually be set later.
-  av_context_->channels = 0;
-  av_context_->sample_rate = 0;
+  // The codec context, with the decoder's state (about 450 KB), is made by PrepareDecoder on
+  // the context's first decode and freed when the game releases or clears the context
+  // (ResetDecoderState): the game uses a few of the 320 contexts at a time (FH1 #640).
 
   av_frame_ = av_frame_alloc();
   if (!av_frame_) {
@@ -273,11 +271,10 @@ void XmaContext::ResetDecoderState() {
   // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
   // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
   // flush callback, so the call never reaches the code clearing channel[].out.
-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
-  // next decode, which does discard the history.
+  // Freeing the codec context makes PrepareDecoder open a new one on the next
+  // decode, which does discard the history, and returns its memory meanwhile.
   if (av_context_) {
-    av_context_->sample_rate = 0;
-    av_context_->channels = 0;
+    avcodec_free_context(&av_context_);
   }
   raw_frame_.fill(0);
   decoded_frame_.fill(0);
@@ -556,12 +553,19 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
   sample_rate = GetSampleRate(sample_rate);
 
   uint32_t channels = is_two_channel ? 2 : 1;
-  if (av_context_->sample_rate != sample_rate ||
+  if (!av_context_ || av_context_->sample_rate != sample_rate ||
       av_context_->channels != static_cast<int>(channels)) {
     REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
-                       av_context_->sample_rate, sample_rate, av_context_->channels, channels);
-    avcodec_free_context(&av_context_);
+                       av_context_ ? av_context_->sample_rate : 0, sample_rate,
+                       av_context_ ? av_context_->channels : 0, channels);
+    if (av_context_) {
+      avcodec_free_context(&av_context_);
+    }
     av_context_ = avcodec_alloc_context3(av_codec_);
+    if (!av_context_) {
+      REXAPU_ERROR("XmaContext {}: Couldn't allocate context", id());
+      return -1;
+    }
 
     av_context_->sample_rate = sample_rate;
     av_context_->channels = channels;
@@ -588,6 +592,9 @@ void XmaContext::PreparePacket(uint32_t frame_size, uint32_t frame_padding) {
 
 bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet,
                               AVFrame* av_frame) {
+  if (!av_context) {
+    return false;  // PrepareDecoder could not allocate it
+  }
   auto ret = avcodec_send_packet(av_context, av_packet);
   if (ret < 0) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
