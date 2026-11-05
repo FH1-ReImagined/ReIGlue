@@ -9,6 +9,7 @@
 // visible blocks as the game wrote them (big-endian), its format, size, pitch, tiling and
 // endianness. Guest addresses change between runs and are left out; so is the mip chain (games
 // bind the same picture with different mip counts).
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -112,6 +113,24 @@ class Packs {
   void CountReplacementUsed(uint64_t fingerprint);
   void CountUploaded(uint64_t gpu_bytes);
   void CountUnusable() { ++unusable_; }
+  // FH1 (#677): the backend's graphics memory for replacements (texture_pack::kReleaseDelayMs).
+  // texture_replace_memory_limit_mb (0: ReplacementMemoryLimit's default).
+  uint32_t memory_limit_mb() const { return memory_limit_mb_; }
+  void CountFreed(uint64_t gpu_bytes) {
+    ++frees_;
+    freed_bytes_ += gpu_bytes;
+  }
+  void CountHeldBack() { ++held_back_; }
+  // At frame starts: what is on the GPU now, the limit, and the uploads' time this frame.
+  void SetResident(uint64_t bytes, uint64_t limit) {
+    resident_bytes_ = bytes;
+    resident_peak_ = std::max(resident_peak_.load(), bytes);
+    limit_bytes_ = limit;
+  }
+  void CountUploadTime(uint64_t nanoseconds) {
+    upload_ns_ += nanoseconds;
+    upload_max_ns_ = std::max(upload_max_ns_.load(), nanoseconds);
+  }
   // Logs the summary at most once a minute (force: now, if anything happened).
   void LogSummary(bool force);
 
@@ -171,6 +190,20 @@ class Packs {
   std::atomic<uint64_t> unusable_{0};  // read, but not usable on this GPU
   std::atomic<uint64_t> uploads_{0};
   std::atomic<uint64_t> upload_bytes_{0};
+  // FH1 (#677).
+  uint32_t memory_limit_mb_ = 0;
+  std::atomic<uint64_t> files_read_{0};
+  std::atomic<uint64_t> file_bytes_read_{0};
+  std::atomic<uint64_t> frees_{0};
+  std::atomic<uint64_t> freed_bytes_{0};
+  std::atomic<uint64_t> held_back_{0};
+  std::atomic<uint64_t> resident_bytes_{0};
+  std::atomic<uint64_t> resident_peak_{0};
+  std::atomic<uint64_t> limit_bytes_{0};
+  std::atomic<uint64_t> upload_ns_{0};
+  std::atomic<uint64_t> upload_max_ns_{0};  // in one frame
+  uint64_t uploads_logged_ = 0;
+  uint64_t frees_logged_ = 0;
   uint64_t dumps_written_logged_ = 0;
   uint64_t last_summary_ms_ = 0;
 };

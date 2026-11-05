@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-168 commits: 130 general (Performance 46, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 11, Workarounds and defaults 3) and 38 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 4, Texture packs 2, Shader-hash effects 1).
+169 commits: 130 general (Performance 46, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 11, Workarounds and defaults 3) and 39 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 4, Texture packs 3, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
 FFmpeg (0413); see the README. Issue numbers (`#45`)
 in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
@@ -189,3 +189,4 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0430 | This branch | Vulkan: a shader translation's SPIR-V freed once its shader module exists (the driver keeps its own copy, and the module is never made again) ([#640](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/640)) | General | Performance | Dyotson |
 | 0435 | This branch | Command processor: no locked instruction on every draw for the outdated-texture flag (a plain load first; the exchange drained the store buffer and was 3.5-4 % of the thread), and no division per packet for the stereo log's offset ([#607](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/607)) | General | Performance | Dyotson |
 | 0436 | This branch | Texture packs: a pack's `pack.toml` can ask for its files to be read at start (`preload = true`), as `texture_replace_preload` does for every pack; for the decals a car's paint job is drawn from once, as it loads ([#659](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/659)) | **Forza** | Texture packs | Dyotson |
+| 0437 | This branch | Texture packs: a replacement is freed from graphics memory 5 s after the last texture with its picture goes (it stayed until exit), and all of them fit in `texture_replace_memory_limit_mb` (default 40% of the card's memory, less when the driver's budget is nearly used): beyond it the least recently drawn are freed, and if that is not enough the game's own texture is drawn; the summary line counts reads, frees, held-back ones and upload time ([#677](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/677)) | **Forza** | Texture packs | Dyotson |

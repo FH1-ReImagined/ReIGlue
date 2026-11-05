@@ -1,6 +1,7 @@
 #pragma once
-// FH1 (#384): the texture pack file formats: DDS reading and writing, and the pack order. Nothing
-// else of the SDK, so tools/test_texture_pack_dds.cpp builds it alone.
+// FH1 (#384): the texture pack file formats: DDS reading and writing, the pack order, and the
+// graphics memory policy of the replacements (#677). Nothing else of the SDK, so
+// tools/test_texture_pack_dds.cpp builds it alone.
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -71,5 +72,45 @@ std::vector<std::string> ParsePackOrder(const std::string& value, size_t& refuse
 // decals baked into its paint job): a top-level `preload = true` (before any [table]; spaces
 // and a # comment after it allowed). Anything else, `preload = "true"` included, is false.
 bool ManifestPreload(std::string_view text);
+
+// FH1 (#677): the graphics memory of the replacements. A replacement stays on the GPU while a
+// texture the game has loaded has its picture, and kReleaseDelayMs after the last one went (the
+// game's streaming often loads the same picture again right away); a preloaded one stays (it
+// has no texture until the game loads it). They all fit in a limit; beyond it the game's own
+// texture is drawn until there is room.
+constexpr uint64_t kReleaseDelayMs = 5000;
+// A replacement bound for a draw within this is on screen: never freed for the limit.
+constexpr uint64_t kInUseMs = 2000;
+// One not drawn for this long is freed too, held or not (the game keeps textures it no longer
+// draws until its own cache is full): read again when it is drawn (as the game's
+// texture_cache_memory_limit_soft_lifetime).
+constexpr uint64_t kIdleMs = 30000;
+// After the limit held one back: no new reads for this long, and the same one not before
+// kRetryMs (each read is a whole file).
+constexpr uint64_t kFullPauseMs = 1000;
+constexpr uint64_t kRetryMs = 30000;
+
+// The limit: limit_mb when set (texture_replace_memory_limit_mb), else 40% of the device-local
+// memory (a discrete GPU's own), on an integrated GPU (its textures in system memory) a quarter
+// of the system memory heap up to 2 GiB if that is more; at least 256 MiB.
+uint64_t ReplacementMemoryLimit(uint32_t limit_mb, uint64_t device_local_bytes, bool integrated,
+                                uint64_t system_heap_bytes);
+
+// A replacement on the GPU, as the limit sees it.
+struct ResidentReplacement {
+  uint64_t fingerprint = 0;
+  uint64_t bytes = 0;
+  uint32_t refs = 0;          // loaded textures with its picture
+  uint64_t last_used_ms = 0;  // bound for a draw
+  uint64_t released_ms = 0;   // when refs reached 0
+  bool pinned = false;        // preloaded
+};
+// What to free so that resident_bytes + incoming bytes fit under limit, freeing down to target
+// (<= limit, so the next ones fit without another search): first the ones no texture has (the
+// longest gone first), then the ones not bound for kInUseMs (the least recently bound first).
+// Preloaded ones and those on screen are kept. fits: whether the incoming one fits after that.
+std::vector<uint64_t> ChooseEvictions(std::vector<ResidentReplacement> resident,
+                                      uint64_t resident_bytes, uint64_t incoming, uint64_t limit,
+                                      uint64_t target, uint64_t now_ms, bool& fits);
 
 }  // namespace rex::graphics::texture_pack

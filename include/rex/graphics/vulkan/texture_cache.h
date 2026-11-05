@@ -156,6 +156,7 @@ class VulkanTextureCache final : public TextureCache {
 
   bool SupportsTexturePackReplacement() const override { return true; }
   void OnTexturePackReplacement(Texture& texture) override;
+  void OnTexturePackRelease(uint64_t replacement) override;
   void TexturePackBeginFrame() override;
 
  private:
@@ -414,7 +415,9 @@ class VulkanTextureCache final : public TextureCache {
 
   // FH1 (#384): texture pack replacements, by fingerprint. Uploaded once, then always in
   // SHADER_READ_ONLY_OPTIMAL; the guest texture keeps its own image (loaded as before), and
-  // bindings of its unsigned view sample the replacement instead.
+  // bindings of its unsigned view sample the replacement instead. FH1 (#677): freed
+  // kReleaseDelayMs after the last texture with its picture went, or when not drawn for kIdleMs
+  // (texture_pack/pack_format.h), and within the limit (TexturePackMakeRoom).
   struct Replacement {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
@@ -426,15 +429,42 @@ class VulkanTextureCache final : public TextureCache {
     uint32_t guest_height = 0;
     bool failed = false;
     std::unordered_map<uint32_t, VkImageView> views;  // by host swizzle
+    // FH1 (#677).
+    uint32_t refs = 0;  // loaded textures holding it (Texture::PackState::held)
+    uint32_t memory_type = 0;
+    uint64_t gpu_bytes = 0;
+    uint64_t last_used_ms = 0;  // bound for a draw
+    uint64_t released_ms = 0;   // refs reached 0
+    uint64_t retry_ms = 0;      // held back by the limit: not read again before
+    bool requested = false;     // a decode is on its way
+    bool pinned = false;        // preloaded: kept without a texture, never freed for the limit
   };
   struct PackStaging {
     uint64_t submission;
     VkBuffer buffer;
     VmaAllocation allocation;
   };
+  // A freed replacement's image, destroyed once the submissions that may sample it completed.
+  struct PackRetired {
+    uint64_t submission;
+    VkImage image;
+    VmaAllocation allocation;
+    uint32_t memory_type;
+    uint64_t size;
+    std::vector<VkImageView> views;
+  };
   VkImageView GetTexturePackView(const Texture& texture, uint32_t host_swizzle);
   void UploadTexturePackReplacement(const texture_pack::Decoded& decoded);
   void DestroyTexturePackReplacements();
+  // FH1 (#677).
+  void RequestTexturePackDecode(uint64_t fingerprint, Replacement& replacement, uint32_t width,
+                                uint32_t height);
+  void RetireTexturePackReplacement(Replacement& replacement);
+  void DestroyRetiredTexturePackImages(uint64_t completed_submission_index, bool all);
+  void FreeReleasedTexturePackReplacements();
+  uint64_t TexturePackMemoryLimit();
+  // Frees replacements (ChooseEvictions) until `bytes` more fit; false if they do not.
+  bool TexturePackMakeRoom(uint64_t bytes, uint64_t fingerprint);
   std::unordered_map<uint64_t, Replacement> pack_replacements_;
   std::shared_ptr<texture_pack::Client> pack_client_;
   std::deque<std::unique_ptr<texture_pack::Decoded>> pack_uploads_;
@@ -442,6 +472,16 @@ class VulkanTextureCache final : public TextureCache {
   uint64_t pack_gpu_bytes_ = 0;
   uint32_t pack_uploads_logged_ = 0;
   bool pack_preloaded_ = false;
+  // FH1 (#677).
+  std::deque<PackRetired> pack_retired_;
+  std::vector<uint64_t> pack_released_;  // refs reached 0: freed after kReleaseDelayMs
+  uint64_t pack_now_ms_ = 0;             // the frame start's
+  uint64_t pack_limit_ = 0;              // 0: not worked out yet
+  uint64_t pack_full_until_ms_ = 0;      // after the limit held one back (kFullPauseMs)
+  uint64_t pack_heap_check_ms_ = 0;
+  uint64_t pack_idle_check_ms_ = 0;
+  bool pack_heap_full_ = false;  // a device-local heap is nearly at the driver's budget
+  bool pack_limit_logged_ = false;
 };
 
 }  // namespace rex::graphics::vulkan

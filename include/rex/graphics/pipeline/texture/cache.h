@@ -282,6 +282,9 @@ class TextureCache {
       uint8_t quick_reloads = 0;
       bool classified = false;
       bool skipped = false;  // never fingerprinted (its kind, or rewritten as the game runs)
+      // FH1 (#677): the replacement this texture holds for the backend (counted there), released
+      // when its picture changes and when the texture is destroyed.
+      uint64_t held = 0;
     };
     PackState& pack_state() { return pack_state_; }
     const PackState& pack_state() const { return pack_state_; }
@@ -601,7 +604,10 @@ class TextureCache {
   // replacements is told when a loaded texture has one, and uploads them at frame starts.
   texture_pack::Packs* texture_packs() const { return packs_; }
   virtual bool SupportsTexturePackReplacement() const { return false; }
+  // Sets state.held to state.replacement (or clears state.replacement if it cannot be used).
   virtual void OnTexturePackReplacement(Texture& /*texture*/) {}
+  // A texture no longer holds this replacement (PackState::held).
+  virtual void OnTexturePackRelease(uint64_t /*replacement*/) {}
   virtual void TexturePackBeginFrame() {}
 
  private:

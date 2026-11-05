@@ -11,12 +11,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/chrono/clock.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/cvar.h>
@@ -3644,6 +3646,7 @@ void VulkanTextureCache::CompletedSubmissionUpdated(uint64_t completed_submissio
                      pack_staging_.front().allocation);
     pack_staging_.pop_front();
   }
+  DestroyRetiredTexturePackImages(completed_submission_index, false);
 }
 
 void VulkanTextureCache::OnTexturePackReplacement(Texture& texture) {
@@ -3662,21 +3665,171 @@ void VulkanTextureCache::OnTexturePackReplacement(Texture& texture) {
                   state.replacement, width, height);
     }
   }
-  if (inserted) {
-    if (!pack_client_) pack_client_ = std::make_shared<texture_pack::Client>();
-    texture_packs()->RequestDecode(state.replacement, width, height, pack_client_);
+  // FH1 (#677): the texture holds this one now (and no longer the one of its last picture).
+  if (state.held != state.replacement) {
+    if (state.held) OnTexturePackRelease(state.held);
+    state.held = state.replacement;
+    ++replacement.refs;
   }
+  // New, or freed for the limit since: read it (unless the limit holds reads back).
+  RequestTexturePackDecode(state.replacement, replacement, width, height);
   if (replacement.failed) state.replacement = 0;
+}
+
+void VulkanTextureCache::OnTexturePackRelease(uint64_t replacement_fingerprint) {
+  auto it = pack_replacements_.find(replacement_fingerprint);
+  if (it == pack_replacements_.end() || !it->second.refs) return;
+  if (!--it->second.refs) {
+    it->second.released_ms = pack_now_ms_;
+    pack_released_.push_back(replacement_fingerprint);
+  }
+}
+
+void VulkanTextureCache::RequestTexturePackDecode(uint64_t fingerprint, Replacement& replacement,
+                                                  uint32_t width, uint32_t height) {
+  if (replacement.requested || replacement.image || replacement.failed) return;
+  if (pack_now_ms_ < replacement.retry_ms || pack_now_ms_ < pack_full_until_ms_) return;
+  if (!pack_client_) pack_client_ = std::make_shared<texture_pack::Client>();
+  replacement.requested = true;
+  texture_packs()->RequestDecode(fingerprint, width, height, pack_client_);
+}
+
+void VulkanTextureCache::RetireTexturePackReplacement(Replacement& replacement) {
+  if (!replacement.image) return;
+  // The submissions up to the current one may sample it; bindings made from now on do not.
+  PackRetired retired{command_processor_.GetCurrentSubmission(), replacement.image,
+                      replacement.allocation, replacement.memory_type, replacement.gpu_bytes, {}};
+  retired.views.reserve(replacement.views.size());
+  for (const auto& view : replacement.views) retired.views.push_back(view.second);
+  pack_retired_.push_back(std::move(retired));
+  pack_gpu_bytes_ -= std::min(pack_gpu_bytes_, replacement.gpu_bytes);
+  if (texture_pack::Packs* packs = texture_packs()) packs->CountFreed(replacement.gpu_bytes);
+  replacement.image = VK_NULL_HANDLE;
+  replacement.allocation = VK_NULL_HANDLE;
+  replacement.views.clear();
+  replacement.gpu_bytes = 0;
+  ResetTextureBindings();
+}
+
+void VulkanTextureCache::DestroyRetiredTexturePackImages(uint64_t completed_submission_index,
+                                                         bool all) {
+  if (pack_retired_.empty()) return;
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  while (!pack_retired_.empty() &&
+         (all || pack_retired_.front().submission <= completed_submission_index)) {
+    const PackRetired& retired = pack_retired_.front();
+    for (VkImageView view : retired.views) dfn.vkDestroyImageView(device, view, nullptr);
+    device_memory::Get().Freed(device_memory::Use::kTexture, retired.memory_type, retired.size);
+    vmaDestroyImage(vma_allocator_, retired.image, retired.allocation);
+    pack_retired_.pop_front();
+  }
+}
+
+void VulkanTextureCache::FreeReleasedTexturePackReplacements() {
+  size_t kept = 0;
+  for (size_t i = 0; i < pack_released_.size(); ++i) {
+    const uint64_t fingerprint = pack_released_[i];
+    auto it = pack_replacements_.find(fingerprint);
+    if (it == pack_replacements_.end()) continue;  // freed already
+    Replacement& replacement = it->second;
+    if (replacement.refs || replacement.pinned) continue;  // held again: back here when released
+    if (replacement.requested || pack_now_ms_ < replacement.released_ms + texture_pack::kReleaseDelayMs) {
+      pack_released_[kept++] = fingerprint;
+      continue;
+    }
+    if (replacement.failed) continue;  // kept, so the file is not read again
+    RetireTexturePackReplacement(replacement);
+    pack_replacements_.erase(it);
+  }
+  pack_released_.resize(kept);
+  // Once a second: the ones not drawn for kIdleMs, though a texture still has them (the game
+  // keeps its textures until its cache is full). Read again when drawn (GetTexturePackView).
+  if (pack_now_ms_ < pack_idle_check_ms_) return;
+  pack_idle_check_ms_ = pack_now_ms_ + 1000;
+  for (auto it = pack_replacements_.begin(); it != pack_replacements_.end();) {
+    Replacement& replacement = it->second;
+    if (replacement.image && !replacement.pinned &&
+        replacement.last_used_ms + texture_pack::kIdleMs <= pack_now_ms_) {
+      RetireTexturePackReplacement(replacement);
+      if (!replacement.refs) {
+        it = pack_replacements_.erase(it);
+        continue;
+      }
+    }
+    ++it;
+  }
+}
+
+uint64_t VulkanTextureCache::TexturePackMemoryLimit() {
+  if (!pack_limit_) {
+    const device_memory::State& state = device_memory::Get();
+    const uint32_t limit_mb = texture_packs()->memory_limit_mb();
+    pack_limit_ = texture_pack::ReplacementMemoryLimit(
+        limit_mb, state.layout().device_local_bytes, state.layout().integrated,
+        state.layout().system_heap_bytes);
+    REXGPU_INFO("Texture packs: replacements take up to {} MiB of graphics memory{}",
+                pack_limit_ >> 20, limit_mb ? " (texture_replace_memory_limit_mb)" : "");
+  }
+  return pack_limit_;
+}
+
+bool VulkanTextureCache::TexturePackMakeRoom(uint64_t bytes, uint64_t fingerprint) {
+  const uint64_t limit = TexturePackMemoryLimit();
+  device_memory::State& state = device_memory::Get();
+  if (pack_now_ms_ >= pack_heap_check_ms_) {
+    // A discrete GPU's memory nearly at the driver's budget (other programs, the game's own
+    // textures): no more replacements, only others swapped for them. An integrated GPU's
+    // textures go to system memory instead (fh1_device_memory.h).
+    pack_heap_check_ms_ = pack_now_ms_ + 1000;
+    pack_heap_full_ = false;
+    if (!state.layout().integrated) {
+      const device_memory::State::Budget budget = state.Query();
+      for (uint32_t h = 0; h < state.layout().heap_count; ++h) {
+        const uint64_t heap_budget = budget.heaps.budget[h];
+        if ((state.layout().device_local_heaps >> h & 1) && heap_budget &&
+            budget.heaps.usage[h] + heap_budget / 20 >= heap_budget) {
+          pack_heap_full_ = true;
+        }
+      }
+    }
+  }
+  const uint64_t room = pack_heap_full_ ? std::min(limit, pack_gpu_bytes_) : limit;
+  if (pack_gpu_bytes_ + bytes <= room) return true;
+  std::vector<texture_pack::ResidentReplacement> resident;
+  resident.reserve(pack_replacements_.size());
+  for (const auto& [resident_fingerprint, replacement] : pack_replacements_) {
+    if (!replacement.image || resident_fingerprint == fingerprint) continue;
+    resident.push_back({resident_fingerprint, replacement.gpu_bytes, replacement.refs,
+                        replacement.last_used_ms, replacement.released_ms, replacement.pinned});
+  }
+  bool fits = false;
+  // An eighth below the limit, so the next ones fit without another search.
+  const std::vector<uint64_t> chosen = texture_pack::ChooseEvictions(
+      std::move(resident), pack_gpu_bytes_, bytes, room, room - room / 8, pack_now_ms_, fits);
+  for (uint64_t chosen_fingerprint : chosen) {
+    auto it = pack_replacements_.find(chosen_fingerprint);
+    if (it == pack_replacements_.end()) continue;
+    RetireTexturePackReplacement(it->second);
+    // One a texture still holds stays listed, to be read again when it is drawn.
+    if (!it->second.refs && !it->second.pinned) pack_replacements_.erase(it);
+  }
+  return fits;
 }
 
 void VulkanTextureCache::TexturePackBeginFrame() {
   texture_pack::Packs* packs = texture_packs();
   if (!packs || !packs->replacing()) return;
+  pack_now_ms_ = rex::chrono::Clock::QueryHostUptimeMillis();
   if (packs->preload() && !pack_preloaded_) {
     pack_preloaded_ = true;
     if (!pack_client_) pack_client_ = std::make_shared<texture_pack::Client>();
     for (uint64_t fingerprint : packs->PreloadList()) {
-      if (pack_replacements_.try_emplace(fingerprint).second) {
+      auto [it, inserted] = pack_replacements_.try_emplace(fingerprint);
+      it->second.pinned = true;
+      if (inserted) {
+        it->second.requested = true;
         packs->RequestDecode(fingerprint, 0, 0, pack_client_);
       }
     }
@@ -3684,9 +3837,11 @@ void VulkanTextureCache::TexturePackBeginFrame() {
   if (pack_client_ && pack_client_->HasReady()) {
     for (auto& decoded : pack_client_->Take()) pack_uploads_.push_back(std::move(decoded));
   }
+  FreeReleasedTexturePackReplacements();
   // At most 32 MiB a frame (and at least one file), so loading a pack does not stall a frame.
   uint64_t budget = uint64_t(32) << 20;
   bool first = true;
+  const auto upload_start = std::chrono::steady_clock::now();
   while (!pack_uploads_.empty() && (first || pack_uploads_.front()->data.size() <= budget)) {
     std::unique_ptr<texture_pack::Decoded> decoded = std::move(pack_uploads_.front());
     pack_uploads_.pop_front();
@@ -3695,13 +3850,23 @@ void VulkanTextureCache::TexturePackBeginFrame() {
     UploadTexturePackReplacement(*decoded);
     pack_client_->Uploaded(decoded->data.size());
   }
+  if (!first) {
+    packs->CountUploadTime(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - upload_start)
+                                        .count()));
+  }
+  packs->SetResident(pack_gpu_bytes_, TexturePackMemoryLimit());
 }
 
 void VulkanTextureCache::UploadTexturePackReplacement(const texture_pack::Decoded& decoded) {
   texture_pack::Packs* packs = texture_packs();
   auto it = pack_replacements_.find(decoded.fingerprint);
-  if (it == pack_replacements_.end() || it->second.image || it->second.failed) return;
+  if (it == pack_replacements_.end()) return;  // freed while it was read
   Replacement& replacement = it->second;
+  replacement.requested = false;
+  if (replacement.image || replacement.failed) return;
+  // FH1 (#677): no texture has it any more (FreeReleasedTexturePackReplacements drops it).
+  if (!replacement.refs && !replacement.pinned) return;
   auto fail = [&](const char* reason) {
     replacement.failed = true;
     if (reason) {
@@ -3732,6 +3897,21 @@ void VulkanTextureCache::UploadTexturePackReplacement(const texture_pack::Decode
   }
   if (!(format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
     fail("this GPU cannot sample its format");
+    return;
+  }
+  // FH1 (#677): within the limit, or the game's own texture until there is room.
+  if (!TexturePackMakeRoom(decoded.data.size(), decoded.fingerprint)) {
+    replacement.retry_ms = pack_now_ms_ + texture_pack::kRetryMs;
+    pack_full_until_ms_ = pack_now_ms_ + texture_pack::kFullPauseMs;
+    packs->CountHeldBack();
+    if (!pack_limit_logged_) {
+      pack_limit_logged_ = true;
+      REXGPU_INFO(
+          "Texture packs: the replacements on screen fill their graphics memory ({} MiB of a "
+          "limit of {} MiB{}): more are drawn with the game's own textures until there is room",
+          pack_gpu_bytes_ >> 20, TexturePackMemoryLimit() >> 20,
+          pack_heap_full_ ? ", the graphics card nearly full" : "");
+    }
     return;
   }
   VkImageCreateInfo image_create_info = {};
@@ -3809,6 +3989,9 @@ void VulkanTextureCache::UploadTexturePackReplacement(const texture_pack::Decode
   replacement.format = format;
   replacement.width = decoded.width;
   replacement.height = decoded.height;
+  replacement.memory_type = image_info.memoryType;
+  replacement.gpu_bytes = image_info.size;
+  replacement.last_used_ms = pack_now_ms_;
   pack_gpu_bytes_ += image_info.size;
   packs->CountUploaded(image_info.size);
   if (pack_uploads_logged_ < 16) {
@@ -3828,10 +4011,17 @@ VkImageView VulkanTextureCache::GetTexturePackView(const Texture& texture,
   const uint64_t fingerprint = texture.pack_state().replacement;
   if (!fingerprint) return VK_NULL_HANDLE;
   auto it = pack_replacements_.find(fingerprint);
-  if (it == pack_replacements_.end() || !it->second.image || it->second.failed) {
+  if (it == pack_replacements_.end() || it->second.failed) return VK_NULL_HANDLE;
+  Replacement& replacement = it->second;
+  replacement.last_used_ms = pack_now_ms_;
+  if (!replacement.image) {
+    // FH1 (#677): freed for the limit while the texture kept it: read again, as it is drawn.
+    if (replacement.refs) {
+      RequestTexturePackDecode(fingerprint, replacement, replacement.guest_width,
+                               replacement.guest_height);
+    }
     return VK_NULL_HANDLE;
   }
-  Replacement& replacement = it->second;
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   if (!vulkan_device->properties().imageViewFormatSwizzle) {
     host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
@@ -3872,6 +4062,8 @@ void VulkanTextureCache::DestroyTexturePackReplacements() {
     }
   }
   pack_replacements_.clear();
+  pack_released_.clear();
+  DestroyRetiredTexturePackImages(0, true);
   for (const PackStaging& staging : pack_staging_) {
     vmaDestroyBuffer(vma_allocator_, staging.buffer, staging.allocation);
   }
