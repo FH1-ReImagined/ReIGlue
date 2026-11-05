@@ -899,9 +899,10 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     WarnUninitializedPacket();
   }
 
-  // Patch 0396: where the packet starts, for the stereo log.
-  const uint32_t packet_start =
-      (reader->read_offset() + reader->capacity() - sizeof(uint32_t)) % reader->capacity();
+  // Patch 0396: where the packet starts, for the stereo log. FH1 (#607, patch 0435): the read
+  // offset only; the division that wraps it is done when the packet is logged, not for each
+  // of the about 24 packets of every draw.
+  const auto packet_read_offset = reader->read_offset();
   bool result;
   switch (packet >> 30) {
     case 0x03:
@@ -917,6 +918,8 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   if ((fh1_stereo_state_ == Fh1StereoState::kSpeculative ||
        fh1_stereo_state_ == Fh1StereoState::kRecording) &&
       result) [[unlikely]] {
+    const uint32_t packet_start = uint32_t(
+        (packet_read_offset + reader->capacity() - sizeof(uint32_t)) % reader->capacity());
     Fh1StereoLogPacket(reader, packet_start, packet);
   }
   return result;

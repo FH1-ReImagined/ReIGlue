@@ -13,7 +13,7 @@ is the patch number in Forza Horizon 1: ReImagined's former `patches/rexglue-sdk
   runtime and platform fixes, diagnostics, codegen and build. Any ReXGlue game can use them; they are
   the candidates for upstream.
 
-167 commits: 129 general (Performance 45, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 11, Workarounds and defaults 3) and 38 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 4, Texture packs 2, Shader-hash effects 1).
+168 commits: 130 general (Performance 46, Xenos GPU 27, Input 18, Runtime and platform 15, Codegen and build 10, Diagnostics 11, Workarounds and defaults 3) and 38 Forza-specific (Upscaling and HUD 18, VR 8, Input 5, Game-specific fixes 4, Texture packs 2, Shader-hash effects 1).
 `patches/sdl3/` holds the one patch to the SDL submodule (0147) and `patches/ffmpeg/` the one to
 FFmpeg (0413); see the README. Issue numbers (`#45`)
 in the commit messages are Forza Horizon 1: ReImagined's issues; the table links them.
@@ -187,3 +187,4 @@ in the commit messages are Forza Horizon 1: ReImagined's issues; the table links
 | 0428 | This branch | XMA decoder: FFmpeg's decoder state (about 450 KB) made on a context's first decode and freed when the game releases or clears the context, and no 128 KB packet buffer per context (the 320 contexts took 183 MB at start, most of them never used) ([#640](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/640)) | General | Performance | Dyotson |
 | 0429 | This branch | Vulkan driver pipeline cache: the driver data held in memory stops at what a save keeps (512 MB); every pipeline's data stayed until exit, about 2 MB a pipeline on NVIDIA (`vulkan_store_pipeline_cache_memory_mb`, testing, lowers the bound) ([#640](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/640), [#406](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/406)) | General | Performance | Dyotson |
 | 0430 | This branch | Vulkan: a shader translation's SPIR-V freed once its shader module exists (the driver keeps its own copy, and the module is never made again) ([#640](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/640)) | General | Performance | Dyotson |
+| 0435 | This branch | Command processor: no locked instruction on every draw for the outdated-texture flag (a plain load first; the exchange drained the store buffer and was 3.5-4 % of the thread), and no division per packet for the stereo log's offset ([#607](https://github.com/FH1-ReImagined/ForzaHorizon1-ReImagined/issues/607)) | General | Performance | Dyotson |

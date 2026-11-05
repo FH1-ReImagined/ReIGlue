@@ -609,7 +609,13 @@ void TextureCache::TexturePackOnLoad(Texture& texture, bool base_loaded) {
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 
-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+  // FH1 (#607, patch 0435): a plain load first. The exchange is a locked instruction, which
+  // waits for the store buffer to drain (the draw's register, constant and command stores):
+  // it was 3.5-4 % of the command processor's CPU, on every draw, while only a memory watch
+  // callback sets the flag. A callback that sets it after this load is seen by the next
+  // draw, as it was when it came after the exchange.
+  if (texture_became_outdated_.load(std::memory_order_acquire) &&
+      texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
     // A texture has become outdated - make sure whether textures are outdated
     // is rechecked in this draw and in subsequent ones to reload the new data
     // if needed.
