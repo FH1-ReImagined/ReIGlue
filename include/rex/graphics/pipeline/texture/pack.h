@@ -83,7 +83,9 @@ class Packs {
 
   bool dumping() const { return dump_; }
   bool replacing() const { return replace_; }
-  bool preload() const { return preload_; }
+  // Whether some files are read at start: every file with texture_replace_preload, else the
+  // files of the packs whose pack.toml asks for it (ManifestPreload).
+  bool preload() const { return preload_ || !preload_list_.empty(); }
   const std::filesystem::path& root() const { return root_; }
 
   // Command processor thread.
@@ -101,6 +103,8 @@ class Packs {
   void RequestDecode(uint64_t fingerprint, uint32_t width, uint32_t height,
                      const std::shared_ptr<Client>& client);
   std::vector<uint64_t> Replacements() const;
+  // The fingerprints to read at start (see preload()).
+  std::vector<uint64_t> PreloadList() const { return preload_ ? Replacements() : preload_list_; }
 
   void CountSkip(Skip skip, xenos::TextureFormat format);
   // The texture cache's time for a load (all of it), and the hashing's part of it.
@@ -127,6 +131,8 @@ class Packs {
   std::filesystem::path dump_dir_;
   // Fingerprint -> file in root_ (read-only after construction).
   std::vector<std::pair<uint64_t, std::filesystem::path>> index_;
+  // Of index_, the fingerprints whose file is in a pack that asks to be preloaded (sorted).
+  std::vector<uint64_t> preload_list_;
 
   std::mutex dump_mutex_;
   std::unordered_set<uint64_t> dumped_;  // on disk at start, or queued in this run

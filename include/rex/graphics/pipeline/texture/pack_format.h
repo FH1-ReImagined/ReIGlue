@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rex::graphics::texture_pack {
@@ -64,5 +65,11 @@ bool DecodeDds(const uint8_t* data, size_t size, Decoded& out, std::string& erro
 // path, "dump" in any case) is left out and counted in refused; a name given twice keeps its
 // first place; empty names are skipped ("|" alone: no packs).
 std::vector<std::string> ParsePackOrder(const std::string& value, size_t& refused);
+
+// A pack's pack.toml asks for its files to be read at start, as texture_replace_preload does
+// for every pack (FH1 #659: a texture the game draws from once, as it loads, such as a car's
+// decals baked into its paint job): a top-level `preload = true` (before any [table]; spaces
+// and a # comment after it allowed). Anything else, `preload = "true"` included, is false.
+bool ManifestPreload(std::string_view text);
 
 }  // namespace rex::graphics::texture_pack

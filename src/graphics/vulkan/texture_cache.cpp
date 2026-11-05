@@ -3675,7 +3675,7 @@ void VulkanTextureCache::TexturePackBeginFrame() {
   if (packs->preload() && !pack_preloaded_) {
     pack_preloaded_ = true;
     if (!pack_client_) pack_client_ = std::make_shared<texture_pack::Client>();
-    for (uint64_t fingerprint : packs->Replacements()) {
+    for (uint64_t fingerprint : packs->PreloadList()) {
       if (pack_replacements_.try_emplace(fingerprint).second) {
         packs->RequestDecode(fingerprint, 0, 0, pack_client_);
       }

@@ -370,6 +370,31 @@ bool DecodeDds(const uint8_t* data, size_t size, Decoded& out, std::string& erro
   return true;
 }
 
+bool ManifestPreload(std::string_view text) {
+  auto trim = [](std::string_view s) {
+    const size_t first = s.find_first_not_of(" \t\r");
+    if (first == std::string_view::npos) return std::string_view();
+    return s.substr(first, s.find_last_not_of(" \t\r") - first + 1);
+  };
+  bool preload = false;
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = text.find('\n', start);
+    if (end == std::string_view::npos) end = text.size();
+    std::string_view line = trim(text.substr(start, end - start));
+    start = end + 1;
+    if (line.empty() || line.front() == '#') continue;
+    if (line.front() == '[') break;  // a table: its keys are not the pack's
+    const size_t equals = line.find('=');
+    if (equals == std::string_view::npos || trim(line.substr(0, equals)) != "preload") continue;
+    std::string_view value = line.substr(equals + 1);
+    const size_t comment = value.find('#');
+    if (comment != std::string_view::npos) value = value.substr(0, comment);
+    preload = trim(value) == "true";
+  }
+  return preload;
+}
+
 std::vector<std::string> ParsePackOrder(const std::string& value, size_t& refused) {
   std::vector<std::string> names;
   size_t start = 0;

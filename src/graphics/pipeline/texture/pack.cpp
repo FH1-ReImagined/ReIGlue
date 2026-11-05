@@ -4,6 +4,7 @@
  */
 
 #include <rex/graphics/pipeline/texture/pack.h>
+#include <rex/graphics/pipeline/texture/pack_format.h>
 
 #include <algorithm>
 #include <bit>
@@ -704,13 +705,28 @@ Packs::Packs() {
       uint64_t fingerprint;
       uint32_t pack;
       bool dds;
+      bool preload;  // its pack's pack.toml asks for it to be read at start (#659)
       std::filesystem::path path;
     };
     std::vector<File> files;
+    // Whether the pack folder's pack.toml says preload = true (ManifestPreload).
+    auto asks_preload = [](const std::filesystem::path& folder) {
+      std::ifstream manifest(folder / "pack.toml", std::ios::binary);
+      if (!manifest) return false;
+      std::string text(64 * 1024, '\0');
+      manifest.read(text.data(), std::streamsize(text.size()));
+      text.resize(size_t(manifest.gcount()));
+      return ManifestPreload(text);
+    };
+    std::vector<std::string> preloaded_packs;  // for the log
     // top_only: the files in `folder` itself, not in its folders (the loose files, ".").
-    auto scan = [&files](const std::filesystem::path& folder, uint32_t pack, bool skip_dump,
-                         bool top_only) {
+    // preload: the folder is a pack that asks to be preloaded; with skip_dump (the whole root,
+    // no texture_packs), each folder at its top is a pack and asks for itself.
+    auto scan = [&files, &asks_preload, &preloaded_packs](const std::filesystem::path& folder,
+                                                         uint32_t pack, bool skip_dump,
+                                                         bool top_only, bool preload) {
       std::error_code scan_error;
+      bool top_preload = false;  // the root scan: the current top folder's
       for (auto it = std::filesystem::recursive_directory_iterator(
                folder, std::filesystem::directory_options::skip_permission_denied, scan_error);
            !scan_error && it != std::filesystem::recursive_directory_iterator();
@@ -718,20 +734,25 @@ Packs::Packs() {
         if (it->is_directory(scan_error)) {
           if (top_only || (skip_dump && it.depth() == 0 && it->path().filename() == "dump")) {
             it.disable_recursion_pending();
+          } else if (skip_dump && it.depth() == 0) {
+            top_preload = asks_preload(it->path());
+            if (top_preload) preloaded_packs.push_back(it->path().filename().string());
           }
           continue;
         }
+        if (skip_dump && it.depth() == 0) top_preload = false;  // a loose file of the root
         const std::string extension = Lower(it->path().extension().string());
         uint64_t fingerprint;
         if ((extension == ".dds" || extension == ".png") &&
             ParseHex(it->path().stem().string(), fingerprint)) {
-          files.push_back({fingerprint, pack, extension == ".dds", it->path()});
+          files.push_back({fingerprint, pack, extension == ".dds", preload || top_preload,
+                           it->path()});
         }
       }
     };
     const std::string order = REXCVAR_GET(texture_packs);
     if (order.empty()) {
-      scan(root_, 0, true, false);
+      scan(root_, 0, true, false, false);
       packs_text = "every folder";
     } else {
       size_t refused = 0;
@@ -741,7 +762,7 @@ Packs::Packs() {
       for (uint32_t i = 0; i < names.size(); ++i) {
         if (names[i] == ".") {  // the loose files directly in the folder
           ++found;
-          scan(root_, i, false, true);
+          scan(root_, i, false, true, false);
           packs_text += (packs_text.empty() ? "" : ", ") + std::string("loose files");
           continue;
         }
@@ -752,7 +773,9 @@ Packs::Packs() {
           continue;
         }
         ++found;
-        scan(folder, i, false, false);
+        const bool preload = asks_preload(folder);
+        if (preload) preloaded_packs.push_back(names[i]);
+        scan(folder, i, false, false, preload);
         packs_text += (packs_text.empty() ? "" : ", ") + names[i];
       }
       if (packs_text.empty()) packs_text = "none";
@@ -779,7 +802,13 @@ Packs::Packs() {
         continue;
       }
       last_pack = file.pack;
+      if (file.preload) preload_list_.push_back(file.fingerprint);
       index_.emplace_back(file.fingerprint, std::move(file.path));
+    }
+    if (!preload_ && !preloaded_packs.empty()) {
+      std::string list;
+      for (const std::string& name : preloaded_packs) list += (list.empty() ? "" : ", ") + name;
+      packs_text += "; preloading " + std::to_string(preload_list_.size()) + " files of " + list;
     }
   }
   if (dump_) {
