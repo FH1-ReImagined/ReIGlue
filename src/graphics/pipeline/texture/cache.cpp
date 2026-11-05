@@ -510,6 +510,19 @@ void TextureCache::TexturePackOnLoad(Texture& texture, bool base_loaded) {
   if (!packs_) return;
   Texture::PackState& state = texture.pack_state();
   if (state.skipped) return;
+  // FH1 (#677): on every return, a picture that changed or lost its replacement releases the
+  // replacement the texture held (OnTexturePackReplacement takes the new one).
+  struct HeldRelease {
+    TextureCache& cache;
+    Texture::PackState& state;
+    ~HeldRelease() {
+      if (state.held && state.held != state.replacement) {
+        const uint64_t held = state.held;
+        state.held = 0;
+        cache.OnTexturePackRelease(held);
+      }
+    }
+  } held_release{*this, state};
   using texture_pack::Skip;
   // Counts the whole call's time, on every return.
   struct Timing {
@@ -836,6 +849,8 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
 
 TextureCache::Texture::~Texture() {
   fh1_frame_cost::Count(fh1_frame_cost::GetSizes().textures, -1);
+  // FH1 (#677): the replacement can be freed (the base cache's destructor calls its own no-op).
+  if (pack_state_.held) texture_cache_.OnTexturePackRelease(pack_state_.held);
   if (mips_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
   }

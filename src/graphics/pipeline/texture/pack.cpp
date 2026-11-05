@@ -56,6 +56,11 @@ REXCVAR_DEFINE_BOOL(texture_replace_preload, false, "GPU",
                     "Read every texture pack file at start instead of when its texture first "
                     "loads (more memory, no texture shown at its original resolution first)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(texture_replace_memory_limit_mb, 0, "GPU",
+                      "The most graphics memory texture pack replacements take, in MB; beyond it "
+                      "a texture is drawn with the game's own until there is room (0: 40% of the "
+                      "graphics card's memory)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(texture_pack_root, "", "GPU",
                       "Texture pack folder (default: textures in the user data folder)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -677,6 +682,7 @@ Packs::Packs() {
   dump_ = REXCVAR_GET(texture_dump);
   replace_ = REXCVAR_GET(texture_replace);
   preload_ = replace_ && REXCVAR_GET(texture_replace_preload);
+  memory_limit_mb_ = REXCVAR_GET(texture_replace_memory_limit_mb);
   dump_png_ = REXCVAR_GET(texture_dump_png);
   std::string root = REXCVAR_GET(texture_pack_root);
   if (root.empty()) {
@@ -1071,6 +1077,12 @@ void Packs::DecodeWorker() {
     } else if (!DecodeDds(file.data(), file.size(), *decoded, error)) {
       // error set
     }
+    if (!file.empty()) {
+      ++files_read_;
+      file_bytes_read_ += file.size();
+      file.clear();
+      file.shrink_to_fit();  // before the mips are made
+    }
     if (error.empty() && job->width && job->height) {
       // The same picture at another size: the aspect ratio must match (within a texel).
       const int64_t cross = int64_t(decoded->width) * job->height - int64_t(decoded->height) * job->width;
@@ -1125,11 +1137,15 @@ void Packs::LogSummary(bool force) {
   const uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
   if (!force && now - last_summary_ms_ < 60000) return;
   const uint64_t written = dumps_written_.load();
+  const uint64_t uploads = uploads_.load(), frees = frees_.load();
   const bool changed = stats_.fingerprint_ns != stats_logged_.fingerprint_ns ||
                        written != dumps_written_logged_ ||
-                       stats_.replacements_used != stats_logged_.replacements_used;
+                       stats_.replacements_used != stats_logged_.replacements_used ||
+                       uploads != uploads_logged_ || frees != frees_logged_;
   last_summary_ms_ = now;
   if (!changed) return;
+  uploads_logged_ = uploads;
+  frees_logged_ = frees;
   std::string formats;
   {
     std::vector<std::pair<uint32_t, uint32_t>> counts;
@@ -1147,9 +1163,10 @@ void Packs::LogSummary(bool force) {
       "Texture packs: command processor time {:.1f} ms ({:.2f} ms since the last summary; "
       "hashing {:.1f} ms, dump copies {:.1f} ms; at most {:.0f} us for a load); {} loads "
       "fingerprinted ({:.1f} MiB); dumped {} ({:.1f} MiB written, {} queued, {} dropped, {} "
-      "failed); replacements for {} textures ({} files read, "
-      "{} not usable, {} uploaded, "
-      "{:.1f} MiB of GPU memory); textures skipped: {} format, {} cube/3D/array/scaled, {} "
+      "failed); replacements for {} textures ({} files read ({:.1f} MiB), "
+      "{} not usable, {} uploaded ({:.1f} MiB in {:.1f} ms, at most {:.2f} ms a frame), {} "
+      "freed ({:.1f} MiB), {} held back by the limit; {:.1f} MiB of GPU memory now, at most "
+      "{:.1f}, limit {} MiB); textures skipped: {} format, {} cube/3D/array/scaled, {} "
       "screen-sized, {} dynamic, {} mips only, {} tiny; {} GPU-written loads{}{}",
       double(s.fingerprint_ns) / 1e6,
       double(s.fingerprint_ns - stats_logged_.fingerprint_ns) / 1e6, double(s.hash_ns) / 1e6,
@@ -1157,8 +1174,12 @@ void Packs::LogSummary(bool force) {
       double(s.fingerprint_bytes) / 1048576.0, written,
       double(dump_bytes_written_.load()) / 1048576.0, s.dumps_queued, s.dumps_dropped,
       dumps_failed_.load(), s.replacements_used,
-      decodes_ok_.load() + decodes_failed_.load(), decodes_failed_.load() + unusable_.load(),
-      uploads_.load(), double(upload_bytes_.load()) / 1048576.0,
+      decodes_ok_.load() + decodes_failed_.load(), double(file_bytes_read_.load()) / 1048576.0,
+      decodes_failed_.load() + unusable_.load(), uploads,
+      double(upload_bytes_.load()) / 1048576.0, double(upload_ns_.load()) / 1e6,
+      double(upload_max_ns_.load()) / 1e6, frees, double(freed_bytes_.load()) / 1048576.0,
+      held_back_.load(), double(resident_bytes_.load()) / 1048576.0,
+      double(resident_peak_.load()) / 1048576.0, limit_bytes_.load() >> 20,
       s.skipped[size_t(Skip::kFormat)], s.skipped[size_t(Skip::kShape)],
       s.skipped[size_t(Skip::kScreen)], s.skipped[size_t(Skip::kDynamic)],
       s.skipped[size_t(Skip::kNoBase)], s.skipped[size_t(Skip::kTiny)],

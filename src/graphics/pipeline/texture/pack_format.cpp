@@ -415,4 +415,47 @@ std::vector<std::string> ParsePackOrder(const std::string& value, size_t& refuse
   return names;
 }
 
+uint64_t ReplacementMemoryLimit(uint32_t limit_mb, uint64_t device_local_bytes, bool integrated,
+                                uint64_t system_heap_bytes) {
+  constexpr uint64_t kMiB = uint64_t(1) << 20;
+  if (limit_mb) return uint64_t(limit_mb) * kMiB;
+  uint64_t limit = device_local_bytes / 100 * 40;
+  if (integrated) limit = std::max(limit, std::min(system_heap_bytes / 4, uint64_t(2048) * kMiB));
+  return std::max(limit, uint64_t(256) * kMiB);
+}
+
+std::vector<uint64_t> ChooseEvictions(std::vector<ResidentReplacement> resident,
+                                      uint64_t resident_bytes, uint64_t incoming, uint64_t limit,
+                                      uint64_t target, uint64_t now_ms, bool& fits) {
+  std::vector<uint64_t> chosen;
+  fits = resident_bytes + incoming <= limit;
+  if (fits) return chosen;
+  // Tier 0: no texture has it, by the time it went; tier 1: not on screen, by its last draw.
+  auto tier = [now_ms](const ResidentReplacement& r) {
+    if (r.pinned) return 2;
+    if (!r.refs) return 0;
+    return r.last_used_ms + kInUseMs <= now_ms ? 1 : 2;
+  };
+  resident.erase(std::remove_if(resident.begin(), resident.end(),
+                                [&tier](const ResidentReplacement& r) { return tier(r) == 2; }),
+                 resident.end());
+  std::sort(resident.begin(), resident.end(),
+            [&tier](const ResidentReplacement& a, const ResidentReplacement& b) {
+              const int ta = tier(a), tb = tier(b);
+              if (ta != tb) return ta < tb;
+              const uint64_t oa = ta ? a.last_used_ms : a.released_ms;
+              const uint64_t ob = tb ? b.last_used_ms : b.released_ms;
+              if (oa != ob) return oa < ob;
+              return a.fingerprint < b.fingerprint;  // the same order every time
+            });
+  target = std::min(target, limit);
+  for (const ResidentReplacement& r : resident) {
+    if (resident_bytes + incoming <= target) break;
+    chosen.push_back(r.fingerprint);
+    resident_bytes -= std::min(resident_bytes, r.bytes);
+  }
+  fits = resident_bytes + incoming <= limit;
+  return chosen;
+}
+
 }  // namespace rex::graphics::texture_pack
