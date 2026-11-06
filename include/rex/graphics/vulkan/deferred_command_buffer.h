@@ -53,6 +53,27 @@ class DeferredCommandBuffer {
   }
   void Execute(VkCommandBuffer command_buffer);
 
+  // FH1 (#551): after a guest draw or resolve, its number in the device-lost trail
+  // (fh1_device_lost_trail.h): written by the GPU to `buffer` (offset 4) once finished with
+  // VK_AMD_buffer_marker, or a checkpoint holding it (VK_NV_device_diagnostic_checkpoints,
+  // reported per pipeline stage: also when issued).
+  struct Fh1Breadcrumbs {
+    PFN_vkCmdWriteBufferMarkerAMD write_buffer_marker = nullptr;
+    PFN_vkCmdSetCheckpointNV set_checkpoint = nullptr;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    // Test hook (FORZA_TEST_GPU_HANG_AT_FRAME): an event never set, waited for.
+    VkEvent hang_event = VK_NULL_HANDLE;
+    PFN_vkCmdWaitEvents wait_events = nullptr;
+  };
+  void SetFh1Breadcrumbs(const Fh1Breadcrumbs* breadcrumbs) { fh1_breadcrumbs_ = breadcrumbs; }
+  void CmdFh1Breadcrumb(uint32_t seq) {
+    auto& args = *reinterpret_cast<ArgsFh1Breadcrumb*>(
+        WriteCommand(Command::kFh1Breadcrumb, sizeof(ArgsFh1Breadcrumb)));
+    args.seq = seq;
+  }
+  // Test hook: makes the GPU wait forever (the driver then resets it: a real device loss).
+  void CmdFh1TestHang() { WriteCommand(Command::kFh1TestHang, 0); }
+
   // The recorded commands, taken out for another thread to execute (threaded submission).
   struct Streams {
     std::vector<uintmax_t> main;
@@ -451,6 +472,8 @@ class DeferredCommandBuffer {
     kVkSetStencilWriteMask,
     kVkSetViewport,
     kHoistedCommands,
+    kFh1Breadcrumb,
+    kFh1TestHang,
   };
 
   struct CommandHeader {
@@ -653,6 +676,10 @@ class DeferredCommandBuffer {
     uint32_t mask_reference;
   };
 
+  struct ArgsFh1Breadcrumb {
+    uint32_t seq;
+  };
+
   struct ArgsHoistedCommands {
     // Range of hoisted_stream_, in elements.
     size_t begin;
@@ -678,6 +705,7 @@ class DeferredCommandBuffer {
   std::vector<uintmax_t> hoisted_stream_;
   std::vector<uintmax_t>* write_stream_ = &command_stream_;
   bool native_upscale_ = false;
+  const Fh1Breadcrumbs* fh1_breadcrumbs_ = nullptr;
 };
 
 }  // namespace rex::graphics::vulkan

@@ -42,6 +42,9 @@
 #include "fh1_render_target_trim.h"
 #include "fh1_pipeline_lookahead.h"
 #include "fh1_submission_watch.h"
+#include "fh1_device_lost_trail.h"
+#include "../fh1_device_lost_report.h"
+#include <rex/ui/vulkan/fh1_breadcrumbs.h>
 #include <rex/platform.h>
 #include "../fh1_frame_cost.h"
 #if REX_PLATFORM_MAC
@@ -52,6 +55,7 @@
 #endif
 #include "fh1_readback_history.h"
 REXCVAR_DECLARE(bool, vulkan_render_target_update_reuse_verify);
+REXCVAR_DECLARE(bool, gpu_device_lost_breadcrumbs);
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
 REXCVAR_DECLARE(bool, forza_present_16_9);
@@ -775,6 +779,28 @@ int64_t Fh1NowMs() {
 uint64_t TestGpuLossFrame() {
   static const uint64_t frame = [] {
     const char* value = std::getenv("FORZA_TEST_GPU_LOSS_AT_FRAME");
+    return value && *value ? uint64_t(std::strtoull(value, nullptr, 10)) : uint64_t(0);
+  }();
+  return frame;
+}
+
+// FH1 (#551): the draws and resolves recorded, and where the GPU writes the last numbers it
+// issued and finished (fh1_device_lost_trail.h). Recorded by the command processor's thread.
+fh1_device_lost_trail::Trail fh1_trail;
+DeferredCommandBuffer::Fh1Breadcrumbs fh1_breadcrumbs;
+VkDeviceMemory fh1_breadcrumb_memory = VK_NULL_HANDLE;
+uint32_t fh1_breadcrumb_memory_type = 0;
+const volatile uint32_t* fh1_breadcrumb_values = nullptr;
+PFN_vkGetQueueCheckpointDataNV fh1_get_queue_checkpoint_data = nullptr;
+bool fh1_breadcrumbs_on = false;
+bool fh1_test_hang_done = false;
+
+// Test hook: FORZA_TEST_GPU_HANG_AT_FRAME=<n> makes the GPU wait, from the 50th draw of a
+// submission of frame n on, for an event that is never set: the driver resets the GPU (a real
+// device loss, to check what the breadcrumbs report). Only for test machines.
+uint64_t TestGpuHangFrame() {
+  static const uint64_t frame = [] {
+    const char* value = std::getenv("FORZA_TEST_GPU_HANG_AT_FRAME");
     return value && *value ? uint64_t(std::strtoull(value, nullptr, 10)) : uint64_t(0);
   }();
   return frame;
@@ -2734,7 +2760,110 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   Fh1WorldAoInitialize();
+  Fh1BreadcrumbsInitialize();
   return true;
+}
+
+void VulkanCommandProcessor::Fh1BreadcrumbsInitialize() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const auto get = [&](const char* name) {
+    return vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr(device, name);
+  };
+  fh1_breadcrumbs = {};
+  fh1_breadcrumbs_on = false;
+  fh1_test_hang_done = false;
+  const ui::vulkan::Fh1BreadcrumbExtension extension = ui::vulkan::Fh1GetBreadcrumbExtension();
+  const char* name = "none";
+  if (extension == ui::vulkan::Fh1BreadcrumbExtension::kAmdBufferMarker) {
+    fh1_breadcrumbs.write_buffer_marker =
+        reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(get("vkCmdWriteBufferMarkerAMD"));
+    VkDeviceSize memory_size = 0;
+    if (fh1_breadcrumbs.write_buffer_marker &&
+        ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, 64, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, fh1_breadcrumbs.buffer,
+            fh1_breadcrumb_memory, &fh1_breadcrumb_memory_type, &memory_size)) {
+      void* mapping = nullptr;
+      if (dfn.vkMapMemory(device, fh1_breadcrumb_memory, 0, VK_WHOLE_SIZE, 0, &mapping) ==
+          VK_SUCCESS) {
+        std::memset(mapping, 0, size_t(std::min<VkDeviceSize>(memory_size, 64)));
+        ui::vulkan::util::FlushMappedMemoryRange(vulkan_device, fh1_breadcrumb_memory,
+                                                 fh1_breadcrumb_memory_type);
+        fh1_breadcrumb_values = static_cast<const volatile uint32_t*>(mapping);
+        fh1_breadcrumbs_on = true;
+        name = "VK_AMD_buffer_marker";
+      }
+    }
+    if (!fh1_breadcrumbs_on) {
+      fh1_breadcrumbs.write_buffer_marker = nullptr;
+      REXGPU_WARN("GPU breadcrumbs: VK_AMD_buffer_marker is enabled but its buffer could not be "
+                  "made; a device loss won't name the draw");
+    }
+  } else if (extension == ui::vulkan::Fh1BreadcrumbExtension::kNvCheckpoints) {
+    fh1_breadcrumbs.set_checkpoint =
+        reinterpret_cast<PFN_vkCmdSetCheckpointNV>(get("vkCmdSetCheckpointNV"));
+    fh1_get_queue_checkpoint_data =
+        reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(get("vkGetQueueCheckpointDataNV"));
+    fh1_breadcrumbs_on = fh1_breadcrumbs.set_checkpoint && fh1_get_queue_checkpoint_data;
+    if (fh1_breadcrumbs_on) name = "VK_NV_device_diagnostic_checkpoints";
+  }
+  if (fh1_breadcrumbs_on && TestGpuHangFrame()) {
+    fh1_breadcrumbs.wait_events = reinterpret_cast<PFN_vkCmdWaitEvents>(get("vkCmdWaitEvents"));
+    const auto create_event = reinterpret_cast<PFN_vkCreateEvent>(get("vkCreateEvent"));
+    VkEventCreateInfo event_info{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    if (!create_event || !fh1_breadcrumbs.wait_events ||
+        create_event(device, &event_info, nullptr, &fh1_breadcrumbs.hang_event) != VK_SUCCESS) {
+      fh1_breadcrumbs.hang_event = VK_NULL_HANDLE;
+    }
+    REXGPU_WARN("Test hook: the GPU will wait forever from frame {} (FORZA_TEST_GPU_HANG_AT_FRAME){}",
+                TestGpuHangFrame(), fh1_breadcrumbs.hang_event ? "" : ", but no event was made");
+  }
+  deferred_command_buffer_.SetFh1Breadcrumbs(fh1_breadcrumbs_on ? &fh1_breadcrumbs : nullptr);
+  REXGPU_INFO("GPU breadcrumbs for a device loss: {}{}", name,
+              REXCVAR_GET(gpu_device_lost_breadcrumbs) ? "" : " (gpu_device_lost_breadcrumbs off)");
+  if (!fh1_breadcrumbs_on) return;
+  fh1_device_lost_report::Set([this, name] { Fh1ReportDeviceLost(name); });
+}
+
+void VulkanCommandProcessor::Fh1ReportDeviceLost(const char* source) {
+  uint32_t issued = 0, finished = 0;
+  if (fh1_breadcrumb_values) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+    if (!(vulkan_device->memory_types().host_coherent & (uint32_t(1) << fh1_breadcrumb_memory_type))) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = fh1_breadcrumb_memory;
+      range.size = VK_WHOLE_SIZE;
+      vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &range);
+    }
+    finished = fh1_breadcrumb_values[1];  // when issued is not written (its GPU cost)
+  } else if (fh1_get_queue_checkpoint_data) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+    auto queue = vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+    uint32_t count = 0;
+    fh1_get_queue_checkpoint_data(queue.queue(), &count, nullptr);
+    std::vector<VkCheckpointDataNV> data(std::min<uint32_t>(count, 64),
+                                         VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+    count = uint32_t(data.size());
+    if (count) fh1_get_queue_checkpoint_data(queue.queue(), &count, data.data());
+    std::string stages;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t seq = uint32_t(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+      stages += fmt::format("{}stage 0x{:X}: #{}", stages.empty() ? "" : ", ", uint32_t(data[i].stage),
+                            seq);
+      if (data[i].stage & VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT) issued = std::max(issued, seq);
+      if (data[i].stage & VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT) finished = std::max(finished, seq);
+    }
+    REXGPU_ERROR("GPU breadcrumbs ({}): {} checkpoint(s): {}", source, count,
+                 stages.empty() ? std::string("none") : stages);
+    if (!finished && issued) {
+      // Only the top of the pipe reported: the checkpoint before the one it reached finished
+      // there at the latest.
+      finished = issued - 1;
+    }
+  }
+  REXGPU_ERROR("{}", fh1_device_lost_trail::Describe(fh1_trail, source, issued, finished));
 }
 
 VkResult VulkanCommandProcessor::ReplayAndSubmit(
@@ -2910,6 +3039,7 @@ void VulkanCommandProcessor::ShutdownSubmissionThread() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  fh1_device_lost_report::Set({});
   fh1_pending_readbacks_.clear();
   Fh1WorldAoShutdown();
   ShutdownSubmissionThread();
@@ -2926,6 +3056,23 @@ void VulkanCommandProcessor::ShutdownContext() {
   const VkDevice device = vulkan_device->device();
 
   DestroyScratchBuffer();
+
+  deferred_command_buffer_.SetFh1Breadcrumbs(nullptr);
+  if (fh1_breadcrumb_values) {
+    dfn.vkUnmapMemory(device, fh1_breadcrumb_memory);
+    fh1_breadcrumb_values = nullptr;
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, fh1_breadcrumbs.buffer);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, fh1_breadcrumb_memory);
+  if (fh1_breadcrumbs.hang_event) {
+    const auto* vulkan_instance = vulkan_device->vulkan_instance();
+    if (const auto destroy_event = reinterpret_cast<PFN_vkDestroyEvent>(
+            vulkan_instance->functions().vkGetDeviceProcAddr(device, "vkDestroyEvent"))) {
+      destroy_event(device, fh1_breadcrumbs.hang_event, nullptr);
+    }
+  }
+  fh1_breadcrumbs = {};
+  fh1_breadcrumbs_on = false;
 
   Fh1DestroySpareReadbacks(UINT64_MAX);
   for (auto& readback_pair : readback_buffers_) {
@@ -6788,7 +6935,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    const bool copied = IssueCopy();
+    if (fh1_breadcrumbs_on && copied && submission_open_) {
+      deferred_command_buffer_.CmdFh1Breadcrumb(
+          fh1_trail.Record(fh1_device_lost_trail::Kind::kResolve, GetCurrentSubmission(),
+                           frame_current_, 0, 0, 0));
+    }
+    return copied;
+  }
+
+  // Test hook (FORZA_TEST_GPU_HANG_AT_FRAME): from the 50th draw of a submission of that frame
+  // on, the GPU waits for an event never set (outside a render pass, as Vulkan wants).
+  if (fh1_breadcrumbs.hang_event && !fh1_test_hang_done && TestGpuHangFrame() &&
+      frame_current_ >= TestGpuHangFrame() && fh1_draws_in_submission >= 50 && submission_open_) {
+    fh1_test_hang_done = true;
+    EndRenderPass();
+    deferred_command_buffer_.CmdFh1TestHang();
+    REXGPU_WARN("Test hook: the GPU waits forever after draw #{} (submission {}, frame {})",
+                fh1_trail.last_recorded(), GetCurrentSubmission(), frame_current_);
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -7549,6 +7713,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             : VK_INDEX_TYPE_UINT32);
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+  }
+  // FH1 (#551): the draw's number, written by the GPU once issued and once finished.
+  if (fh1_breadcrumbs_on) {
+    deferred_command_buffer_.CmdFh1Breadcrumb(fh1_trail.Record(
+        fh1_device_lost_trail::Kind::kDraw, GetCurrentSubmission(), frame_current_,
+        primitive_processing_result.host_draw_vertex_count,
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0));
   }
 
   // FH1 (#380): after the shadow mask's blur, multiplies the world AO into it.

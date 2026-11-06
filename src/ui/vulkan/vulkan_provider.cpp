@@ -35,6 +35,15 @@ REXCVAR_DEFINE_STRING(
     "d3d12_adapter name an index and win over this.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// FH1 (#551): Vulkan breadcrumbs (VK_AMD_buffer_marker or VK_NV_device_diagnostic_checkpoints)
+// and Direct3D 12's DRED (auto-breadcrumbs, page faults) without the debug layer.
+REXCVAR_DEFINE_BOOL(
+    gpu_device_lost_breadcrumbs, true, "GPU",
+    "When the graphics driver resets the GPU (device lost), log the draw the GPU was on: Vulkan "
+    "marks every draw (VK_AMD_buffer_marker, VK_NV_device_diagnostic_checkpoints), Direct3D 12 "
+    "turns on DRED")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(vulkan_prefer_geometry_shader, true, "UI/Vulkan",
                     "Prefer physical devices supporting geometryShader when auto-selecting")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
