@@ -31,6 +31,7 @@ REXCVAR_DEFINE_BOOL(d3d12_break_on_warning, false, "UI/D3D12",
                     "Break on Direct3D 12 validation warnings");
 
 REXCVAR_DECLARE(std::string, gpu_vendor);
+REXCVAR_DECLARE(bool, gpu_device_lost_breadcrumbs);
 
 REXCVAR_DEFINE_INT32(d3d12_adapter, -1, "UI/D3D12",
                      "Index of the DXGI adapter to use (-1 for the gpu_vendor one, else the one with "
@@ -231,19 +232,21 @@ bool D3D12Provider::Initialize() {
       REXLOG_WARN("Failed to enable the Direct3D 12 debug layer");
       debug = false;
     }
-
-    // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes.
-    {
-      Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
-      if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
-        dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-        REXLOG_INFO("DRED (Device Removed Extended Data) enabled");
-      } else {
-        REXLOG_WARN(
-            "Failed to enable DRED - device removal diagnostics will be "
-            "limited");
-      }
+  }
+  // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes. FH1 (#551): without
+  // the debug layer too (gpu_device_lost_breadcrumbs, default on), so that a player's log says
+  // which operation the GPU was on when the driver reset it (DEVICE_HUNG) and the address of a
+  // page fault. It needs no SDK layers, only Windows 10 1903 or later.
+  if (debug || REXCVAR_GET(gpu_device_lost_breadcrumbs)) {
+    Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
+    if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
+      dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      REXLOG_INFO("DRED (Device Removed Extended Data) enabled: auto-breadcrumbs, page faults");
+    } else {
+      REXLOG_WARN(
+          "Failed to enable DRED - device removal diagnostics will be "
+          "limited");
     }
   }
   // Create the DXGI factory.

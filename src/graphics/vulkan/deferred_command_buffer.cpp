@@ -18,6 +18,8 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+
+#include <cstdlib>
 #include <rex/graphics/vulkan/fh1_dlss.h>
 #include <rex/math.h>
 
@@ -372,6 +374,27 @@ VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buf
           command_buffer = ExecuteStream(command_buffer, hoisted_stream + args.begin, args.end - args.begin,
                         hoisted_stream, split);
           if (!command_buffer) return VK_NULL_HANDLE;
+        }
+      } break;
+
+      case Command::kFh1Breadcrumb: {
+        const auto& args = *reinterpret_cast<const ArgsFh1Breadcrumb*>(stream);
+        const Fh1Breadcrumbs* b = fh1_breadcrumbs_;
+        if (b && b->write_buffer_marker) {
+          // Only when finished: a top-of-pipe marker too (when issued) doubled the GPU time
+          // the markers cost (#551: +5% instead of +2% of the GPU's busy time in a race).
+          b->write_buffer_marker(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b->buffer,
+                                 4, args.seq);
+        } else if (b && b->set_checkpoint) {
+          b->set_checkpoint(command_buffer, reinterpret_cast<const void*>(uintptr_t(args.seq)));
+        }
+      } break;
+
+      case Command::kFh1TestHang: {
+        const Fh1Breadcrumbs* b = fh1_breadcrumbs_;
+        if (b && b->hang_event && b->wait_events) {
+          b->wait_events(command_buffer, 1, &b->hang_event, VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 0, nullptr, 0, nullptr);
         }
       } break;
 

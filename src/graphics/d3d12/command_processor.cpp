@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <sstream>
 #include <utility>
 
@@ -3261,29 +3263,89 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
     return;
   }
 
+  // FH1 (#551): DRED is on without the debug layer too (gpu_device_lost_breadcrumbs): the
+  // command lists the GPU had not finished, the operation it was on, and a page fault's address.
+  static const char* const kOpNames[] = {
+      "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced",
+      "ExecuteIndirect", "Dispatch", "CopyBufferRegion", "CopyTextureRegion", "CopyResource",
+      "CopyTiles", "ResolveSubresource", "ClearRenderTargetView", "ClearUnorderedAccessView",
+      "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+      "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames", "AtomicCopyBufferUint",
+      "AtomicCopyBufferUint64", "ResolveSubresourceRegion", "WriteBufferImmediate"};
+  auto op_name = [](D3D12_AUTO_BREADCRUMB_OP op) {
+    const uint32_t i = uint32_t(op);
+    return i < uint32_t(std::size(kOpNames)) ? std::string(kOpNames[i])
+                                             : fmt::format("op {}", i);
+  };
+  auto is_draw = [](D3D12_AUTO_BREADCRUMB_OP op) {
+    return op == D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED ||
+           op == D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED;
+  };
   D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
   if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+    uint32_t lists = 0, finished = 0, not_started = 0;
     for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node;
          node = node->pNext) {
-      if (!node->pLastBreadcrumbValue || !node->pCommandHistory ||
-          *node->pLastBreadcrumbValue == 0) {
+      ++lists;
+      if (!node->pLastBreadcrumbValue || !node->pCommandHistory) {
         continue;
       }
-      REXGPU_ERROR("DRED breadcrumb: completed {} of {} ops", *node->pLastBreadcrumbValue,
-                   node->BreadcrumbCount);
-      uint32_t last = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
-      uint32_t start = last > 3 ? last - 3 : 0;
-      uint32_t end = std::min(last + 1, node->BreadcrumbCount);
-      for (uint32_t i = start; i < end; i++) {
-        REXGPU_ERROR("  [{}] op type {}{}", i, static_cast<int>(node->pCommandHistory[i]),
-                     i == last ? " <-- FAULT" : "");
+      const uint32_t done = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
+      if (done >= node->BreadcrumbCount) {
+        ++finished;
+        continue;
       }
+      if (done == 0) {
+        ++not_started;
+        continue;
+      }
+      uint32_t draws_before = 0, draws_total = 0;
+      for (uint32_t i = 0; i < node->BreadcrumbCount; ++i) {
+        if (is_draw(node->pCommandHistory[i])) {
+          ++draws_total;
+          if (i < done) ++draws_before;
+        }
+      }
+      const D3D12_AUTO_BREADCRUMB_OP stuck = node->pCommandHistory[done];
+      std::string before;
+      for (uint32_t i = done > 4 ? done - 4 : 0; i < done; ++i) {
+        before += (before.empty() ? "" : ", ") + op_name(node->pCommandHistory[i]);
+      }
+      REXGPU_ERROR(
+          "DRED: command list '{}' on queue '{}': {} of {} operations finished; the GPU was on "
+          "{} [{}]{}; the {} before it: {}",
+          node->pCommandListDebugNameA ? node->pCommandListDebugNameA : "unnamed",
+          node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA : "unnamed", done,
+          node->BreadcrumbCount, op_name(stuck), done,
+          is_draw(stuck) ? fmt::format(" (draw {} of the list's {})", draws_before + 1, draws_total)
+                         : fmt::format(" (after {} of the list's {} draws)", draws_before,
+                                       draws_total),
+          done - (done > 4 ? done - 4 : 0), before.empty() ? std::string("none") : before);
     }
+    REXGPU_ERROR("DRED: {} command list(s) tracked: {} finished, {} not started", lists, finished,
+                 not_started);
+  } else {
+    REXGPU_ERROR("DRED: no breadcrumbs (DRED off: gpu_device_lost_breadcrumbs, or Windows before 1903)");
   }
 
   D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
-  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) && page_fault.PageFaultVA != 0) {
-    REXGPU_ERROR("DRED page fault at VA 0x{:016X}", page_fault.PageFaultVA);
+  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault))) {
+    if (page_fault.PageFaultVA != 0) {
+      auto names = [](const D3D12_DRED_ALLOCATION_NODE* node) {
+        std::string out;
+        for (int i = 0; node && i < 6; node = node->pNext, ++i) {
+          out += fmt::format("{}{} (type {})", out.empty() ? "" : ", ",
+                             node->ObjectNameA ? node->ObjectNameA : "unnamed",
+                             int(node->AllocationType));
+        }
+        return out.empty() ? std::string("none") : out;
+      };
+      REXGPU_ERROR("DRED page fault at VA 0x{:016X}; allocations there: {}; freed there lately: {}",
+                   page_fault.PageFaultVA, names(page_fault.pHeadExistingAllocationNode),
+                   names(page_fault.pHeadRecentFreedAllocationNode));
+    } else {
+      REXGPU_ERROR("DRED: no page fault");
+    }
   }
 }
 
@@ -3303,6 +3365,20 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   // Check if the device is still available.
   ID3D12Device* device = GetD3D12Provider().GetDevice();
+  // Test hook: FORZA_TEST_GPU_LOSS_AT_FRAME=<n> removes the device at frame n
+  // (ID3D12Device5::RemoveDevice), to see what the device-removal report says.
+  static const uint64_t test_loss_frame = [] {
+    const char* value = std::getenv("FORZA_TEST_GPU_LOSS_AT_FRAME");
+    return value && *value ? uint64_t(std::strtoull(value, nullptr, 10)) : uint64_t(0);
+  }();
+  if (test_loss_frame && frame_current_ >= test_loss_frame) {
+    Microsoft::WRL::ComPtr<ID3D12Device5> device5;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5)))) {
+      REXGPU_WARN("Test hook: removing the D3D12 device at frame {} (FORZA_TEST_GPU_LOSS_AT_FRAME)",
+                  frame_current_);
+      device5->RemoveDevice();
+    }
+  }
   HRESULT device_removed_reason = device->GetDeviceRemovedReason();
   if (FAILED(device_removed_reason)) {
     device_removed_ = true;

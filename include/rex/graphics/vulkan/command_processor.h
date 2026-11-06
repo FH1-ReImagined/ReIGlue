@@ -803,6 +803,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // FH1 (#380): ambient occlusion in the world's sun shadow mask (fh1_world_ao.cpp).
   struct Fh1WorldAo;
   Fh1WorldAo* fh1_world_ao_ = nullptr;
+  // FH1 (#551): breadcrumbs per draw, and the report of the draw the GPU was on when the device
+  // was lost (fh1_device_lost_trail.h).
+  void Fh1BreadcrumbsInitialize();
+  void Fh1ReportDeviceLost(const char* source);
   void Fh1WorldAoInitialize();
   void Fh1WorldAoShutdown();
   bool Fh1WorldAoBeforeDraw(const Shader* pixel_shader, uint32_t used_texture_mask);

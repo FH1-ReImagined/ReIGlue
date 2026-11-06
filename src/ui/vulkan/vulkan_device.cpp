@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -21,8 +23,20 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/fh1_breadcrumbs.h>
 
 #include "vulkan_creation_hooks.h"
+
+REXCVAR_DECLARE(bool, gpu_device_lost_breadcrumbs);
+
+namespace rex::ui::vulkan {
+namespace {
+std::atomic<int> fh1_breadcrumb_extension{0};
+}  // namespace
+Fh1BreadcrumbExtension Fh1GetBreadcrumbExtension() {
+  return Fh1BreadcrumbExtension(fh1_breadcrumb_extension.load(std::memory_order_acquire));
+}
+}  // namespace rex::ui::vulkan
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -268,6 +282,20 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  // FH1 (#551): breadcrumbs after every guest draw, so that a lost device names the draw the GPU
+  // was on (graphics/vulkan/fh1_device_lost_trail.h). The NVIDIA one only without AMD's.
+  bool ext_AMD_buffer_marker = false;
+  bool ext_NV_device_diagnostic_checkpoints = false;
+  if (with_gpu_emulation && REXCVAR_GET(gpu_device_lost_breadcrumbs)) {
+    // Test hook: FORZA_TEST_GPU_BREADCRUMBS=nv takes NVIDIA's checkpoints where AMD's markers
+    // exist too (NVIDIA's driver has both).
+    const char* test = std::getenv("FORZA_TEST_GPU_BREADCRUMBS");
+    if (!test || std::strcmp(test, "nv") != 0) {
+      XE_UI_VULKAN_LOCAL_EXTENSION(AMD_buffer_marker)
+    }
+    XE_UI_VULKAN_LOCAL_EXTENSION(NV_device_diagnostic_checkpoints)
+  }
+
 #undef XE_UI_VULKAN_STRUCT_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_EXTENSION
 #undef XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION
@@ -305,6 +333,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         }
       }
     }
+  }
+
+  if (ext_AMD_buffer_marker && ext_NV_device_diagnostic_checkpoints) {
+    ext_NV_device_diagnostic_checkpoints = false;
+    enabled_extensions.erase(
+        std::remove_if(enabled_extensions.begin(), enabled_extensions.end(),
+                       [](const char* name) {
+                         return std::strcmp(name, "VK_NV_device_diagnostic_checkpoints") == 0;
+                       }),
+        enabled_extensions.end());
   }
 
   if (with_swapchain && !device->extensions_.ext_KHR_swapchain) {
@@ -793,6 +831,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         "'{}': {}",
         properties.deviceName, vk::to_string(vk::Result(device_create_result)));
     return nullptr;
+  }
+  if (with_gpu_emulation) {
+    fh1_breadcrumb_extension.store(
+        int(ext_AMD_buffer_marker                  ? Fh1BreadcrumbExtension::kAmdBufferMarker
+            : ext_NV_device_diagnostic_checkpoints ? Fh1BreadcrumbExtension::kNvCheckpoints
+                                                   : Fh1BreadcrumbExtension::kNone),
+        std::memory_order_release);
   }
 
   // Load device functions.

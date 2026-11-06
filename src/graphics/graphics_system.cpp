@@ -28,6 +28,8 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
+
+#include "fh1_device_lost_report.h"
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
@@ -225,6 +227,8 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
   }
+  // FH1 (#551): the draw the GPU was on (the Vulkan breadcrumbs), before the game stops.
+  fh1_device_lost_report::Run();
   // FatalError writes only to stderr, which a windowed game has nowhere to show.
   REXGPU_CRITICAL(
       "Graphics device lost: the GPU driver reset or removed the device, which can't be "
