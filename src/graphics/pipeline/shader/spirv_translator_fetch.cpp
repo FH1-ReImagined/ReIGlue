@@ -537,6 +537,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // function so it doesn't have to handle this case.
     if (used_result_components) {
       StoreResult(instr.result, const_float_vectors_0_[used_result_component_count - 1]);
+    } else if (instr.result.GetUsedWriteMask()) {
+      // Only constant 0/1 components (as the D3D12 translator stores them): without this the
+      // register kept whatever it held (FH1 #648: FM4 track shaders' shadow fetches made 1).
+      StoreResult(instr.result, spv::NoResult);
     }
     return;
   }
