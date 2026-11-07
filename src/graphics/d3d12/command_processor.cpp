@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "../vulkan/fh1_submission_watch.h"
 #include <algorithm>
 #include <cstdarg>
 #include <cstdlib>
@@ -51,6 +52,13 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(d3d12_submission_draw_limit, -1, "GPU/D3D12",
+                     "End a GPU submission after this many draws (a frame then reaches the GPU in "
+                     "several parts, so no single part can run into Windows' 2 s GPU timeout): "
+                     "-1 = 1000 on integrated (UMA) GPUs, else none; 0 = none")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
@@ -2281,6 +2289,22 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+namespace {
+// FH1 (#725): the draws of the open submission, and how many submissions were ended early.
+uint32_t fh1_draws_in_submission = 0;
+uint64_t fh1_submission_splits = 0;
+// Whether the device shares system memory (an integrated GPU): D3D12_FEATURE_ARCHITECTURE.UMA.
+bool Fh1Uma(ID3D12Device* device) {
+  static const bool uma = [device] {
+    D3D12_FEATURE_DATA_ARCHITECTURE architecture = {};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture,
+                                                 sizeof(architecture))) &&
+           architecture.UMA;
+  }();
+  return uma;
+}
+}  // namespace
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
@@ -2290,6 +2314,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
+
+  // FH1 (#725): as Vulkan's vulkan_submission_draw_limit (#268), on integrated GPUs at most so many
+  // draws in one submission, so that no single ExecuteCommandLists runs past Windows' 2 s GPU
+  // timeout (an Intel UHD drew frames of up to 1.2 s and lost the device as a race started). Not
+  // inside an occlusion query, which the submission's end would cut short, nor while pipelines
+  // are still being created for it (they have to be ready when it is submitted).
+  if (submission_open_ && frame_open_ && !active_occlusion_query_.valid &&
+      CanEndSubmissionImmediately() &&
+      vulkan::fh1_submission_watch::ShouldSplit(
+          fh1_draws_in_submission,
+          vulkan::fh1_submission_watch::DrawLimit(REXCVAR_GET(d3d12_submission_draw_limit),
+                                                  Fh1Uma(device)))) {
+    if (EndSubmission(false) && (++fh1_submission_splits == 1 ||
+                                 fh1_submission_splits % 10000 == 0)) {
+      REXGPU_INFO("D3D12: ended a submission after {} draws on an integrated GPU ({} so far, "
+                  "d3d12_submission_draw_limit)",
+                  fh1_draws_in_submission, fh1_submission_splits);
+    }
+  }
+  ++fh1_draws_in_submission;
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -3413,6 +3457,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    fh1_draws_in_submission = 0;
 
     // Start a new deferred command list - will submit it to the real one in the
     // end of the submission (when async pipeline creation requests are
