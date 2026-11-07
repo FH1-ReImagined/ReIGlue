@@ -524,6 +524,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   void ProcessVertexFetchInstruction(const ParsedVertexFetchInstruction& instr) override;
   void ProcessTextureFetchInstruction(const ParsedTextureFetchInstruction& instr) override;
+  // FH1 (#648): FM4's shadow fetches, marked by the track converter (fm4_shaders.py), sample
+  // FH1's screen-space shadow mask at the pixel instead; false if this cannot be done.
+  bool Fh1Fm4ShadowFetch(const ParsedTextureFetchInstruction& instr);
+  static bool Fh1HasFm4ShadowFetch(const std::vector<uint32_t>& ucode);
   void ProcessAluInstruction(const ParsedAluInstruction& instr,
                              uint8_t memexport_eM_potentially_written_before) override;
 
@@ -950,6 +954,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id input_point_coordinates_;
   // PS, only when needed - float4.
   spv::Id input_fragment_coordinates_;
+  // FH1 (#648): the pixel shader has marked FM4 shadow fetches (Fh1Fm4ShadowFetch).
+  bool fh1_fm4_shadow_ = false;
   // PS, only when needed - bool.
   spv::Id input_front_facing_;
   // PS, only when needed - int.

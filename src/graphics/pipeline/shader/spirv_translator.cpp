@@ -3099,8 +3099,10 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // (per-sample if supported).
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  // FH1 (#648): FM4 shadow fetches sample at the pixel's position.
+  fh1_fm4_shadow_ = is_pixel_shader() && Fh1HasFm4ShadowFetch(current_shader().ucode_data());
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
-      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
+      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible || fh1_fm4_shadow_) {
     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                            type_float4_, "gl_FragCoord");
     builder_->addDecoration(input_fragment_coordinates_, spv::DecorationBuiltIn,

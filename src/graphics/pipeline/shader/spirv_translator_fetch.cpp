@@ -10,6 +10,7 @@
  */
 
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <memory>
 #include <sstream>
@@ -495,6 +496,13 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       break;
   }
 
+  // FH1 (#648): a marked FM4 shadow fetch.
+  if (fh1_fm4_shadow_ && instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+      instr.attributes.offset_x == -8.0f && instr.attributes.offset_y == 7.5f &&
+      Fh1Fm4ShadowFetch(instr)) {
+    return;
+  }
+
   // Handle instructions that store something.
   uint32_t used_result_components = instr.result.GetUsedResultComponents();
   uint32_t used_result_nonzero_components = instr.GetNonZeroResultComponents();
@@ -537,6 +545,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // function so it doesn't have to handle this case.
     if (used_result_components) {
       StoreResult(instr.result, const_float_vectors_0_[used_result_component_count - 1]);
+    } else if (instr.result.GetUsedWriteMask()) {
+      // Only constant 0/1 components (as the D3D12 translator stores them): without this the
+      // register kept whatever it held (FH1 #648: FM4 track shaders' shadow fetches made 1).
+      StoreResult(instr.result, spv::NoResult);
     }
     return;
   }
@@ -2300,6 +2312,101 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(uint32_t fetch_constant,
     main_interface_.push_back(new_sampler_binding.variable);
   }
   return new_sampler_binding_index;
+}
+
+// FH1 (#648, The Festival): FM4's track shaders read their shadows from FM4's own shadow map
+// at coordinates their vertex shader computes; FH1 draws none, and keeps its shadows as a
+// screen-space mask (the 1280x720-at-720p texture its own track shaders fetch on sampler 13 at
+// the clip position). The track converter (tools/fm4_shaders.py) points each such FM4 fetch at
+// fetch constant 13, makes its result the constant 1 (no shadows anywhere this is not done)
+// and marks it: texel offsets x -16 and y 15 in the instruction (-8 and 7.5 texels), which no
+// real shader uses. A marked fetch samples the mask at the pixel's position instead, and the
+// result components the converter made 1 get the mask's shadow (component 0: 1 lit, 0 in
+// shadow; components 2 and 3 read 0 everywhere, 1 shows none, checked at Suzuka's grid).
+// A translator without this branch (D3D12, ReGPU, a Vulkan one with 0439 but not this) stores
+// the converter's constant 1: no shadow, the surface as without the marks. A Vulkan translator
+// without 0439 stores nothing for it, and the converter's shad_color 0 then draws black, so the
+// converter must only mark fetches for builds with 0439.
+bool SpirvShaderTranslator::Fh1HasFm4ShadowFetch(const std::vector<uint32_t>& ucode) {
+  for (size_t i = 0; i + 2 < ucode.size(); i += 3) {
+    const uint32_t w0 = ucode[i], w2 = ucode[i + 2];
+    if ((w0 & 0x1F) == uint32_t(ucode::FetchOpcode::kTextureFetch) && ((w2 >> 16) & 0x1F) == 0x10 &&
+        ((w2 >> 21) & 0x1F) == 0x0F) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SpirvShaderTranslator::Fh1Fm4ShadowFetch(const ParsedTextureFetchInstruction& instr) {
+  if (input_fragment_coordinates_ == spv::NoResult) {
+    return false;
+  }
+  const uint32_t fetch_constant_index = instr.operands[1].storage_index;
+  const size_t sampler_index =
+      FindOrAddSamplerBinding(fetch_constant_index, xenos::TextureFilter::kLinear,
+                              xenos::TextureFilter::kLinear, xenos::TextureFilter::kPoint,
+                              xenos::AnisoFilter::kDisabled);
+  const size_t image_index =
+      FindOrAddTextureBinding(fetch_constant_index, xenos::FetchOpDimension::k2D, false);
+  if (sampler_index == SIZE_MAX || image_index == SIZE_MAX) {
+    return false;
+  }
+  spv::Id sampler = builder_->createLoad(sampler_bindings_[sampler_index].variable, spv::NoPrecision);
+  spv::Id image = builder_->createLoad(texture_bindings_[image_index].variable, spv::NoPrecision);
+  // The pixel's position over the mask's size.
+  builder_->addCapability(spv::CapabilityImageQuery);
+  spv::Id size_int = builder_->createBinOp(spv::OpImageQuerySizeLod, type_int3_, image,
+                                           builder_->makeIntConstant(0));
+  spv::Id size = builder_->createUnaryOp(spv::OpConvertSToF, type_float3_, size_int);
+  spv::Id frag = builder_->createLoad(input_fragment_coordinates_, spv::NoPrecision);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->createCompositeExtract(frag, type_float_, 0));
+  id_vector_temp_.push_back(builder_->createCompositeExtract(frag, type_float_, 1));
+  id_vector_temp_.push_back(const_float_1_);
+  spv::Id position = builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
+  spv::Id coords = builder_->createNoContractionBinOp(spv::OpFDiv, type_float3_, position, size);
+  // Layer 0 of the 2D array.
+  coords = builder_->createCompositeInsert(const_float_0_, coords, type_float3_, 2);
+  spv::Builder::TextureParameters texture_parameters = {};
+  texture_parameters.coords = coords;
+  texture_parameters.lod = const_float_0_;
+  texture_parameters.sampler = builder_->createBinOp(
+      spv::OpSampledImage, builder_->makeSampledImageType(builder_->getTypeId(image)), image,
+      sampler);
+  spv::Id texel = builder_->createTextureCall(spv::NoPrecision, type_float4_, false, false, false,
+                                              false, false, texture_parameters,
+                                              spv::ImageOperandsLodMask);
+  // FH1_FM4_SHADOW_COMPONENT=0-3 (a dev test) picks another component of the mask.
+  static const unsigned component = [] {
+    const char* v = std::getenv("FH1_FM4_SHADOW_COMPONENT");
+    return v && *v >= '0' && *v <= '3' ? unsigned(*v - '0') : 0u;
+  }();
+  spv::Id shadow = builder_->createCompositeExtract(texel, type_float_, component);
+  // The converter makes FM4's shadow colour (shad_color) 0, which takes the lightmap's light
+  // too: a shadow drew black. The mask's 0 becomes FH1_FM4_SHADOW_FLOOR (default 0.45, about
+  // FM4's own TrackSettings ShadowColor, 0.39 0.46 0.57) instead: floor + (1 - floor) * mask.
+  static const float floor_value = [] {
+    const char* v = std::getenv("FH1_FM4_SHADOW_FLOOR");
+    return v ? float(std::atof(v)) : 0.45f;
+  }();
+  shadow = builder_->createNoContractionBinOp(
+      spv::OpFAdd, type_float_, builder_->makeFloatConstant(floor_value),
+      builder_->createNoContractionBinOp(spv::OpFMul, type_float_,
+                                         builder_->makeFloatConstant(1.0f - floor_value), shadow));
+  InstructionResult result = instr.result;
+  bool any = false;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (result.components[i] == SwizzleSource::k1) {
+      result.components[i] = SwizzleSource::kX;
+      any = true;
+    }
+  }
+  if (!any) {
+    return false;
+  }
+  StoreResult(result, shadow);
+  return true;
 }
 
 void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& texture_parameters,
