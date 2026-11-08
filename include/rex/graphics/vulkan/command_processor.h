@@ -1109,6 +1109,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool dynamic_stencil_reference_front_update_needed_;
   bool dynamic_stencil_reference_back_update_needed_;
 
+  SamplerBindingReuse sampler_reuse_[2];
+  uint64_t binding_sampler_calls_ = 0, binding_sampler_hits_ = 0;
+  uint64_t binding_sampler_verified_ = 0, binding_mismatches_ = 0;
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;

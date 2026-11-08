@@ -586,6 +586,11 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
 
 void VulkanTextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+  if (BindingReuseStats() && ++binding_stats_frames_ % 300 == 0) {
+    REXLOG_INFO("VKBINDING_TEXTURE: calls={} hits={} verified={} mismatches={}",
+        binding_request_calls_, binding_request_hits_, binding_request_verified_, binding_request_mismatches_);
+    binding_request_calls_ = binding_request_hits_ = binding_request_verified_ = binding_request_mismatches_ = 0;
+  }
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
 }
@@ -614,6 +619,16 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  bool reuse = BindingReuseEnabled() &&
+      binding_request_reuse_.Matches(command_processor_.GetCurrentSubmission(),
+          binding_usage_epoch_, used_texture_mask, UINT32_MAX,
+          !TextureRequestBindingsReady(used_texture_mask));
+  if (BindingReuseStats()) { ++binding_request_calls_; binding_request_hits_ += reuse; }
+  if (reuse && !BindingReuseVerify()) return;
+  // Verification runs the complete request, including ownership selection,
+  // uploads, usage transitions and lifetime marking.
+  const auto previous_bindings = reuse ? vulkan_texture_bindings_ : decltype(vulkan_texture_bindings_){};
+  const uint64_t previous_usage = binding_usage_epoch_;
   TextureCache::RequestTextures(used_texture_mask);
 
   // Pre-create 3D-as-2D wrappers while still in texture request phase.
@@ -685,6 +700,17 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
     }
   }
+  if (reuse) {
+    ++binding_request_verified_;
+    bool same = previous_usage == binding_usage_epoch_;
+    for (uint32_t i = 0; i < xenos::kTextureFetchConstantCount; ++i) {
+      if (!(used_texture_mask & (UINT32_C(1) << i))) continue;
+      same &= previous_bindings[i].image_view_unsigned == vulkan_texture_bindings_[i].image_view_unsigned &&
+              previous_bindings[i].image_view_signed == vulkan_texture_bindings_[i].image_view_signed;
+    }
+    if (!same) { ++binding_request_mismatches_; REXGPU_ERROR("VKBINDING: texture request mismatch"); }
+  }
+  binding_request_reuse_.Remember(command_processor_.GetCurrentSubmission(), binding_usage_epoch_, used_texture_mask);
 }
 
 VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,

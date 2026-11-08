@@ -115,8 +115,17 @@ class TextureCache {
     uint32_t bit_count = last_index - first_index + 1;
     uint32_t mask = bit_count == 32 ? UINT32_MAX : ((UINT32_C(1) << bit_count) - 1) << first_index;
     texture_bindings_in_sync_ &= ~mask;
+    sampler_fetch_writes_ |= mask;
   }
 
+  // Consumed only by the Vulkan sampler acquisition path, on the GPU thread.
+  uint32_t ConsumeSamplerFetchWrites() {
+    uint32_t written = sampler_fetch_writes_; sampler_fetch_writes_ = 0; return written;
+  }
+  bool TextureRequestBindingsReady(uint32_t mask) const {
+    return !(mask & ~texture_bindings_in_sync_) &&
+           !texture_became_outdated_.load(std::memory_order_acquire);
+  }
   virtual void RequestTextures(uint32_t used_texture_mask);
 
   // "ActiveTexture" means as of the latest RequestTextures call.
@@ -693,6 +702,7 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+  uint32_t sampler_fetch_writes_ = UINT32_MAX;
 };
 
 }  // namespace rex::graphics

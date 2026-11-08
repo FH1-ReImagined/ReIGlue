@@ -81,6 +81,7 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/graphics/vulkan/binding_reuse.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/types.h>
@@ -7165,19 +7166,25 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // different for some reason (like a race condition with the guest in index
     // buffer processing in the primitive processor resulting in different host
     // vertex shader types), the bindings will stay the same.
-    // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
-    // submission.
+    const uint32_t sampler_fetch_writes = texture_cache_->ConsumeSamplerFetchWrites();
+    for (auto& state : sampler_reuse_) state.dirty |= sampler_fetch_writes;
     uint32_t samplers_overflowed_count = 0;
     for (uint32_t j = 0; j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
           j ? current_samplers_pixel_ : current_samplers_vertex_;
-      if (!i) {
-        shader_samplers.clear();
-      }
       const VulkanShader* shader = j ? pixel_shader : vertex_shader;
-      if (!shader) {
-        continue;
-      }
+      auto& reuse_state = sampler_reuse_[j];
+      const uint32_t sampled_mask = shader ? shader->GetUsedTextureMaskAfterTranslation() : 0;
+      const int32_t anisotropy = REXCVAR_GET(anisotropic_override);
+      const bool reuse_samplers = BindingReuseEnabled() && !i &&
+          reuse_state.Matches(shader, texture_cache_.get(), GetCurrentSubmission(),
+                              anisotropy, sampled_mask);
+      if (BindingReuseStats()) { ++binding_sampler_calls_; binding_sampler_hits_ += reuse_samplers; }
+      if (reuse_samplers && !BindingReuseVerify()) continue;
+      const auto previous_samplers = reuse_samplers ? shader_samplers :
+          std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>{};
+      if (!i) shader_samplers.clear();
+      if (!shader) { reuse_state = {}; continue; }
       const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
           shader->GetSamplerBindingsAfterTranslation();
       if (!i) {
@@ -7210,6 +7217,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           ++samplers_overflowed_count;
         }
       }
+      if (reuse_samplers) {
+        ++binding_sampler_verified_;
+        bool same = previous_samplers.size() == shader_samplers.size();
+        for (size_t k = 0; same && k < shader_samplers.size(); ++k) {
+          same = previous_samplers[k].first.value == shader_samplers[k].first.value &&
+                 previous_samplers[k].second == shader_samplers[k].second;
+        }
+        if (!same) { ++binding_mismatches_; REXGPU_ERROR("VKBINDING: sampler mismatch"); }
+      }
+      reuse_state.shader = shader; reuse_state.cache = texture_cache_.get();
+      reuse_state.submission = samplers_overflowed_count ||
+          anisotropy != REXCVAR_GET(anisotropic_override) ? UINT64_MAX : GetCurrentSubmission();
+      reuse_state.anisotropy = anisotropy; reuse_state.dirty = 0;
     }
     if (!samplers_overflowed_count) {
       break;
@@ -7400,6 +7420,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
       }
+      current_graphics_descriptor_sets_bound_up_to_date_ &=
+          BindingCompatiblePrefixMask(descriptor_sets_kept);
     } else {
       // No or unknown pipeline layout previously bound - all bindings are in an
       // indeterminate state.
@@ -9541,6 +9563,12 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
     primitive_processor_->BeginFrame();
 
+    if (frame_current_ == 1) REXLOG_INFO("VKBINDING: reuse={} verify={}", BindingReuseEnabled(), BindingReuseVerify());
+    if (BindingReuseStats() && frame_current_ % 300 == 0) {
+      REXLOG_INFO("VKBINDING: samplers={} sampler_hits={} verified={} mismatches={}",
+          binding_sampler_calls_, binding_sampler_hits_, binding_sampler_verified_, binding_mismatches_);
+      binding_sampler_calls_ = binding_sampler_hits_ = binding_sampler_verified_ = binding_mismatches_ = 0;
+    }
     texture_cache_->BeginFrame();
     if (fh1_other_textures_) fh1_other_textures_->BeginFrame();
   }
@@ -11062,7 +11090,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
+  // Always allocate/write texture descriptors and bind their fresh sets.
+  // Matching payloads alone did not preserve rendering correctness.
   current_graphics_descriptor_set_values_up_to_date_ &=
       ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
         (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
