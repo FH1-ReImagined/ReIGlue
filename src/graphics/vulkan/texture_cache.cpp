@@ -490,6 +490,7 @@ VulkanTextureCache::~VulkanTextureCache() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  Fh1DescriptorHandlesDestroyed();
   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
   }
@@ -907,6 +908,7 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
       }
     }
     dfn.vkDestroySampler(device, sampler_used_first_->second.sampler, nullptr);
+    Fh1DescriptorHandlesDestroyed();
     if (sampler_used_first_->second.used_next) {
       sampler_used_first_->second.used_next->second.used_previous =
           sampler_used_first_->second.used_previous;
@@ -2169,6 +2171,7 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  Fh1DescriptorHandlesDestroyed();
   if (storage_view_)
     dfn.vkDestroyImageView(device, storage_view_, nullptr);
   for (const auto& view_pair : views_) {
@@ -3746,6 +3749,7 @@ void VulkanTextureCache::DestroyRetiredTexturePackImages(uint64_t completed_subm
   while (!pack_retired_.empty() &&
          (all || pack_retired_.front().submission <= completed_submission_index)) {
     const PackRetired& retired = pack_retired_.front();
+    if (!retired.views.empty()) Fh1DescriptorHandlesDestroyed();
     for (VkImageView view : retired.views) dfn.vkDestroyImageView(device, view, nullptr);
     device_memory::Get().Freed(device_memory::Use::kTexture, retired.memory_type, retired.size);
     vmaDestroyImage(vma_allocator_, retired.image, retired.allocation);
@@ -4079,6 +4083,7 @@ void VulkanTextureCache::DestroyTexturePackReplacements() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   for (auto& [fingerprint, replacement] : pack_replacements_) {
+    if (!replacement.views.empty()) Fh1DescriptorHandlesDestroyed();
     for (const auto& view : replacement.views) dfn.vkDestroyImageView(device, view.second, nullptr);
     if (replacement.image) {
       VmaAllocationInfo info;
