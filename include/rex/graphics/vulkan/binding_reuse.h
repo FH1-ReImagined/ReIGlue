@@ -1,11 +1,34 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 
 namespace rex::graphics::vulkan {
-inline bool BindingReuseEnabled() {
-  static const bool enabled = [] { const char* p = std::getenv("FORZA_VK_BINDING_REUSE"); return p && p[0] == '1'; }();
-  return enabled;
+// Set by the command processor at each frame start from vulkan_binding_request_reuse (or
+// FORZA_VK_BINDING_REUSE=0/1, which overrides it).
+inline bool binding_request_reuse_enabled = false;
+inline bool BindingReuseEnabled() { return binding_request_reuse_enabled; }
+inline bool BindingReuseEnvOverride(bool cvar_value) {
+  static const int env = [] {
+    const char* p = std::getenv("FORZA_VK_BINDING_REUSE");
+    return p && *p ? int(p[0] == '1') : -1;
+  }();
+  return env < 0 ? cvar_value : env != 0;
+}
+// vulkan_texture_descriptor_reuse, or FORZA_VK_TEXTURE_SET_REUSE=0/1, which overrides it.
+inline bool Fh1TextureSetReuseEnvOverride(bool cvar_value) {
+  static const int env = [] {
+    const char* p = std::getenv("FORZA_VK_TEXTURE_SET_REUSE");
+    return p && *p ? int(p[0] == '1') : -1;
+  }();
+  return env < 0 ? cvar_value : env != 0;
+}
+// Bumped whenever an image view or a sampler a guest texture descriptor may hold is destroyed:
+// a handle made later may have the same value, so descriptor sets remembered by their handles
+// are forgotten (patch 0444).
+inline std::atomic<uint64_t> fh1_descriptor_handles_destroyed{0};
+inline void Fh1DescriptorHandlesDestroyed() {
+  fh1_descriptor_handles_destroyed.fetch_add(1, std::memory_order_relaxed);
 }
 inline bool BindingReuseVerify() {
   static const bool enabled = [] { const char* p = std::getenv("FORZA_VK_BINDING_VERIFY"); return p && p[0] == '1'; }();

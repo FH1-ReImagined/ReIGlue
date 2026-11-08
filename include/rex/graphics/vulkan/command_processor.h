@@ -32,6 +32,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/fh1_descriptor_memo.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
@@ -1170,6 +1171,17 @@ class VulkanCommandProcessor : public CommandProcessor {
       dynamic_constants_sets_;
   uint64_t dynamic_constants_frame_ = UINT64_MAX;
   uint64_t binding_draws_ = 0, binding_constant_sets_ = 0, binding_constant_hits_ = 0;
+
+  // FH1 (#192, patch 0444): the texture descriptor sets written in this frame, by their
+  // contents (vulkan_texture_descriptor_reuse, read at each frame start). Cleared at each frame,
+  // with the transient pools and when a view or a sampler is destroyed.
+  bool fh1_texture_set_reuse_ = false;
+  fh1_descriptor_memo::DescriptorMemo<VkDescriptorSet> fh1_texture_set_memo_;
+  uint64_t fh1_texture_set_memo_frame_ = UINT64_MAX;
+  uint64_t fh1_texture_set_memo_handles_ = UINT64_MAX;
+  std::vector<uint64_t> fh1_texture_set_words_;
+  uint64_t binding_texture_sets_ = 0, binding_texture_set_hits_ = 0;
+  uint64_t binding_texture_set_kept_ = 0, binding_texture_set_clears_ = 0;
 
   VkDescriptorSet current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetCount];
   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
