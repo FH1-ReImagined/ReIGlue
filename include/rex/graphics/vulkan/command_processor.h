@@ -758,10 +758,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Direct3D 12 PIX warnings.
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeDynamicUniformBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageImage;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_dynamic_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_image_;
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
@@ -1144,6 +1146,28 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Whether up-to-date data has been written to constant (uniform) buffers, and
   // the buffer infos in current_constant_buffer_infos_ point to them.
   uint32_t current_constant_buffers_up_to_date_;
+  // Experimental, fixed at device setup. Dynamic offsets vary per draw; keys
+  // include every buffer and range, and descriptor ownership remains with the
+  // existing fence-retired transient queues. Never reuse entries across frames.
+  bool dynamic_uniform_constants_ = false;
+  bool binding_stats_ = false;
+  using DynamicConstantsKey = std::array<std::pair<VkBuffer, VkDeviceSize>,
+                                        SpirvShaderTranslator::kConstantBufferCount>;
+  struct DynamicConstantsHasher {
+    size_t operator()(const DynamicConstantsKey& key) const {
+      size_t hash = 0;
+      for (const auto& [buffer, range] : key) {
+        hash ^= std::hash<VkBuffer>{}(buffer) + size_t(0x9e3779b9) + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<VkDeviceSize>{}(range) + size_t(0x9e3779b9) + (hash << 6) + (hash >> 2);
+      }
+      return hash;
+    }
+  };
+  std::unordered_map<DynamicConstantsKey, VkDescriptorSet, DynamicConstantsHasher>
+      dynamic_constants_sets_;
+  uint64_t dynamic_constants_frame_ = UINT64_MAX;
+  uint64_t binding_draws_ = 0, binding_constant_sets_ = 0, binding_constant_hits_ = 0;
+
   VkDescriptorSet current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetCount];
   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
   // up-to-date data.
