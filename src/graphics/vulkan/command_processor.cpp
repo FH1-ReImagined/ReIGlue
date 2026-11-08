@@ -244,18 +244,18 @@ REXCVAR_DEFINE_BOOL(gpu_shader_translation_memo, true, "GPU/Vulkan",
                     "each frame start)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_dynamic_constants, false, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_dynamic_constants, true, "GPU/Vulkan",
                     "Bind the guest draw constants as dynamic uniform buffers: a draw whose "
                     "constants changed selects its slices with offsets at bind time, reusing a "
                     "descriptor set of the frame instead of writing a new one (at startup)");
 
-REXCVAR_DEFINE_BOOL(vulkan_texture_descriptor_reuse, false, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_texture_descriptor_reuse, true, "GPU/Vulkan",
                     "A draw whose texture and sampler descriptors are the same as an earlier "
                     "draw's of the frame uses that draw's descriptor set instead of writing a new "
                     "one (read at each frame start)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_binding_request_reuse, false, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_binding_request_reuse, true, "GPU/Vulkan",
                     "Within a submission, a draw whose sampled fetch constants and textures are "
                     "unchanged keeps the previous draw's samplers and skips its texture request "
                     "(read at each frame start)")
