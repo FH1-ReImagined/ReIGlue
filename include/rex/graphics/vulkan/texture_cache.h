@@ -18,6 +18,7 @@
 
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/vulkan/shader.h>
+#include <rex/graphics/vulkan/binding_reuse.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
@@ -222,6 +223,9 @@ class VulkanTextureCache final : public TextureCache {
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
       Usage old_usage = usage_;
+      if (old_usage != new_usage) {
+        ++static_cast<VulkanTextureCache&>(texture_cache()).binding_usage_epoch_;
+      }
       usage_ = new_usage;
       return old_usage;
     }
@@ -397,6 +401,11 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t sampler_max_count_;
 
   xenos::AnisoFilter max_anisotropy_;
+  uint64_t binding_usage_epoch_ = 0;
+  TextureRequestReuse binding_request_reuse_;
+  uint64_t binding_request_calls_ = 0, binding_request_hits_ = 0;
+  uint64_t binding_request_verified_ = 0, binding_request_mismatches_ = 0;
+  uint32_t binding_stats_frames_ = 0;
 
   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher> samplers_;
   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;
