@@ -907,6 +907,48 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipelineLayout host_depth_store_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k4X) + 1] = {};
 
+  // FH1 (#640): without VK_EXT_shader_stencil_export, a transfer to depth copies the stencil in
+  // one full-size draw per bit. A compute pass first finds which bits are set in each source
+  // (stencil_bit_mask.cs.glsl: 8 words a source, a slot), and each bit's draws are conditional
+  // on its word (VK_EXT_conditional_rendering): a source whose stencil is 0 costs no draws.
+  // Slots: kFh1StencilMaskRegions regions, one for each submission (by its number), reused
+  // once the submission that used it last is complete.
+  static constexpr uint32_t kFh1StencilMaskRegions = 8;
+  static constexpr uint32_t kFh1StencilMaskSlotsPerRegion = 256;
+  bool Fh1StencilMaskInitialize();
+  void Fh1StencilMaskShutdown();
+  // A slot for this submission, or UINT32_MAX.
+  uint32_t Fh1StencilMaskAllocateSlot();
+  VkPipelineLayout fh1_stencil_mask_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline fh1_stencil_mask_pipelines_[2] = {};  // one sample, more
+  VkBuffer fh1_stencil_mask_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory fh1_stencil_mask_memory_ = VK_NULL_HANDLE;
+  VkDescriptorPool fh1_stencil_mask_descriptor_pool_ = VK_NULL_HANDLE;
+  VkDescriptorSet fh1_stencil_mask_descriptor_set_ = VK_NULL_HANDLE;
+  PFN_vkCmdBeginConditionalRenderingEXT fh1_begin_conditional_rendering_ = nullptr;
+  PFN_vkCmdEndConditionalRenderingEXT fh1_end_conditional_rendering_ = nullptr;
+  PFN_vkCmdFillBuffer fh1_fill_buffer_ = nullptr;
+  uint64_t fh1_stencil_mask_region_submission_[kFh1StencilMaskRegions] = {};
+  uint64_t fh1_stencil_mask_submission_ = UINT64_MAX;
+  uint32_t fh1_stencil_mask_next_slot_ = 0;
+  bool fh1_stencil_mask_region_usable_ = false;
+  struct Fh1StencilMaskSource {
+    const RenderTarget* source;
+    uint32_t slot;
+    uint32_t y_begin, y_end;
+  };
+  std::vector<Fh1StencilMaskSource> fh1_stencil_mask_sources_;
+ public:
+  // Depth transfers without stencil export: those whose stencil bit draws were conditional, and
+  // all of them (once a minute in the log).
+  void Fh1TakeStencilMaskStats(uint64_t& masked, uint64_t& total) {
+    masked = fh1_stencil_masked_transfers_;
+    total = fh1_stencil_bit_transfers_;
+    fh1_stencil_masked_transfers_ = fh1_stencil_bit_transfers_ = 0;
+  }
+ private:
+  uint64_t fh1_stencil_masked_transfers_ = 0, fh1_stencil_bit_transfers_ = 0;
+
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> transfer_vertex_buffer_pool_;
   VkShaderModule transfer_passthrough_vertex_shader_ = VK_NULL_HANDLE;
   VkPipelineLayout transfer_pipeline_layouts_[size_t(TransferPipelineLayoutIndex::kCount)] = {};

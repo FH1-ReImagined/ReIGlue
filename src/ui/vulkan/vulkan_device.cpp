@@ -249,6 +249,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_1_3_EXT_shader_demote_to_helper_invocation = false;
   bool ext_1_3_KHR_dynamic_rendering = false;
   bool ext_EXT_non_seamless_cube_map = false;
+  // FH1 (#640): render target transfers skip their per-bit stencil draws on the GPU.
+  bool ext_EXT_conditional_rendering = false;
   if (with_gpu_emulation) {
     // #15.
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1, 2)
@@ -271,6 +273,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(EXT_shader_demote_to_helper_invocation, 1, 3)
       // #423.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_non_seamless_cube_map)
+      // #82.
+      XE_UI_VULKAN_LOCAL_EXTENSION(EXT_conditional_rendering)
       // Required for non-black YCbCr border color parity with D3D12.
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_custom_border_color)
       // Required for true null descriptors in bindless texture bindings.
@@ -390,6 +394,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT>
       features_EXT_non_seamless_cube_map;
+  VulkanFeatures<VkPhysicalDeviceConditionalRenderingFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT>
+      features_EXT_conditional_rendering;
   VulkanFeatures<VkPhysicalDeviceCustomBorderColorFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT>
       features_EXT_custom_border_color;
@@ -433,6 +440,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (ext_EXT_non_seamless_cube_map) {
       features_EXT_non_seamless_cube_map.Link(supported_features_2, device_create_info);
+    }
+    if (ext_EXT_conditional_rendering) {
+      features_EXT_conditional_rendering.Link(supported_features_2, device_create_info);
     }
     if (device->extensions_.ext_EXT_custom_border_color) {
       features_EXT_custom_border_color.Link(supported_features_2, device_create_info);
@@ -788,6 +798,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (ext_EXT_non_seamless_cube_map) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_non_seamless_cube_map, nonSeamlessCubeMap)
+    }
+  }
+
+  if (ext_EXT_conditional_rendering && with_gpu_emulation) {
+    features_EXT_conditional_rendering.enabled.conditionalRendering =
+        features_EXT_conditional_rendering.supported.conditionalRendering;
+    device->fh1_conditional_rendering_ =
+        features_EXT_conditional_rendering.supported.conditionalRendering != VK_FALSE;
+    if (device->fh1_conditional_rendering_) {
+      REXLOG_INFO("* conditionalRendering");
     }
   }
 

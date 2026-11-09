@@ -395,6 +395,25 @@ VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buf
         }
       } break;
 
+      case Command::kFh1FillBuffer: {
+        const auto& args = *reinterpret_cast<const ArgsFh1FillBuffer*>(stream);
+        args.fill(command_buffer, args.buffer, args.offset, args.size, args.data);
+      } break;
+
+      case Command::kFh1BeginConditionalRendering: {
+        const auto& args = *reinterpret_cast<const ArgsFh1BeginConditionalRendering*>(stream);
+        VkConditionalRenderingBeginInfoEXT info{
+            VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+        info.buffer = args.buffer;
+        info.offset = args.offset;
+        args.begin(command_buffer, &info);
+      } break;
+
+      case Command::kFh1EndConditionalRendering: {
+        const auto& args = *reinterpret_cast<const ArgsFh1EndConditionalRendering*>(stream);
+        args.end(command_buffer);
+      } break;
+
       case Command::kFh1Timestamp: {
         const auto& args = *reinterpret_cast<const ArgsFh1Timestamp*>(stream);
         args.write(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, args.pool, args.query);

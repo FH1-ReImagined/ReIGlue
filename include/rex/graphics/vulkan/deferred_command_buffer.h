@@ -97,6 +97,30 @@ class DeferredCommandBuffer {
   uint16_t fh1_gpu_zone() const { return fh1_gpu_zone_; }
   Fh1GpuProfile* fh1_gpu_profile() const { return fh1_gpu_profile_; }
   bool fh1_gpu_profiling() const { return fh1_gpu_profile_ != nullptr; }
+  // FH1 (#640): the stencil bit masks of render target transfers (render_target_cache.cpp).
+  void CmdFh1FillBuffer(PFN_vkCmdFillBuffer fill, VkBuffer buffer, VkDeviceSize offset,
+                        VkDeviceSize size, uint32_t data) {
+    auto& args = *reinterpret_cast<ArgsFh1FillBuffer*>(
+        WriteCommand(Command::kFh1FillBuffer, sizeof(ArgsFh1FillBuffer)));
+    args.fill = fill;
+    args.buffer = buffer;
+    args.offset = offset;
+    args.size = size;
+    args.data = data;
+  }
+  void CmdFh1BeginConditionalRendering(PFN_vkCmdBeginConditionalRenderingEXT begin,
+                                       VkBuffer buffer, VkDeviceSize offset) {
+    auto& args = *reinterpret_cast<ArgsFh1BeginConditionalRendering*>(WriteCommand(
+        Command::kFh1BeginConditionalRendering, sizeof(ArgsFh1BeginConditionalRendering)));
+    args.begin = begin;
+    args.buffer = buffer;
+    args.offset = offset;
+  }
+  void CmdFh1EndConditionalRendering(PFN_vkCmdEndConditionalRenderingEXT end) {
+    auto& args = *reinterpret_cast<ArgsFh1EndConditionalRendering*>(WriteCommand(
+        Command::kFh1EndConditionalRendering, sizeof(ArgsFh1EndConditionalRendering)));
+    args.end = end;
+  }
   void CmdFh1Timestamp(PFN_vkCmdWriteTimestamp write, VkQueryPool pool, uint32_t query) {
     auto& args = *reinterpret_cast<ArgsFh1Timestamp*>(
         WriteCommand(Command::kFh1Timestamp, sizeof(ArgsFh1Timestamp)));
@@ -506,6 +530,9 @@ class DeferredCommandBuffer {
     kFh1Breadcrumb,
     kFh1TestHang,
     kFh1Timestamp,
+    kFh1FillBuffer,
+    kFh1BeginConditionalRendering,
+    kFh1EndConditionalRendering,
   };
 
   struct CommandHeader {
@@ -710,6 +737,24 @@ class DeferredCommandBuffer {
 
   struct ArgsFh1Breadcrumb {
     uint32_t seq;
+  };
+
+  struct ArgsFh1FillBuffer {
+    PFN_vkCmdFillBuffer fill;
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+    uint32_t data;
+  };
+
+  struct ArgsFh1BeginConditionalRendering {
+    PFN_vkCmdBeginConditionalRenderingEXT begin;
+    VkBuffer buffer;
+    VkDeviceSize offset;
+  };
+
+  struct ArgsFh1EndConditionalRendering {
+    PFN_vkCmdEndConditionalRenderingEXT end;
   };
 
   struct ArgsFh1Timestamp {

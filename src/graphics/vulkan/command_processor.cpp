@@ -10000,6 +10000,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                       ? fmt::format(", verified, {} differed", mismatches)
                       : std::string());
             }
+            // FH1 (#640): vulkan_transfer_stencil_bit_mask.
+            uint64_t stencil_masked, stencil_transfers;
+            rt_cache->Fh1TakeStencilMaskStats(stencil_masked, stencil_transfers);
+            if (stencil_transfers) {
+              REXGPU_INFO("Depth transfers without stencil export: {}, {} with the stencil bit "
+                          "draws conditional on the bits set in the source",
+                          stencil_transfers, stencil_masked);
+            }
           }
         });
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
