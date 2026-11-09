@@ -28,6 +28,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -45,6 +46,11 @@ REXCVAR_DEFINE_BOOL(
 REXCVAR_DEFINE_BOOL(
     vulkan_direct_scaled_depth_upload, true, "Vulkan",
     "Also load eligible scaled NVIDIA depth textures directly into images, preserving depth conversion");
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_direct_unscaled_texture_upload, true, "Vulkan",
+    "Also load eligible unscaled NVIDIA textures (one mip, tiled: resolved render targets at "
+    "render scale 1) directly into images from the shared memory");
 
 REXCVAR_DEFINE_BOOL(vulkan_force_base_mip, false, "GPU/Vulkan",
     "Work around texture filtering artifacts by sampling 2D textures at their base mip");
@@ -1250,7 +1256,8 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   const bool separate_view_format = formats[1] != VK_FORMAT_UNDEFINED;
   bool direct_upload =
       REXCVAR_GET(vulkan_direct_scaled_texture_upload) && load_image_pipeline_ &&
-      vulkan_device->properties().vendorID == 0x10DE && key.scaled_resolve && key.tiled &&
+      vulkan_device->properties().vendorID == 0x10DE &&
+      (key.scaled_resolve || REXCVAR_GET(vulkan_direct_unscaled_texture_upload)) && key.tiled &&
       key.dimension == xenos::DataDimension::k2DOrStacked && depth_or_array_size == 1 &&
       key.mip_max_level == 0 && key.GetWidth() >= 32 && key.GetHeight() >= 32 &&
       (host_format.format_unsigned.load_shader == kLoadShaderIndex32bpb ||
@@ -1414,8 +1421,17 @@ bool VulkanTextureCache::LoadScaledTextureDirect(VulkanTexture& texture) {
   const auto key = texture.key();
   const auto* device = command_processor_.GetVulkanDevice();
   uint64_t start, length;
-  if (!GetScaledResolveRange(key.base_page << 12, texture.GetGuestBaseSize(), 4, start, length))
-    return false;
+  // FH1 (#640): an unscaled texture is read from the shared memory, at scale 1.
+  const bool scaled = key.scaled_resolve != 0;
+  VulkanSharedMemory& vulkan_shared_memory = static_cast<VulkanSharedMemory&>(shared_memory());
+  if (scaled) {
+    if (!GetScaledResolveRange(key.base_page << 12, texture.GetGuestBaseSize(), 4, start, length))
+      return false;
+  } else {
+    start = uint64_t(key.base_page) << 12;
+    length = rex::align(uint64_t(texture.GetGuestBaseSize()), uint64_t(16));
+    if (length > uint64_t(SharedMemory::kBufferSize) - start) return false;
+  }
   auto dest = command_processor_.AllocateSingleTransientDescriptor(
       VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
   auto source = command_processor_.AllocateSingleTransientDescriptor(
@@ -1425,7 +1441,8 @@ bool VulkanTextureCache::LoadScaledTextureDirect(VulkanTexture& texture) {
   VkDescriptorImageInfo image_info = {};
   image_info.imageView = texture.storage_view();
   image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-  VkDescriptorBufferInfo buffer_info = {scaled_resolve_buffer_, start, length};
+  VkDescriptorBufferInfo buffer_info = {scaled ? scaled_resolve_buffer_ : vulkan_shared_memory.buffer(),
+                                        start, length};
   VkWriteDescriptorSet writes[2] = {};
   for (uint32_t i = 0; i < 2; ++i) {
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1438,7 +1455,11 @@ bool VulkanTextureCache::LoadScaledTextureDirect(VulkanTexture& texture) {
   writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[1].pBufferInfo = &buffer_info;
   device->functions().vkUpdateDescriptorSets(device->device(), 2, writes, 0, nullptr);
-  UseScaledResolveBufferForRead();
+  if (scaled) {
+    UseScaledResolveBufferForRead();
+  } else {
+    vulkan_shared_memory.Use(VulkanSharedMemory::Usage::kRead);
+  }
   texture.MarkAsUsed();
   auto old_usage = texture.SetUsage(VulkanTexture::Usage::kComputeDestination);
   VkPipelineStageFlags src_stage;
@@ -1452,7 +1473,7 @@ bool VulkanTextureCache::LoadScaledTextureDirect(VulkanTexture& texture) {
   command_processor_.BindExternalComputePipeline(load_image_pipeline_);
   command_processor_.SubmitBarriers(true);
   LoadConstants constants = {};
-  uint32_t sx = draw_resolution_scale_x(), sy = draw_resolution_scale_y();
+  uint32_t sx = scaled ? draw_resolution_scale_x() : 1, sy = scaled ? draw_resolution_scale_y() : 1;
   constants.is_tiled_3d_endian_scale = 1 | (uint32_t(key.endianness) << 2) | (sx << 4) | (sy << 7);
   const auto load_shader = GetHostFormatPair(key).format_unsigned.load_shader;
   if (load_shader == kLoadShaderIndexDepthUnorm) {
@@ -1479,6 +1500,25 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                                bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
+  // FH1 (#640): fh1_gpu_profile, by format, size and scaling.
+  DeferredCommandBuffer& gpu_zone_commands = command_processor_.deferred_command_buffer();
+  uint16_t gpu_zone_id = Fh1GpuProfile::kTextureLoad;
+  if (Fh1GpuProfile* profile = gpu_zone_commands.fh1_gpu_profile()) {
+    const uint64_t key = (uint64_t(0x7D) << 56) ^ (uint64_t(texture_key.format) << 40) ^
+                         (uint64_t(texture_key.GetWidth()) << 20) ^ texture_key.GetHeight() ^
+                         (uint64_t(texture_key.scaled_resolve) << 52) ^
+                         (uint64_t(texture_key.mip_max_level) << 53) ^
+                         (uint64_t(load_mips) << 46) ^ (uint64_t(load_base) << 47);
+    gpu_zone_id = profile->FindZone(key);
+    if (gpu_zone_id == Fh1GpuProfile::kNoZone) {
+      gpu_zone_id = profile->AddZone(
+          key, fmt::format("~tex {} {}x{} mips {}{}{}{}", FormatInfo::Get(texture_key.format)->name,
+                           texture_key.GetWidth(), texture_key.GetHeight(),
+                           texture_key.mip_max_level + 1, texture_key.scaled_resolve ? " resolved" : "",
+                           load_base ? "" : " (mips only)", load_mips ? "" : " (base only)"));
+    }
+  }
+  Fh1GpuZoneScope gpu_zone(gpu_zone_commands, gpu_zone_id);
 
   if (load_base && !texture_key.mip_max_level && !vulkan_texture.force_load_3d_tiling() &&
       vulkan_texture.storage_view()) {

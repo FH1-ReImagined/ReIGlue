@@ -292,6 +292,9 @@ class VulkanDevice {
 
   const MemoryTypes& memory_types() const { return memory_types_; }
 
+  // FH1 (#640): VK_EXT_conditional_rendering with conditionalRendering enabled (GPU emulation).
+  bool fh1_conditional_rendering() const { return fh1_conditional_rendering_; }
+
  private:
   explicit VulkanDevice(const VulkanInstance* vulkan_instance, VkPhysicalDevice physical_device);
 
@@ -310,6 +313,9 @@ class VulkanDevice {
   uint32_t queue_family_sparse_binding_ = UINT32_MAX;
 
   MemoryTypes memory_types_;
+
+  // Last, so that the members before keep their offsets for code built against older headers.
+  bool fh1_conditional_rendering_ = false;
 };
 
 }  // namespace vulkan

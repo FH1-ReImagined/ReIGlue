@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -32,6 +33,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -58,6 +60,10 @@ REXCVAR_DEFINE_BOOL(vulkan_render_target_update_reuse_verify, false, "GPU/Vulkan
                     "setup for a reused draw and log where it differs (testing)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_transfer_stencil_bit_mask, true, "GPU/Vulkan",
+                    "Without VK_EXT_shader_stencil_export (NVIDIA), render target transfers copy "
+                    "the stencil in one full-size draw per bit: with conditional rendering, only "
+                    "the draws of the bits set in the source run");
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -91,6 +97,7 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/host_depth_store_2xmsaa_cs.h"
 #include "../shaders/vulkan_spirv/host_depth_store_4xmsaa_cs.h"
 #include "../shaders/vulkan_spirv/passthrough_position_xy_vs.h"
+#include "../shaders/vulkan_spirv/stencil_bit_mask_cs.h"
 #include "../shaders/vulkan_spirv/resolve_clear_32bpp_cs.h"
 #include "../shaders/vulkan_spirv/resolve_clear_32bpp_scaled_cs.h"
 #include "../shaders/vulkan_spirv/resolve_clear_64bpp_cs.h"
@@ -722,6 +729,12 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       host_depth_store_pipelines_[i] = host_depth_store_pipeline;
     }
 
+    // FH1 (#640): optional; without it the stencil bit draws all run.
+    if (!vulkan_device->extensions().ext_EXT_shader_stencil_export &&
+        vulkan_device->fh1_conditional_rendering() && !Fh1StencilMaskInitialize()) {
+      Fh1StencilMaskShutdown();
+    }
+
     // Transfer and clear vertex buffer, for quads of up to tile granularity.
     transfer_vertex_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
         vulkan_device, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -990,6 +1003,120 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   return true;
 }
 
+bool VulkanRenderTargetCache::Fh1StencilMaskInitialize() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const auto& ifn = vulkan_device->vulkan_instance()->functions();
+  fh1_begin_conditional_rendering_ = reinterpret_cast<PFN_vkCmdBeginConditionalRenderingEXT>(
+      ifn.vkGetDeviceProcAddr(device, "vkCmdBeginConditionalRenderingEXT"));
+  fh1_end_conditional_rendering_ = reinterpret_cast<PFN_vkCmdEndConditionalRenderingEXT>(
+      ifn.vkGetDeviceProcAddr(device, "vkCmdEndConditionalRenderingEXT"));
+  fh1_fill_buffer_ =
+      reinterpret_cast<PFN_vkCmdFillBuffer>(ifn.vkGetDeviceProcAddr(device, "vkCmdFillBuffer"));
+  if (!fh1_begin_conditional_rendering_ || !fh1_end_conditional_rendering_ || !fh1_fill_buffer_) {
+    return false;
+  }
+  const VkDeviceSize size = VkDeviceSize(sizeof(uint32_t)) * 8 * kFh1StencilMaskRegions *
+                            kFh1StencilMaskSlotsPerRegion;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, size,
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+              VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, fh1_stencil_mask_buffer_,
+          fh1_stencil_mask_memory_)) {
+    return false;
+  }
+  VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+  VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pool_info.maxSets = 1;
+  pool_info.poolSizeCount = 1;
+  pool_info.pPoolSizes = &pool_size;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr,
+                                 &fh1_stencil_mask_descriptor_pool_) != VK_SUCCESS) {
+    return false;
+  }
+  VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  set_info.descriptorPool = fh1_stencil_mask_descriptor_pool_;
+  set_info.descriptorSetCount = 1;
+  set_info.pSetLayouts = &descriptor_set_layout_storage_buffer_;
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, &fh1_stencil_mask_descriptor_set_) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  VkDescriptorBufferInfo buffer_info{fh1_stencil_mask_buffer_, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = fh1_stencil_mask_descriptor_set_;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write.pBufferInfo = &buffer_info;
+  dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+  // The host depth store's layout: set 0 a storage buffer, set 1 the source's transfer set.
+  VkDescriptorSetLayout set_layouts[] = {descriptor_set_layout_storage_buffer_,
+                                         descriptor_set_layout_sampled_image_x2_};
+  VkPushConstantRange push_constants{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 5};
+  VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout_info.setLayoutCount = uint32_t(rex::countof(set_layouts));
+  layout_info.pSetLayouts = set_layouts;
+  layout_info.pushConstantRangeCount = 1;
+  layout_info.pPushConstantRanges = &push_constants;
+  if (dfn.vkCreatePipelineLayout(device, &layout_info, nullptr,
+                                 &fh1_stencil_mask_pipeline_layout_) != VK_SUCCESS) {
+    return false;
+  }
+  fh1_stencil_mask_pipelines_[0] = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, fh1_stencil_mask_pipeline_layout_, shaders::stencil_bit_mask_cs,
+      sizeof(shaders::stencil_bit_mask_cs));
+  fh1_stencil_mask_pipelines_[1] = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, fh1_stencil_mask_pipeline_layout_, shaders::stencil_bit_mask_ms_cs,
+      sizeof(shaders::stencil_bit_mask_ms_cs));
+  if (!fh1_stencil_mask_pipelines_[0] || !fh1_stencil_mask_pipelines_[1]) {
+    return false;
+  }
+  REXGPU_INFO(
+      "VulkanRenderTargetCache: no stencil export; transfers draw only the stencil bits set in "
+      "their sources (conditional rendering)");
+  return true;
+}
+
+void VulkanRenderTargetCache::Fh1StencilMaskShutdown() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (VkPipeline& pipeline : fh1_stencil_mask_pipelines_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, pipeline);
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         fh1_stencil_mask_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         fh1_stencil_mask_descriptor_pool_);
+  fh1_stencil_mask_descriptor_set_ = VK_NULL_HANDLE;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, fh1_stencil_mask_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, fh1_stencil_mask_memory_);
+  fh1_begin_conditional_rendering_ = nullptr;
+  fh1_end_conditional_rendering_ = nullptr;
+}
+
+uint32_t VulkanRenderTargetCache::Fh1StencilMaskAllocateSlot() {
+  const uint64_t submission = command_processor_.GetCurrentSubmission();
+  const uint32_t region = uint32_t(submission % kFh1StencilMaskRegions);
+  if (fh1_stencil_mask_submission_ != submission) {
+    fh1_stencil_mask_submission_ = submission;
+    fh1_stencil_mask_next_slot_ = 0;
+    // The region's words may be read by its last submission until that one is done.
+    fh1_stencil_mask_region_usable_ =
+        fh1_stencil_mask_region_submission_[region] <= command_processor_.GetCompletedSubmission();
+    if (fh1_stencil_mask_region_usable_) {
+      fh1_stencil_mask_region_submission_[region] = submission;
+    }
+  }
+  if (!fh1_stencil_mask_region_usable_ ||
+      fh1_stencil_mask_next_slot_ >= kFh1StencilMaskSlotsPerRegion) {
+    return UINT32_MAX;
+  }
+  return region * kFh1StencilMaskSlotsPerRegion + fh1_stencil_mask_next_slot_++;
+}
+
 void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1064,6 +1191,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
                                          transfer_passthrough_vertex_shader_);
   transfer_vertex_buffer_pool_.reset();
 
+  Fh1StencilMaskShutdown();
   for (size_t i = 0; i < rex::countof(host_depth_store_pipelines_); ++i) {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                            host_depth_store_pipelines_[i]);
@@ -1205,6 +1333,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
+          Fh1GpuZoneScope gpu_zone(command_buffer, Fh1GpuProfile::kResolveDirect);
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
@@ -1221,6 +1350,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           uint32_t dump_rows;
           uint32_t dump_pitch;
           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+          Fh1GpuZoneScope gpu_zone(command_buffer, Fh1GpuProfile::kResolveDump);
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
             return false;
@@ -1361,6 +1491,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                 ? resolve_info.rb_color_clear_lo |
                                       (uint64_t(resolve_info.rb_color_clear) << 32)
                                 : resolve_info.rb_color_clear;
+          Fh1GpuZoneScope gpu_zone(command_processor_.deferred_command_buffer(),
+                                   Fh1GpuProfile::kResolveClear);
           PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
                                            &clear_rectangle);
         }
@@ -5077,6 +5209,26 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     auto& dest_vulkan_rt = *static_cast<VulkanRenderTarget*>(dest_rt);
     RenderTargetKey dest_rt_key = dest_vulkan_rt.key();
 
+    // FH1 (#640): fh1_gpu_profile names the transfers by their source and destination.
+    std::optional<Fh1GpuZoneScope> gpu_zone;
+    if (Fh1GpuProfile* profile = command_buffer.fh1_gpu_profile()) {
+      const RenderTarget* source = current_transfers.empty() ? nullptr : current_transfers[0].source;
+      const RenderTarget* depth_source =
+          current_transfers.empty() ? nullptr : current_transfers[0].host_depth_source;
+      const uint64_t key = (uint64_t(0x7E) << 56) ^ (uint64_t(dest_rt_key.key) << 24) ^
+                           (source ? uint64_t(source->key().key) * 0x9E3779B1ull : 0) ^
+                           (depth_source ? 0x5555 : 0) ^ (current_transfers.size() << 50);
+      uint16_t zone = profile->FindZone(key);
+      if (zone == Fh1GpuProfile::kNoZone) {
+        zone = profile->AddZone(
+            key, fmt::format("~xfer {} <- {}{} ({} transfers{})", dest_rt_key.GetDebugName(),
+                             source ? source->key().GetDebugName() : std::string("none"),
+                             depth_source ? " +host depth" : "", current_transfers.size(),
+                             resolve_clear_needed ? ", clear" : ""));
+      }
+      gpu_zone.emplace(command_buffer, zone);
+    }
+
     // Late barriers in case there was cross-copying that prevented merging of
     // barriers.
     {
@@ -5220,6 +5372,65 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       }
       std::sort(current_transfer_invocations_.begin(), current_transfer_invocations_.end());
 
+      // FH1 (#640): the depth sources of the stencil bit draws, and the rows of each they read,
+      // for their bit masks (vulkan_transfer_stencil_bit_mask).
+      fh1_stencil_mask_sources_.clear();
+      if (need_stencil_bit_draws) {
+        ++fh1_stencil_bit_transfers_;
+        if (fh1_stencil_mask_pipelines_[0] != VK_NULL_HANDLE &&
+            REXCVAR_GET(vulkan_transfer_stencil_bit_mask)) {
+          for (const TransferInvocation& invocation : current_transfer_invocations_) {
+            if (invocation.shader_key.mode != TransferMode::kDepthToStencilBit) {
+              continue;
+            }
+            const RenderTarget* source = invocation.transfer.source;
+            const RenderTargetKey source_key = source->key();
+            const uint32_t height =
+                GetRenderTargetHeight(source_key.pitch_tiles_at_32bpp, source_key.msaa_samples);
+            uint32_t y_begin = 0, y_end = height;
+            const uint32_t pitch = source_key.pitch_tiles_at_32bpp;
+            const uint32_t tile_rows = xenos::kEdramTileHeightSamples >>
+                                       uint32_t(source_key.msaa_samples >= xenos::MsaaSamples::k2X);
+            if (pitch && invocation.transfer.start_tiles >= source_key.base_tiles &&
+                invocation.transfer.end_tiles > invocation.transfer.start_tiles) {
+              y_begin = std::min(
+                  (invocation.transfer.start_tiles - source_key.base_tiles) / pitch * tile_rows,
+                  height);
+              y_end = std::min((invocation.transfer.end_tiles - source_key.base_tiles + pitch - 1) /
+                                   pitch * tile_rows,
+                               height);
+              if (y_end <= y_begin) {
+                y_begin = 0;
+                y_end = height;
+              }
+            }
+            bool found = false;
+            for (Fh1StencilMaskSource& known : fh1_stencil_mask_sources_) {
+              if (known.source == source) {
+                known.y_begin = std::min(known.y_begin, y_begin);
+                known.y_end = std::max(known.y_end, y_end);
+                found = true;
+              }
+            }
+            if (found) {
+              continue;
+            }
+            const uint32_t slot = Fh1StencilMaskAllocateSlot();
+            if (slot == UINT32_MAX || (!fh1_stencil_mask_sources_.empty() &&
+                                       slot != fh1_stencil_mask_sources_.back().slot + 1)) {
+              // Out of slots (or not contiguous): all the draws, as before.
+              fh1_stencil_mask_sources_.clear();
+              break;
+            }
+            fh1_stencil_mask_sources_.push_back({source, slot, y_begin, y_end});
+          }
+        }
+      }
+      // The masks' compute pass reads the sources too.
+      const VkPipelineStageFlags source_stage_mask =
+          kSourceStageMask |
+          (fh1_stencil_mask_sources_.empty() ? 0 : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
       for (auto it = current_transfer_invocations_.cbegin();
            it != current_transfer_invocations_.cend(); ++it) {
         assert_not_null(it->transfer.source);
@@ -5230,10 +5441,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                 source_vulkan_rt.key().is_depth
                     ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                     : VK_IMAGE_ASPECT_COLOR_BIT),
-            source_vulkan_rt.current_stage_mask(), kSourceStageMask,
+            source_vulkan_rt.current_stage_mask(), source_stage_mask,
             source_vulkan_rt.current_access_mask(), kSourceAccessMask,
             source_vulkan_rt.current_layout(), kSourceLayout);
-        source_vulkan_rt.SetUsage(kSourceStageMask, kSourceAccessMask, kSourceLayout);
+        source_vulkan_rt.SetUsage(source_stage_mask, kSourceAccessMask, kSourceLayout);
         auto host_depth_source_vulkan_rt =
             static_cast<VulkanRenderTarget*>(it->transfer.host_depth_source);
         if (host_depth_source_vulkan_rt) {
@@ -5255,6 +5466,52 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                                   kSourceLayout);
           }
         }
+      }
+
+      // FH1 (#640): the sources' stencil bit masks, before the render pass.
+      if (!fh1_stencil_mask_sources_.empty()) {
+        ++fh1_stencil_masked_transfers_;
+        const VkDeviceSize mask_offset =
+            VkDeviceSize(sizeof(uint32_t)) * 8 * fh1_stencil_mask_sources_.front().slot;
+        const VkDeviceSize mask_size =
+            VkDeviceSize(sizeof(uint32_t)) * 8 * fh1_stencil_mask_sources_.size();
+        command_processor_.SubmitBarriers(true);
+        command_buffer.CmdFh1FillBuffer(fh1_fill_buffer_, fh1_stencil_mask_buffer_, mask_offset,
+                                        mask_size, 0);
+        command_processor_.PushBufferMemoryBarrier(
+            fh1_stencil_mask_buffer_, mask_offset, mask_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        command_processor_.SubmitBarriers(true);
+        for (const Fh1StencilMaskSource& mask_source : fh1_stencil_mask_sources_) {
+          const auto& source_rt = *static_cast<const VulkanRenderTarget*>(mask_source.source);
+          const RenderTargetKey source_key = source_rt.key();
+          uint32_t samples = uint32_t(1) << uint32_t(source_key.msaa_samples);
+          if (source_key.msaa_samples == xenos::MsaaSamples::k2X &&
+              !msaa_2x_attachments_supported_) {
+            samples = 4;  // 2x as 4x: all the image's samples
+          }
+          command_processor_.BindExternalComputePipeline(fh1_stencil_mask_pipelines_[samples > 1]);
+          VkDescriptorSet mask_descriptor_sets[] = {fh1_stencil_mask_descriptor_set_,
+                                                    source_rt.GetDescriptorSetTransferSource()};
+          command_buffer.CmdVkBindDescriptorSets(
+              VK_PIPELINE_BIND_POINT_COMPUTE, fh1_stencil_mask_pipeline_layout_, 0,
+              uint32_t(rex::countof(mask_descriptor_sets)), mask_descriptor_sets, 0, nullptr);
+          const uint32_t width = source_key.GetWidth() * draw_resolution_scale_x();
+          const uint32_t constants[] = {width, mask_source.y_begin * draw_resolution_scale_y(),
+                                        mask_source.y_end * draw_resolution_scale_y(), samples,
+                                        mask_source.slot};
+          command_buffer.CmdVkPushConstants(fh1_stencil_mask_pipeline_layout_,
+                                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                                            constants);
+          command_buffer.CmdVkDispatch(
+              (width + 15) / 16,
+              ((mask_source.y_end - mask_source.y_begin) * draw_resolution_scale_y() + 7) / 8, 1);
+        }
+        command_processor_.PushBufferMemoryBarrier(
+            fh1_stencil_mask_buffer_, mask_offset, mask_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT);
       }
 
       // Perform the transfers for the render target.
@@ -5564,7 +5821,25 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               command_buffer.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                       transfer_stencil_bit);
             }
+            // FH1 (#640): only if the bit is set somewhere in the source.
+            uint32_t mask_slot = UINT32_MAX;
+            if (transfer_is_stencil_bit &&
+                transfer_shader_key.mode == TransferMode::kDepthToStencilBit) {
+              for (const Fh1StencilMaskSource& mask_source : fh1_stencil_mask_sources_) {
+                if (mask_source.source == &source_vulkan_rt) {
+                  mask_slot = mask_source.slot;
+                }
+              }
+            }
+            if (mask_slot != UINT32_MAX) {
+              command_buffer.CmdFh1BeginConditionalRendering(
+                  fh1_begin_conditional_rendering_, fh1_stencil_mask_buffer_,
+                  VkDeviceSize(sizeof(uint32_t)) * (mask_slot * 8 + k));
+            }
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
+            if (mask_slot != UINT32_MAX) {
+              command_buffer.CmdFh1EndConditionalRendering(fh1_end_conditional_rendering_);
+            }
           }
         }
       }

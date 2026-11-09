@@ -47,6 +47,7 @@
 #include <rex/ui/vulkan/fh1_breadcrumbs.h>
 #include <rex/platform.h>
 #include "../fh1_frame_cost.h"
+#include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #if REX_PLATFORM_MAC
 #include <mach/mach.h>
 #endif
@@ -217,6 +218,16 @@ REXCVAR_DEFINE_STRING(fh1_frame_cost_csv, "", "GPU/Vulkan",
                       "textures, uploads, pipelines, render targets, waits) to this CSV file")
     .debug_only();
 
+REXCVAR_DEFINE_DOUBLE(fh1_gpu_profile, 0.0, "GPU/Vulkan",
+                      "Testing: every this many seconds, log the GPU time of the command "
+                      "processor's work by kind and render pass (Vulkan timestamps); 0 = off")
+    .debug_only();
+REXCVAR_DEFINE_STRING(fh1_gpu_profile_csv, "", "GPU/Vulkan",
+                      "Testing: also append fh1_gpu_profile's reports to this CSV file")
+    .debug_only();
+REXCVAR_DEFINE_BOOL(fh1_gpu_profile_shaders, false, "GPU/Vulkan",
+                    "Testing: fh1_gpu_profile splits render passes by pixel shader")
+    .debug_only();
 REXCVAR_DEFINE_INT32(vulkan_submission_draw_limit, -1, "GPU/Vulkan",
                      "End a GPU submission after this many draws (a frame then reaches the GPU in "
                      "several parts, so no single part can run into Windows' 2 s GPU timeout): "
@@ -806,6 +817,9 @@ uint64_t TestGpuLossFrame() {
 // issued and finished (fh1_device_lost_trail.h). Recorded by the command processor's thread.
 fh1_device_lost_trail::Trail fh1_trail;
 DeferredCommandBuffer::Fh1Breadcrumbs fh1_breadcrumbs;
+// FH1 (#640): fh1_gpu_profile.
+Fh1GpuProfile fh1_gpu_profile;
+bool fh1_gpu_profile_shaders_on = false;
 VkDeviceMemory fh1_breadcrumb_memory = VK_NULL_HANDLE;
 uint32_t fh1_breadcrumb_memory_type = 0;
 const volatile uint32_t* fh1_breadcrumb_values = nullptr;
@@ -2800,6 +2814,12 @@ bool VulkanCommandProcessor::SetupContext() {
 
   Fh1WorldAoInitialize();
   Fh1BreadcrumbsInitialize();
+  if (REXCVAR_GET(fh1_gpu_profile) > 0.0 &&
+      fh1_gpu_profile.Initialize(GetVulkanDevice(), REXCVAR_GET(fh1_gpu_profile),
+                                 REXCVAR_GET(fh1_gpu_profile_csv))) {
+    fh1_gpu_profile_shaders_on = REXCVAR_GET(fh1_gpu_profile_shaders);
+    deferred_command_buffer_.SetFh1GpuProfile(&fh1_gpu_profile);
+  }
   return true;
 }
 
@@ -3097,6 +3117,8 @@ void VulkanCommandProcessor::ShutdownContext() {
   DestroyScratchBuffer();
 
   deferred_command_buffer_.SetFh1Breadcrumbs(nullptr);
+  deferred_command_buffer_.SetFh1GpuProfile(nullptr);
+  fh1_gpu_profile.Shutdown();
   if (fh1_breadcrumb_values) {
     dfn.vkUnmapMemory(device, fh1_breadcrumb_memory);
     fh1_breadcrumb_values = nullptr;
@@ -5173,6 +5195,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
+  Fh1GpuZoneScope gpu_zone(deferred_command_buffer_, Fh1GpuProfile::kSwap);
 
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
@@ -7319,15 +7342,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     fh1_stereo_mirrored_ = mirrored;
     fh1_stereo_handedness_known_ = true;
   }
-  if (!Fh1WorldAoBeforeDraw(pixel_shader, used_texture_mask)) {
-    return draw_fail("world_ao_submission");
+  {
+    Fh1GpuZoneScope gpu_zone(deferred_command_buffer_, Fh1GpuProfile::kEffects);
+    if (!Fh1WorldAoBeforeDraw(pixel_shader, used_texture_mask)) {
+      return draw_fail("world_ao_submission");
+    }
   }
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
-    return draw_fail("render_target_update");
+  {
+    Fh1GpuZoneScope zone(deferred_command_buffer_, Fh1GpuProfile::kTransfer);
+    if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                      normalized_color_mask, *vertex_shader)) {
+      return draw_fail("render_target_update");
+    }
   }
   // A depth-only draw can precede the first HUD color export. Keep the scene
   // transfer pending until there is a native color attachment to seed.
@@ -7700,6 +7729,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
 
+  // FH1 (#640): the draw's render pass (and pixel shader) as its zone.
+  if (deferred_command_buffer_.fh1_gpu_profiling()) {
+    Fh1SetDrawGpuZone(pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+  }
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
@@ -7783,7 +7816,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // FH1 (#380): after the shadow mask's blur, multiplies the world AO into it.
-  Fh1WorldAoAfterDraw(pixel_shader);
+  {
+    Fh1GpuZoneScope gpu_zone(deferred_command_buffer_, Fh1GpuProfile::kEffects);
+    Fh1WorldAoAfterDraw(pixel_shader);
+  }
 
   if (hdr_menu_background) {
     // Include the decoded 1280x720 movie, but not the following logo, text or
@@ -8022,6 +8058,28 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   return true;
 }
 
+void VulkanCommandProcessor::Fh1SetDrawGpuZone(uint64_t pixel_shader) {
+  const VulkanRenderTargetCache::RenderPassKey key =
+      render_target_cache_->last_update_render_pass_key();
+  const VulkanRenderTargetCache::Framebuffer* framebuffer =
+      render_target_cache_->last_update_framebuffer();
+  const uint32_t width = framebuffer ? framebuffer->host_extent.width : 0;
+  const uint32_t height = framebuffer ? framebuffer->host_extent.height : 0;
+  const char* depth = (key.depth_and_color_used & 1)
+                          ? xenos::GetDepthRenderTargetFormatName(key.depth_format)
+                          : nullptr;
+  const xenos::ColorRenderTargetFormat formats[] = {key.color_0_view_format, key.color_1_view_format,
+                                                    key.color_2_view_format,
+                                                    key.color_3_view_format};
+  const char* colors[4] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (key.depth_and_color_used & (2u << i)) colors[i] = xenos::GetColorRenderTargetFormatName(formats[i]);
+  }
+  deferred_command_buffer_.SetFh1GpuZone(fh1_gpu_profile.DrawZone(
+      key.key, width, height, uint32_t(key.msaa_samples), depth, colors, 4,
+      fh1_gpu_profile_shaders_on ? pixel_shader : 0));
+}
+
 bool VulkanCommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -8030,6 +8088,7 @@ bool VulkanCommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  Fh1GpuZoneScope gpu_zone(deferred_command_buffer_, Fh1GpuProfile::kResolve);
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
@@ -8335,6 +8394,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (!written_length) {
     return true;
   }
+  Fh1GpuZoneScope gpu_zone(deferred_command_buffer_, Fh1GpuProfile::kReadback);
   // FH1 (#536): a copy still on its way to guest memory that this resolve wrote over is dropped
   // (putting the older data in guest memory would have the GPU load it back over this
   // resolve); those done by now go to guest memory.
@@ -9275,6 +9335,9 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
                                       submissions_in_flight_fences_awaited_end);
   submission_completed_ += fences_awaited;
+  if (deferred_command_buffer_.fh1_gpu_profiling()) {
+    fh1_gpu_profile.Completed(submission_completed_);
+  }
 
   // Reclaim semaphores.
   while (!submissions_in_flight_semaphores_.empty()) {
@@ -9471,6 +9534,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    if (deferred_command_buffer_.fh1_gpu_profiling()) {
+      fh1_gpu_profile.BeginSubmission(deferred_command_buffer_, GetCurrentSubmission(),
+                                      frame_current_);
+    }
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -9756,6 +9823,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
 
     SubmitBarriers(true);
+    if (deferred_command_buffer_.fh1_gpu_profiling()) {
+      fh1_gpu_profile.EndSubmission(deferred_command_buffer_);
+    }
 
     fh1_submission_watch_state.Submitted(GetCurrentSubmission(), fh1_draws_in_submission,
                                          Fh1NowMs());
@@ -9929,6 +9999,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                   REXCVAR_GET(vulkan_render_target_update_reuse_verify)
                       ? fmt::format(", verified, {} differed", mismatches)
                       : std::string());
+            }
+            // FH1 (#640): vulkan_transfer_stencil_bit_mask.
+            uint64_t stencil_masked, stencil_transfers;
+            rt_cache->Fh1TakeStencilMaskStats(stencil_masked, stencil_transfers);
+            if (stencil_transfers) {
+              REXGPU_INFO("Depth transfers without stencil export: {}, {} with the stencil bit "
+                          "draws conditional on the bits set in the source",
+                          stencil_transfers, stencil_masked);
             }
           }
         });

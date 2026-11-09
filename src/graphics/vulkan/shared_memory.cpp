@@ -19,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -287,6 +288,8 @@ bool VulkanSharedMemory::UploadRanges(
     cost.upload_bytes += uint64_t(range.second) << page_size_log2();
   }
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  // FH1 (#640): fh1_gpu_profile (the hoisted copies are timed at their hoist point).
+  Fh1GpuZoneScope gpu_zone(command_buffer, Fh1GpuProfile::kUpload);
   // In a render pass whose draws have not read these pages, copy before the render pass
   // instead of ending it: between a barrier after everything that read the buffer before the
   // render pass and one before the render pass's reads, which all the uploads hoisted before
