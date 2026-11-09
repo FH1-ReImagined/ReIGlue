@@ -3431,6 +3431,33 @@ const PlainRegisters plain_registers;
 
 void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                                    uint32_t num_registers) {
+  WriteRegistersImpl<true>(start_index, base, num_registers);
+}
+
+void VulkanCommandProcessor::WriteRegistersFromHost(uint32_t start_index, const uint32_t* values,
+                                                    uint32_t num_registers) {
+  WriteRegistersImpl<false>(start_index, values, num_registers);
+}
+
+template <bool kGuestEndian>
+void VulkanCommandProcessor::WriteRegistersImpl(uint32_t start_index, const uint32_t* base,
+                                                uint32_t num_registers) {
+  // FH1 (#607, patch 0450): guest byte order from the ring or memory, host byte order from the
+  // decode/record split's records.
+  auto load = [](const uint32_t* p) -> uint32_t {
+    if constexpr (kGuestEndian) {
+      return memory::load_and_swap<uint32_t>(p);
+    } else {
+      return *p;
+    }
+  };
+  auto copy = [](uint32_t* dest, const uint32_t* src, uint32_t count) {
+    if constexpr (kGuestEndian) {
+      memory::copy_and_swap(dest, src, count);
+    } else {
+      std::memcpy(dest, src, sizeof(uint32_t) * count);
+    }
+  };
   if (!num_registers) {
     return;
   }
@@ -3464,7 +3491,7 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    copy(register_file_->values + start_index, base, num_registers);
     if (frame_open_) {
       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
@@ -3492,7 +3519,7 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    copy(register_file_->values + start_index, base, num_registers);
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
     return;
@@ -3507,7 +3534,7 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     uint32_t* values = register_file_->values + start_index;
     uint32_t first_changed = UINT32_MAX, last_changed = 0;
     for (uint32_t i = 0; i < num_registers; ++i) {
-      uint32_t value = memory::load_and_swap<uint32_t>(base + i);
+      uint32_t value = load(base + i);
       if (values[i] != value) {
         values[i] = value;
         if (first_changed == UINT32_MAX) {
@@ -3563,14 +3590,14 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
       }
     }
     part_end = std::min(part_end, range_end);
-    uint32_t* part_base = base + (index - start_index);
+    const uint32_t* part_base = base + (index - start_index);
     if (constant_block) {
-      VulkanCommandProcessor::WriteRegistersFromMem(index, part_base, part_end - index);
+      WriteRegistersImpl<kGuestEndian>(index, part_base, part_end - index);
     } else {
       // Most of these (render state, about 3 million a second in a race) only store
       // the value: do that here, as CommandProcessor::WriteRegister would.
       for (uint32_t i = index; i < part_end; ++i) {
-        uint32_t value = memory::load_and_swap<uint32_t>(part_base + (i - index));
+        uint32_t value = load(part_base + (i - index));
         if (plain_registers.IsPlain(i)) {
           // Volatile like CommandProcessor::WriteRegister's store (WAIT_REG_MEM polls).
           const_cast<volatile uint32_t&>(register_file_->values[i]) = value;

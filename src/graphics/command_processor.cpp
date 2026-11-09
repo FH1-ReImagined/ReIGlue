@@ -489,7 +489,14 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
     switch (words[i]) {
       case kRecordRun: {
         const uint32_t start = words[i + 1], run = words[i + 2];
-        WriteRegistersFromMem(start, const_cast<uint32_t*>(words + i + 3), run);
+        WriteRegistersFromHost(start, words + i + 3, run);
+        i += 3 + run;
+      } break;
+      case kRecordPlainRun: {
+        // FH1 (#607, patch 0450): registers whose write only stores the value (0360's direct
+        // copy, which the split could not take from the ring), without the backend's call.
+        const uint32_t start = words[i + 1], run = words[i + 2];
+        std::memcpy(register_file_->values + start, words + i + 3, sizeof(uint32_t) * run);
         i += 3 + run;
       } break;
       case kRecordOne:
@@ -571,7 +578,41 @@ inline bool ElidableOne(uint32_t index) {
 // Unchanged registers between two changed ones that are recorded with them rather than starting
 // a new run (a run costs more than storing a few values again).
 constexpr uint32_t kElideGap = 8;
+// FH1 (#607, patch 0450): whether every register of [first, first + count) has its bit set.
+inline bool AllBitsSet(const uint64_t* bits, uint32_t first, uint32_t count) {
+  const uint32_t last = first + count - 1;
+  uint32_t word = first >> 6;
+  const uint32_t last_word = last >> 6;
+  const uint64_t first_mask = ~UINT64_C(0) << (first & 63);
+  const uint64_t last_mask = ~UINT64_C(0) >> (63 - (last & 63));
+  if (word == last_word) {
+    const uint64_t mask = first_mask & last_mask;
+    return (bits[word] & mask) == mask;
+  }
+  if ((bits[word] & first_mask) != first_mask) {
+    return false;
+  }
+  for (++word; word < last_word; ++word) {
+    if (bits[word] != ~UINT64_C(0)) {
+      return false;
+    }
+  }
+  return (bits[last_word] & last_mask) == last_mask;
+}
 }  // namespace
+
+uint32_t* CommandProcessor::RecordRun(uint32_t start_index, uint32_t num_registers) {
+  uint32_t* record = RecordWords(3 + num_registers);
+  // The registers the backend only stores (all of them outside the constant blocks) go
+  // straight to the register file on the recorder.
+  record[0] = fh1_plain_registers_ && start_index < XE_GPU_REG_SHADER_CONSTANT_000_X &&
+                      AllBitsSet(fh1_plain_registers_, start_index, num_registers)
+                  ? kRecordPlainRun
+                  : kRecordRun;
+  record[1] = start_index;
+  record[2] = num_registers;
+  return record + 3;
+}
 
 void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
   if (!record_split_) {
@@ -638,12 +679,9 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
         }
       }
       const uint32_t run = last - first + 1;
-      memory::copy_and_swap(shadow + first, base + first, run);
-      uint32_t* record = RecordWords(3 + run);
-      record[0] = kRecordRun;
-      record[1] = start_index + first;
-      record[2] = run;
-      std::memcpy(record + 3, base + first, sizeof(uint32_t) * run);
+      uint32_t* values = RecordRun(start_index + first, run);
+      memory::copy_and_swap(values, base + first, run);
+      std::memcpy(shadow + first, values, sizeof(uint32_t) * run);
       record_registers_out_ += run;
       i = last + 1;
     }
@@ -653,16 +691,14 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
     return;
   }
   record_registers_out_ += num_registers;
-  memory::copy_and_swap(decode_register_file_->values + start_index, base, num_registers);
+  uint32_t* values = RecordRun(start_index, num_registers);
+  memory::copy_and_swap(values, base, num_registers);
+  std::memcpy(decode_register_file_->values + start_index, values,
+              sizeof(uint32_t) * num_registers);
   if (start_index <= XE_GPU_REG_COHER_STATUS_HOST &&
       start_index + num_registers > XE_GPU_REG_COHER_STATUS_HOST) {
     decode_register_file_->values[XE_GPU_REG_COHER_STATUS_HOST] |= UINT32_C(0x80000000);
   }
-  uint32_t* record = RecordWords(3 + num_registers);
-  record[0] = kRecordRun;
-  record[1] = start_index;
-  record[2] = num_registers;
-  std::memcpy(record + 3, base, sizeof(uint32_t) * num_registers);
   if (record_batch_->words.size() >= kRecordBatchWords) {
     PublishRecordBatch();
   }
@@ -1113,6 +1149,13 @@ void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* bas
   for (uint32_t i = 0; i < num_registers; ++i) {
     uint32_t data = memory::load_and_swap<uint32_t>(base + i);
     WriteRegister(start_index + i, data);
+  }
+}
+
+void CommandProcessor::WriteRegistersFromHost(uint32_t start_index, const uint32_t* values,
+                                              uint32_t num_registers) {
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    WriteRegister(start_index + i, values[i]);
   }
 }
 

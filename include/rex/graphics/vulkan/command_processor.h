@@ -312,6 +312,11 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  void WriteRegistersFromHost(uint32_t start_index, const uint32_t* values,
+                              uint32_t num_registers) override;
+  // FH1 (#607, patch 0450): the two above, guest or host byte order.
+  template <bool kGuestEndian>
+  void WriteRegistersImpl(uint32_t start_index, const uint32_t* base, uint32_t num_registers);
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
 
