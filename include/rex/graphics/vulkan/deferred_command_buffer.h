@@ -24,6 +24,7 @@ namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor;
 class Fh1Dlss;
+class Fh1GpuProfile;
 
 class DeferredCommandBuffer {
  public:
@@ -73,6 +74,36 @@ class DeferredCommandBuffer {
   }
   // Test hook: makes the GPU wait forever (the driver then resets it: a real device loss).
   void CmdFh1TestHang() { WriteCommand(Command::kFh1TestHang, 0); }
+
+  // FH1 (#640): GPU time per kind of work (fh1_gpu_profile.h). The zone is what the commands
+  // recorded from now on are for; with a profile, a timestamp goes before the first command
+  // written to the main stream in a new zone. Returns the previous zone.
+  void SetFh1GpuProfile(Fh1GpuProfile* profile) {
+    fh1_gpu_profile_ = profile;
+    fh1_gpu_zone_pending_ = false;
+  }
+  uint16_t SetFh1GpuZone(uint16_t zone) {
+    const uint16_t previous = fh1_gpu_zone_;
+    fh1_gpu_zone_ = zone;
+    // A zone left without commands of its own back to the marked one needs no timestamp.
+    fh1_gpu_zone_pending_ = fh1_gpu_profile_ != nullptr && zone != fh1_gpu_zone_marked_;
+    return previous;
+  }
+  // The profile wrote a timestamp starting `zone`.
+  void Fh1GpuZoneMarked(uint16_t zone) {
+    fh1_gpu_zone_marked_ = zone;
+    fh1_gpu_zone_pending_ = false;
+  }
+  uint16_t fh1_gpu_zone() const { return fh1_gpu_zone_; }
+  Fh1GpuProfile* fh1_gpu_profile() const { return fh1_gpu_profile_; }
+  bool fh1_gpu_profiling() const { return fh1_gpu_profile_ != nullptr; }
+  void CmdFh1Timestamp(PFN_vkCmdWriteTimestamp write, VkQueryPool pool, uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsFh1Timestamp*>(
+        WriteCommand(Command::kFh1Timestamp, sizeof(ArgsFh1Timestamp)));
+    args.write = write;
+    args.pool = pool;
+    args.query = query;
+  }
 
   // The recorded commands, taken out for another thread to execute (threaded submission).
   struct Streams {
@@ -474,6 +505,7 @@ class DeferredCommandBuffer {
     kHoistedCommands,
     kFh1Breadcrumb,
     kFh1TestHang,
+    kFh1Timestamp,
   };
 
   struct CommandHeader {
@@ -680,6 +712,12 @@ class DeferredCommandBuffer {
     uint32_t seq;
   };
 
+  struct ArgsFh1Timestamp {
+    PFN_vkCmdWriteTimestamp write;
+    VkQueryPool pool;
+    uint32_t query;
+  };
+
   struct ArgsHoistedCommands {
     // Range of hoisted_stream_, in elements.
     size_t begin;
@@ -694,6 +732,7 @@ class DeferredCommandBuffer {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  void Fh1GpuZoneMark();
   VkCommandBuffer ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
                      size_t stream_remaining, const uintmax_t* hoisted_stream,
                      const Fh1Dlss::SplitSubmission& split = {}) const;
@@ -706,6 +745,24 @@ class DeferredCommandBuffer {
   std::vector<uintmax_t>* write_stream_ = &command_stream_;
   bool native_upscale_ = false;
   const Fh1Breadcrumbs* fh1_breadcrumbs_ = nullptr;
+  Fh1GpuProfile* fh1_gpu_profile_ = nullptr;
+  uint16_t fh1_gpu_zone_ = 0;
+  uint16_t fh1_gpu_zone_marked_ = 0;
+  bool fh1_gpu_zone_pending_ = false;
+};
+
+// FH1 (#640): the zone of the commands recorded in a scope.
+class Fh1GpuZoneScope {
+ public:
+  Fh1GpuZoneScope(DeferredCommandBuffer& commands, uint16_t zone)
+      : commands_(commands), previous_(commands.SetFh1GpuZone(zone)) {}
+  ~Fh1GpuZoneScope() { commands_.SetFh1GpuZone(previous_); }
+  Fh1GpuZoneScope(const Fh1GpuZoneScope&) = delete;
+  Fh1GpuZoneScope& operator=(const Fh1GpuZoneScope&) = delete;
+
+ private:
+  DeferredCommandBuffer& commands_;
+  uint16_t previous_;
 };
 
 }  // namespace rex::graphics::vulkan

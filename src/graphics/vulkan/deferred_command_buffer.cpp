@@ -21,6 +21,7 @@
 
 #include <cstdlib>
 #include <rex/graphics/vulkan/fh1_dlss.h>
+#include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #include <rex/math.h>
 
 namespace rex::graphics::vulkan {
@@ -40,10 +41,14 @@ void DeferredCommandBuffer::Reset() {
 
 size_t DeferredCommandBuffer::CmdHoistPoint() {
   assert_true(write_stream_ == &command_stream_);
+  // FH1 (#640): the hoisted uploads run at the hoist point, in their own zone; the zone goes on
+  // after it.
+  const uint16_t zone = SetFh1GpuZone(Fh1GpuProfile::kUpload);
   auto& args = *reinterpret_cast<ArgsHoistedCommands*>(
       WriteCommand(Command::kHoistedCommands, sizeof(ArgsHoistedCommands)));
   args.begin = hoisted_stream_.size();
   args.end = args.begin;
+  SetFh1GpuZone(zone);
   return size_t(reinterpret_cast<const uintmax_t*>(&args) - command_stream_.data());
 }
 
@@ -390,6 +395,11 @@ VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buf
         }
       } break;
 
+      case Command::kFh1Timestamp: {
+        const auto& args = *reinterpret_cast<const ArgsFh1Timestamp*>(stream);
+        args.write(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, args.pool, args.query);
+      } break;
+
       case Command::kFh1TestHang: {
         const Fh1Breadcrumbs* b = fh1_breadcrumbs_;
         if (b && b->hang_event && b->wait_events) {
@@ -498,7 +508,15 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
   }
 }
 
+void DeferredCommandBuffer::Fh1GpuZoneMark() {
+  fh1_gpu_zone_pending_ = false;
+  fh1_gpu_profile_->Mark(*this, fh1_gpu_zone_);
+}
+
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
+  if (fh1_gpu_zone_pending_ && write_stream_ == &command_stream_) {
+    Fh1GpuZoneMark();
+  }
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
   std::vector<uintmax_t>& stream = *write_stream_;

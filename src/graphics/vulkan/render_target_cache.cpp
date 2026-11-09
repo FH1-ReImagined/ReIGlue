@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -32,6 +33,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -1205,6 +1207,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
+          Fh1GpuZoneScope gpu_zone(command_buffer, Fh1GpuProfile::kResolveDirect);
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
@@ -1221,6 +1224,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           uint32_t dump_rows;
           uint32_t dump_pitch;
           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+          Fh1GpuZoneScope gpu_zone(command_buffer, Fh1GpuProfile::kResolveDump);
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
             return false;
@@ -1361,6 +1365,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                 ? resolve_info.rb_color_clear_lo |
                                       (uint64_t(resolve_info.rb_color_clear) << 32)
                                 : resolve_info.rb_color_clear;
+          Fh1GpuZoneScope gpu_zone(command_processor_.deferred_command_buffer(),
+                                   Fh1GpuProfile::kResolveClear);
           PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
                                            &clear_rectangle);
         }
@@ -5076,6 +5082,26 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 
     auto& dest_vulkan_rt = *static_cast<VulkanRenderTarget*>(dest_rt);
     RenderTargetKey dest_rt_key = dest_vulkan_rt.key();
+
+    // FH1 (#640): fh1_gpu_profile names the transfers by their source and destination.
+    std::optional<Fh1GpuZoneScope> gpu_zone;
+    if (Fh1GpuProfile* profile = command_buffer.fh1_gpu_profile()) {
+      const RenderTarget* source = current_transfers.empty() ? nullptr : current_transfers[0].source;
+      const RenderTarget* depth_source =
+          current_transfers.empty() ? nullptr : current_transfers[0].host_depth_source;
+      const uint64_t key = (uint64_t(0x7E) << 56) ^ (uint64_t(dest_rt_key.key) << 24) ^
+                           (source ? uint64_t(source->key().key) * 0x9E3779B1ull : 0) ^
+                           (depth_source ? 0x5555 : 0) ^ (current_transfers.size() << 50);
+      uint16_t zone = profile->FindZone(key);
+      if (zone == Fh1GpuProfile::kNoZone) {
+        zone = profile->AddZone(
+            key, fmt::format("~xfer {} <- {}{} ({} transfers{})", dest_rt_key.GetDebugName(),
+                             source ? source->key().GetDebugName() : std::string("none"),
+                             depth_source ? " +host depth" : "", current_transfers.size(),
+                             resolve_clear_needed ? ", clear" : ""));
+      }
+      gpu_zone.emplace(command_buffer, zone);
+    }
 
     // Late barriers in case there was cross-copying that prevented merging of
     // barriers.

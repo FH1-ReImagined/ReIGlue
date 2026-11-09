@@ -28,6 +28,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -1479,6 +1480,25 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                                bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
+  // FH1 (#640): fh1_gpu_profile, by format, size and scaling.
+  DeferredCommandBuffer& gpu_zone_commands = command_processor_.deferred_command_buffer();
+  uint16_t gpu_zone_id = Fh1GpuProfile::kTextureLoad;
+  if (Fh1GpuProfile* profile = gpu_zone_commands.fh1_gpu_profile()) {
+    const uint64_t key = (uint64_t(0x7D) << 56) ^ (uint64_t(texture_key.format) << 40) ^
+                         (uint64_t(texture_key.GetWidth()) << 20) ^ texture_key.GetHeight() ^
+                         (uint64_t(texture_key.scaled_resolve) << 52) ^
+                         (uint64_t(texture_key.mip_max_level) << 53) ^
+                         (uint64_t(load_mips) << 46) ^ (uint64_t(load_base) << 47);
+    gpu_zone_id = profile->FindZone(key);
+    if (gpu_zone_id == Fh1GpuProfile::kNoZone) {
+      gpu_zone_id = profile->AddZone(
+          key, fmt::format("~tex {} {}x{} mips {}{}{}{}", FormatInfo::Get(texture_key.format)->name,
+                           texture_key.GetWidth(), texture_key.GetHeight(),
+                           texture_key.mip_max_level + 1, texture_key.scaled_resolve ? " resolved" : "",
+                           load_base ? "" : " (mips only)", load_mips ? "" : " (base only)"));
+    }
+  }
+  Fh1GpuZoneScope gpu_zone(gpu_zone_commands, gpu_zone_id);
 
   if (load_base && !texture_key.mip_max_level && !vulkan_texture.force_load_3d_tiling() &&
       vulkan_texture.storage_view()) {

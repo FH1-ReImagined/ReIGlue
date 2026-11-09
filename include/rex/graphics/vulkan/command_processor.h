@@ -811,6 +811,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // FH1 (#551): breadcrumbs per draw, and the report of the draw the GPU was on when the device
   // was lost (fh1_device_lost_trail.h).
   void Fh1BreadcrumbsInitialize();
+  // FH1 (#640): fh1_gpu_profile's zone for the draw being recorded.
+  void Fh1SetDrawGpuZone(uint64_t pixel_shader);
   void Fh1ReportDeviceLost(const char* source);
   void Fh1WorldAoInitialize();
   void Fh1WorldAoShutdown();
