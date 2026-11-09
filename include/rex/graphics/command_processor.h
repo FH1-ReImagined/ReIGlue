@@ -151,6 +151,10 @@ class CommandProcessor {
   virtual void WriteRegister(uint32_t index, uint32_t value);
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+  // FH1 (#607, patch 0450): as WriteRegistersFromMem, with the values in host byte order (the
+  // decode/record split's recorder: the decoder has swapped them already for its shadow).
+  virtual void WriteRegistersFromHost(uint32_t start_index, const uint32_t* values,
+                                      uint32_t num_registers);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                           uint32_t num_registers);
   void WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
@@ -368,14 +372,16 @@ class CommandProcessor {
   };
   static constexpr uint32_t kDrawIndexed = 1, kDrawIndx2 = 2;
   bool ExecuteDraw(const DrawRecord& draw);
-  // A batch of records, in order, in `words`: kRecordRun start count, then count guest-endian
-  // register values; kRecordOne index value; kRecordDraw, a DrawRecord; kRecordShader type
+  // A batch of records, in order, in `words`: kRecordRun start count, then count register
+  // values (host byte order, 0450); kRecordPlainRun the same for a range of registers that are
+  // all in fh1_plain_registers_ (stored, nothing else); kRecordOne index value; kRecordDraw, a DrawRecord; kRecordShader type
   // address dwords (IM_LOAD); kRecordShaderImmediate type dwords, then the dwords (copied from
   // the ring); kRecordStore physical address, value (already in guest byte order): a word the
   // CPU waits on, stored and its waiters woken; kRecordInterrupt cpu_mask; kRecordCall index
   // into `fns`.
   enum : uint32_t {
     kRecordRun,
+    kRecordPlainRun,
     kRecordOne,
     kRecordDraw,
     kRecordShader,
@@ -417,6 +423,8 @@ class CommandProcessor {
   // of those directly).
   uint32_t DecoderRegisterValue(uint32_t index);
   uint32_t* RecordWords(uint32_t count);
+  // A kRecordRun or kRecordPlainRun header; returns where its values go.
+  uint32_t* RecordRun(uint32_t start_index, uint32_t num_registers);
   void RecordCall(std::function<void()> fn);
   void RecordStore(uint32_t address, uint32_t guest_value);
   void RecordAction();
