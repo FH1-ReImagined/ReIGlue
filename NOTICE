@@ -47,6 +47,8 @@ Pinyon Shift
   are one atomic read-modify-write (0470, lock_free_reservations) follow its
   single-reservation sections (ShiftGlue 07b2b2a, Brandon G. Neri); the
   check of each section is written for ReIGlue's code generator.
+  mfmsr reading this thread's count of locked sections instead of taking the
+  lock (0471) follows its thread-local interrupt depth (ShiftGlue b13a1b5).
 
 ShiftGlue
   https://github.com/arcanite24/shiftglue-sdk

@@ -358,23 +358,26 @@ inline PPCGuestLockStats& ppc_guest_lock_stats_() {
   } while (0)
 #endif
 
-inline std::atomic<i32>& ppc_global_lock_count_() {
-  static std::atomic<i32> count{0};
-  return count;
+// The locked interrupts-off sections this thread is in (0471). mfmsr reads it
+// without the lock: while a thread holds the global lock for a section, no
+// other thread is in one, so a count of all threads' sections read under the
+// lock (as before) said the same, only after waiting for the lock.
+inline i32& ppc_guest_interrupts_off_() {
+  static thread_local i32 depth = 0;
+  return depth;
 }
 
-#define REX_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> u64 {                                                      \
-    REX_GUEST_LOCK_STAT(mfmsr);                                        \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
+#define REX_CHECK_GLOBAL_LOCK()                         \
+  ([&]() -> u64 {                                       \
+    REX_GUEST_LOCK_STAT(mfmsr);                         \
+    return ppc_guest_interrupts_off_() ? 0 : 0x8000;    \
   }())
 
 #define REX_ENTER_GLOBAL_LOCK()                          \
   do {                                                   \
     REX_GUEST_LOCK_STAT(locked);                         \
     rex::thread::global_critical_region::mutex().lock(); \
-    ppc_global_lock_count_().fetch_add(1);               \
+    ++ppc_guest_interrupts_off_();                       \
   } while (0)
 
 // An interrupts-off section the code generator found to be one atomic
@@ -388,7 +391,7 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
 
 #define REX_LEAVE_GLOBAL_LOCK()                                                           \
   do {                                                                                    \
-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
+    auto old_depth_ = ppc_guest_interrupts_off_()--;                                      \
+    assert(old_depth_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
     rex::thread::global_critical_region::mutex().unlock();                                \
   } while (0)
