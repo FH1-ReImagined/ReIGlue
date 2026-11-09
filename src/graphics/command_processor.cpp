@@ -405,6 +405,10 @@ constexpr uint32_t kRecordSpin = 1024;
 constexpr uint64_t kRecordMaxQueued = 512;
 // A batch is published after this many draws (and other backend work) or words.
 constexpr uint32_t kRecordBatchActions = 32;
+// FH1 (#607, patch 0452): or after this many while the recorder has run everything published.
+constexpr uint32_t kRecordBatchActionsIdle = 4;
+// The physical address bits of a word the recorder stores (RecordNoteStore).
+constexpr uint32_t kRecordStoreAddressMask = 0x1FFFFFFC;
 constexpr size_t kRecordBatchWords = 32768;
 }  // namespace
 
@@ -479,7 +483,8 @@ void CommandProcessor::RecordThreadMain() {
       std::lock_guard<std::mutex> lock(record_mutex_);
       record_free_.push_back(std::move(batch));
       record_completed_.store(taken, std::memory_order_release);
-      wake = record_decoder_waiting_;
+      // FH1 (#607, patch 0452): only once the batch the decoder waits for is done.
+      wake = record_decoder_waiting_ && taken >= record_wake_at_;
     }
     if (wake) {
       record_done_cond_.notify_one();
@@ -566,7 +571,13 @@ uint32_t* CommandProcessor::RecordWords(uint32_t count) {
 }
 
 void CommandProcessor::RecordAction() {
-  if (++record_batch_->actions >= kRecordBatchActions) {
+  // FH1 (#607, patch 0452): a recorder with nothing to do gets the work sooner, in a smaller
+  // batch (after a wait, at the start of the game's next commands), rather than idling until
+  // the decoder has decoded 32 draws.
+  const uint32_t actions = ++record_batch_->actions;
+  if (actions >= kRecordBatchActions ||
+      (actions >= kRecordBatchActionsIdle &&
+       record_completed_.load(std::memory_order_relaxed) == record_published_)) {
     PublishRecordBatch();
   }
 }
@@ -656,6 +667,15 @@ void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
     return;
   }
   ++record_registers_out_;
+  if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
+    // FH1 (#607, patch 0452): the recorder's WriteRegister stores it to memory (Direct3D's
+    // fences, which WAIT_REG_MEM waits for): where, for RecordWaitStore.
+    const uint32_t* shadow = decode_register_file_->values;
+    const uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
+    if ((1 << scratch_reg) & shadow[XE_GPU_REG_SCRATCH_UMSK]) {
+      RecordNoteStore(shadow[XE_GPU_REG_SCRATCH_ADDR] + scratch_reg * 4);
+    }
+  }
   if (index < RegisterFile::kRegisterCount) {
     uint32_t shadow_value = value;
     if (index == XE_GPU_REG_COHER_STATUS_HOST) {
@@ -748,6 +768,17 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
       start_index + num_registers > XE_GPU_REG_COHER_STATUS_HOST) {
     decode_register_file_->values[XE_GPU_REG_COHER_STATUS_HOST] |= UINT32_C(0x80000000);
   }
+  if (start_index <= XE_GPU_REG_SCRATCH_REG7 &&
+      start_index + num_registers > XE_GPU_REG_SCRATCH_REG0) {
+    const uint32_t* shadow = decode_register_file_->values;
+    for (uint32_t index = std::max<uint32_t>(start_index, XE_GPU_REG_SCRATCH_REG0);
+         index <= XE_GPU_REG_SCRATCH_REG7 && index < start_index + num_registers; ++index) {
+      const uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
+      if ((1 << scratch_reg) & shadow[XE_GPU_REG_SCRATCH_UMSK]) {
+        RecordNoteStore(shadow[XE_GPU_REG_SCRATCH_ADDR] + scratch_reg * 4);
+      }
+    }
+  }
   if (record_batch_->words.size() >= kRecordBatchWords) {
     PublishRecordBatch();
   }
@@ -811,6 +842,7 @@ void CommandProcessor::RecordCall(std::function<void()> fn) {
 }
 
 void CommandProcessor::RecordStore(uint32_t address, uint32_t guest_value) {
+  RecordNoteStore(address);
   uint32_t* record = RecordWords(3);
   record[0] = kRecordStore;
   record[1] = address;
@@ -828,6 +860,7 @@ void CommandProcessor::PublishRecordBatch() {
     const uint64_t target = record_published_ - kRecordMaxQueued / 2;
     std::unique_lock<std::mutex> lock(record_mutex_);
     record_decoder_waiting_ = true;
+    record_wake_at_ = target;
     record_done_cond_.wait(lock, [&]() {
       return record_completed_.load(std::memory_order_acquire) >= target;
     });
@@ -871,6 +904,7 @@ void CommandProcessor::RecordSync(RecordSyncReason reason) {
   }
   std::unique_lock<std::mutex> lock(record_mutex_);
   record_decoder_waiting_ = true;
+  record_wake_at_ = target;
   record_done_cond_.wait(
       lock, [&]() { return record_completed_.load(std::memory_order_acquire) >= target; });
   record_decoder_waiting_ = false;
@@ -894,10 +928,77 @@ void CommandProcessor::RecordWaitProgress() {
   }
   std::unique_lock<std::mutex> lock(record_mutex_);
   record_decoder_waiting_ = true;
+  record_wake_at_ = completed + 1;
   record_done_cond_.wait_for(lock, std::chrono::microseconds(100), [&]() {
     return record_completed_.load(std::memory_order_acquire) != completed;
   });
   record_decoder_waiting_ = false;
+}
+
+void CommandProcessor::RecordNoteStore(uint32_t address) {
+  // Physical addresses, as TranslatePhysical takes them. The batch being recorded is published
+  // as number record_published_ + 1.
+  address &= kRecordStoreAddressMask;
+  for (RecordedStore& store : record_stores_) {
+    if (store.address == address) {
+      store.batch = record_published_ + 1;
+      return;
+    }
+  }
+  RecordedStore& slot = record_stores_[record_store_next_++ % kRecordStoreSlots];
+  slot.address = address;
+  slot.batch = record_published_ + 1;
+}
+
+bool CommandProcessor::RecordWaitStore(uint32_t address) {
+  address &= kRecordStoreAddressMask;
+  uint64_t target = 0;
+  for (const RecordedStore& store : record_stores_) {
+    if (store.address == address) {
+      target = store.batch;
+      break;
+    }
+  }
+  if (target <= record_completed_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  if (wait_progress_first_) {
+    ++record_syncs_[kSyncWaitMemory];
+  }
+  PublishRecordBatch();
+  target = std::min(target, record_published_);
+  // Asleep until the recorder runs the batch with the store (woken once, not after each batch
+  // before it), polling only while it runs that batch; at most 100 us at a time, as the CPU may
+  // write the word too.
+  uint64_t completed = record_completed_.load(std::memory_order_acquire);
+  if (completed + 1 < target) {
+    std::unique_lock<std::mutex> lock(record_mutex_);
+    record_decoder_waiting_ = true;
+    record_wake_at_ = target - 1;
+    record_done_cond_.wait_for(lock, std::chrono::microseconds(100), [&]() {
+      return record_completed_.load(std::memory_order_acquire) + 1 >= target;
+    });
+    record_decoder_waiting_ = false;
+    completed = record_completed_.load(std::memory_order_acquire);
+    if (completed + 1 < target) {
+      return true;
+    }
+  }
+  for (uint32_t i = 0;
+       i < kRecordSpin && record_completed_.load(std::memory_order_acquire) < target; ++i) {
+    SpinPause();
+  }
+  if (record_completed_.load(std::memory_order_acquire) >= target) {
+    return true;
+  }
+  std::unique_lock<std::mutex> lock(record_mutex_);
+  record_decoder_waiting_ = true;
+  record_wake_at_ = target;
+  record_done_cond_.wait_for(lock, std::chrono::microseconds(100), [&]() {
+    return record_completed_.load(std::memory_order_acquire) >= target;
+  });
+  record_decoder_waiting_ = false;
+  return true;
 }
 
 void CommandProcessor::LogRecordSplit() {
@@ -2137,7 +2238,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         // #474: the word may be one the recorder is still to write (a fence, the scratch
         // write-back), and the sleep below lasts until a vblank: while the recorder has work,
         // poll again each time it finishes a batch (or after 100 us, the game may write it).
-        RecordWaitProgress();
+        // FH1 (#607, patch 0452): a word the recorder is still to store (a recorded fence or
+        // scratch write-back), as the waits in a frame are: once its batch is done.
+        if (!RecordWaitStore(poll_reg_addr & ~uint32_t(0x3))) {
+          RecordWaitProgress();
+        }
         continue;
       }
       // Wait.
