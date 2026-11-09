@@ -12,6 +12,7 @@
 #include "ppc/disasm.h"
 #include "builders/builder_context.h"
 #include "builders.h"
+#include "reservation_sections.h"
 
 #include <algorithm>
 #include <cassert>
@@ -344,6 +345,27 @@ void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... arg
   fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
 }
 
+// A bctr preceded by mtctr (with only nops between, at most 3 back): the switch
+// pattern whose jump table emission detects late.
+bool IsSwitchPatternBctr(const uint32_t* data) {
+  constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
+  constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
+  constexpr uint32_t NOP = 0x60000000;
+  for (int i = 1; i <= 3; i++) {
+    uint32_t prev_insn = load_and_swap<uint32_t>(data - i);
+    if ((prev_insn & MTCTR_MASK) == MTCTR_OPCODE) {
+      for (int j = 1; j < i; j++) {
+        if (load_and_swap<uint32_t>(data - j) != NOP)
+          return false;
+      }
+      return true;
+    }
+    if (prev_insn != NOP)
+      return false;
+  }
+  return false;
+}
+
 }  // namespace
 
 std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
@@ -482,6 +504,55 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
   emit_println(out, "\tREX_FUNC_PROLOGUE();");
 
+  // --- Lock-free reservation sections (0470): found before emission, since
+  // a section's closing mtmsrd must know how it was opened ---
+  ReservationSections reservations;
+  if (!ctx.config.skipMsr && ctx.config.lockFreeReservations) {
+    ReservationCode code;
+    bool hasSection = false;
+    for (const auto& block : blocks()) {
+      auto* blockData = reinterpret_cast<const uint32_t*>(ctx.binary.translate(block.base));
+      if (!blockData)
+        continue;
+      for (uint32_t addr = block.base; addr < block.end(); addr += 4) {
+        const uint32_t* insnData = blockData + (addr - block.base) / 4;
+        const uint32_t word = load_and_swap<uint32_t>(insnData);
+        code.words.emplace(addr, word);
+        // mtmsrd r13
+        hasSection |= (word & 0xFFE007FE) == (0x7C000164 | 13u << 21);
+        if (ctx.config.midAsmHooks.contains(addr))
+          code.hookSites.insert(addr);
+        // bctr (not bctrl) with the switch pattern and no table yet: emission
+        // may still find one, whose targets are unknown here.
+        if (word == 0x4E800420 && !ctx.config.switchTables.contains(addr) &&
+            std::none_of(jumpTables().begin(), jumpTables().end(),
+                         [addr](const JumpTable& jt) { return jt.bctrAddress == addr; }) &&
+            IsSwitchPatternBctr(insnData)) {
+          code.unknownIndirectTargets = true;
+        }
+      }
+    }
+    if (hasSection) {
+      for (const auto& [site, table] : ctx.config.switchTables) {
+        if (containsAddress(site))
+          code.indirectTargets.insert(table.targets.begin(), table.targets.end());
+      }
+      for (const auto& jt : jumpTables())
+        code.indirectTargets.insert(jt.targets.begin(), jt.targets.end());
+      for (const auto& [site, hook] : ctx.config.midAsmHooks) {
+        for (uint32_t target :
+             {hook.jumpAddress, hook.jumpAddressOnTrue, hook.jumpAddressOnFalse}) {
+          if (target && containsAddress(target))
+            code.indirectTargets.insert(target);
+        }
+      }
+      reservations = FindReservationSections(code);
+      auto& totals = ReservationSectionCounts();
+      totals.sections += reservations.sections;
+      totals.lockFree += reservations.enters.size();
+    }
+  }
+
   // --- Second pass: emit instruction code ---
   const JumpTable* activeJt = nullptr;
   bool allRecompiled = true;
@@ -535,27 +606,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       } else {
         // Late jump table detection for bctr
         if (insn.opcode->id == PPC_INST_BCTR && !activeJt) {
-          bool is_switch_pattern = false;
-          constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
-          constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
-          constexpr uint32_t NOP = 0x60000000;
-
-          for (int i = 1; i <= 3 && !is_switch_pattern; i++) {
-            uint32_t prev_insn = load_and_swap<uint32_t>(data - i);
-            if ((prev_insn & MTCTR_MASK) == MTCTR_OPCODE) {
-              is_switch_pattern = true;
-              for (int j = 1; j < i; j++) {
-                if (load_and_swap<uint32_t>(data - j) != NOP) {
-                  is_switch_pattern = false;
-                  break;
-                }
-              }
-            } else if (prev_insn != NOP) {
-              break;
-            }
-          }
-
-          if (is_switch_pattern) {
+          if (IsSwitchPatternBctr(data)) {
             FunctionScanner scanner(ctx.binary);
             auto jt_opt = scanner.detect_jump_table(blockBase);
             if (jt_opt.has_value()) {
@@ -580,8 +631,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
         // Dispatch instruction to builder
         int id = insn.opcode->id;
-        BuilderContext builderCtx{body,           ctx,      *this,   insn, blockBase, data,
-                                  localVariables, csrState, activeJt};
+        BuilderContext builderCtx{body,           ctx,      *this,    insn,         blockBase, data,
+                                  localVariables, csrState, activeJt, &reservations};
 
         if (hasHookBefore) {
           builderCtx.emit_mid_asm_hook();

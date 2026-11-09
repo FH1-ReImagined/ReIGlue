@@ -93,6 +93,9 @@ struct RecompilerConfig {
   bool xerAsLocalVariable = false;
   bool reservedRegisterAsLocalVariable = false;
   bool skipMsr = false;
+  /// An interrupts-off section that is one atomic read-modify-write runs
+  /// without the global lock (0470; `lock_free_reservations`).
+  bool lockFreeReservations = true;
   bool crRegistersAsLocalVariables = false;
   bool nonArgumentRegistersAsLocalVariables = false;
   bool nonVolatileRegistersAsLocalVariables = false;

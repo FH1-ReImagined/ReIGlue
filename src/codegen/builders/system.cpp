@@ -333,9 +333,17 @@ bool build_mtmsrd(BuilderContext& ctx) {
     // Global lock mechanism:
     // R13 = enter lock (disable interrupts)
     // Other = leave lock (enable interrupts)
+    // A section that is one atomic read-modify-write (reservation_sections.h)
+    // takes no lock: its store-conditional is a host compare-exchange.
     uint32_t src_reg = ctx.insn.operands[0];
+    const ReservationSections* sections = ctx.reservations;
     if (src_reg == 13) {
-      ctx.println("\tREX_ENTER_GLOBAL_LOCK();");
+      if (sections && sections->isLockFreeEnter(ctx.base))
+        ctx.println("\tREX_ENTER_RESERVATION_SECTION();");
+      else
+        ctx.println("\tREX_ENTER_GLOBAL_LOCK();");
+    } else if (sections && sections->isLockFreeLeave(ctx.base)) {
+      ctx.println("\tREX_LEAVE_RESERVATION_SECTION();");
     } else {
       ctx.println("\tREX_LEAVE_GLOBAL_LOCK();");
     }
