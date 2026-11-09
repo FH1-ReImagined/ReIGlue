@@ -13,6 +13,7 @@
 #include "fh1_frame_cost.h"
 #include "fh1_vr_stereo.h"
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -41,6 +42,10 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+
+#if REX_ARCH_AMD64
+#include <tmmintrin.h>
+#endif
 
 #if REX_PLATFORM_LINUX
 #include <linux/futex.h>
@@ -554,7 +559,7 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
 }
 
 uint32_t* CommandProcessor::RecordWords(uint32_t count) {
-  std::vector<uint32_t>& words = record_batch_->words;
+  auto& words = record_batch_->words;
   const size_t offset = words.size();
   words.resize(offset + count);
   return words.data() + offset;
@@ -578,6 +583,33 @@ inline bool ElidableOne(uint32_t index) {
 // Unchanged registers between two changed ones that are recorded with them rather than starting
 // a new run (a run costs more than storing a few values again).
 constexpr uint32_t kElideGap = 8;
+// FH1 (#607, patch 0451): bit i set if shadow[i] (host byte order) differs from guest[i] (guest
+// byte order), for count <= 64.
+inline uint64_t ChangedRegisters(const uint32_t* shadow, const uint32_t* guest, uint32_t count) {
+  uint64_t changed = 0;
+  uint32_t i = 0;
+#if REX_ARCH_AMD64
+  const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+  for (; i + 8 <= count; i += 8) {
+    const __m128i g0 =
+        _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(guest + i)), swap);
+    const __m128i g1 =
+        _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(guest + i + 4)), swap);
+    const __m128i s0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(shadow + i));
+    const __m128i s1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(shadow + i + 4));
+    const uint32_t same = uint32_t(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(g0, s0)))) |
+                          (uint32_t(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(g1, s1))))
+                           << 4);
+    changed |= uint64_t(~same & 0xFF) << i;
+  }
+#endif
+  for (; i < count; ++i) {
+    if (shadow[i] != memory::load_and_swap<uint32_t>(guest + i)) {
+      changed |= uint64_t(1) << i;
+    }
+  }
+  return changed;
+}
 // FH1 (#607, patch 0450): whether every register of [first, first + count) has its bit set.
 inline bool AllBitsSet(const uint64_t* bits, uint32_t first, uint32_t count) {
   const uint32_t last = first + count - 1;
@@ -631,6 +663,16 @@ void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
       shadow_value |= UINT32_C(0x80000000);
     }
     decode_register_file_->values[index] = shadow_value;
+    if (fh1_plain_registers_ && ((fh1_plain_registers_[index >> 6] >> (index & 63)) & 1)) {
+      // FH1 (#607, patch 0450): the draw initiators and index buffer registers among them,
+      // stored on the recorder without the backend's WriteRegister.
+      uint32_t* record = RecordWords(4);
+      record[0] = kRecordPlainRun;
+      record[1] = index;
+      record[2] = 1;
+      record[3] = value;
+      return;
+    }
   }
   uint32_t* record = RecordWords(3);
   record[0] = kRecordOne;
@@ -659,31 +701,38 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
       !(start_index <= XE_GPU_REG_VGT_DRAW_INITIATOR &&
         start_index + num_registers > XE_GPU_REG_VGT_EVENT_INITIATOR)) {
     // After Pinyon Shift (ShiftGlue 9bf779f): only the parts of the range that change a value.
+    // FH1 (#607, patch 0451): which values change is found 64 registers at a time (a bit
+    // each, four compared per step), then the runs of changes, with gaps of up to kElideGap
+    // unchanged registers inside a run, are read from the bits. A run is written to the
+    // shadow when it ends, behind the comparisons (which are against the old values).
     uint32_t* shadow = decode_register_file_->values + start_index;
-    uint32_t i = 0;
-    while (i < num_registers) {
-      while (i < num_registers && shadow[i] == memory::load_and_swap<uint32_t>(base + i)) {
-        ++i;
-      }
-      if (i >= num_registers) {
-        break;
-      }
-      const uint32_t first = i;
-      uint32_t last = i;
-      for (uint32_t j = i + 1, gap = 0; j < num_registers; ++j) {
-        if (shadow[j] != memory::load_and_swap<uint32_t>(base + j)) {
-          last = j;
-          gap = 0;
-        } else if (++gap > kElideGap) {
-          break;
-        }
-      }
+    uint32_t run_first = UINT32_MAX, run_last = 0;
+    auto record_run = [&](uint32_t first, uint32_t last) {
       const uint32_t run = last - first + 1;
       uint32_t* values = RecordRun(start_index + first, run);
-      memory::copy_and_swap(values, base + first, run);
+      for (uint32_t k = 0; k < run; ++k) {
+        values[k] = memory::load_and_swap<uint32_t>(base + first + k);
+      }
       std::memcpy(shadow + first, values, sizeof(uint32_t) * run);
       record_registers_out_ += run;
-      i = last + 1;
+    };
+    for (uint32_t block = 0; block < num_registers; block += 64) {
+      uint64_t changed = ChangedRegisters(shadow + block, base + block,
+                                          std::min<uint32_t>(64, num_registers - block));
+      while (changed) {
+        const uint32_t i = block + uint32_t(std::countr_zero(changed));
+        changed &= changed - 1;
+        if (run_first == UINT32_MAX) {
+          run_first = i;
+        } else if (i - run_last - 1 > kElideGap) {
+          record_run(run_first, run_last);
+          run_first = i;
+        }
+        run_last = i;
+      }
+    }
+    if (run_first != UINT32_MAX) {
+      record_run(run_first, run_last);
     }
     if (record_batch_->words.size() >= kRecordBatchWords) {
       PublishRecordBatch();
