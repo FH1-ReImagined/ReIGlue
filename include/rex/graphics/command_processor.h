@@ -390,8 +390,28 @@ class CommandProcessor {
     kRecordInterrupt,
     kRecordCall,
   };
+  // FH1 (#607, patch 0451): a vector that grows without zeroing the new words (RecordWords
+  // writes every one of them right after).
+  template <typename T>
+  struct UninitializedAllocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+      using other = UninitializedAllocator<U>;
+    };
+    UninitializedAllocator() = default;
+    template <typename U>
+    UninitializedAllocator(const UninitializedAllocator<U>&) noexcept {}
+    template <typename U>
+    void construct(U* p) noexcept {
+      ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+      ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+  };
   struct RecordBatch {
-    std::vector<uint32_t> words;
+    std::vector<uint32_t, UninitializedAllocator<uint32_t>> words;
     std::vector<std::function<void()>> fns;
     uint32_t actions = 0;  // draws and other backend work, for when to publish
   };
