@@ -456,6 +456,20 @@ class CommandProcessor {
   void RecordSync(RecordSyncReason reason);
   // WAIT_REG_MEM for memory: returns once the recorder has finished a batch, or after 100 us.
   void RecordWaitProgress();
+  // FH1 (#607, patch 0452): the memory words the recorder is still to store (EVENT_WRITE_SHD,
+  // scratch write-back) and the batch each is in. RecordWaitStore: for WAIT_REG_MEM, false if
+  // the word is not one of them (or stored already); otherwise waits for that batch (at most
+  // 100 us at a time) and returns true.
+  void RecordNoteStore(uint32_t address);
+  bool RecordWaitStore(uint32_t address);
+  struct RecordedStore {
+    uint32_t address = UINT32_MAX;
+    uint64_t batch = 0;
+  };
+  static constexpr uint32_t kRecordStoreSlots = 8;
+  RecordedStore record_stores_[kRecordStoreSlots];
+  uint32_t record_store_next_ = 0;
+  uint64_t record_wake_at_ = 0;  // record_mutex_: the completed batch that wakes the decoder
   bool wait_progress_first_ = false;
   void LogRecordSplit();
 
