@@ -81,6 +81,7 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/graphics/vulkan/binding_reuse.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/types.h>
@@ -241,6 +242,23 @@ REXCVAR_DEFINE_BOOL(gpu_shader_translation_memo, true, "GPU/Vulkan",
                     "Each shader answers a draw that needs the same translation (modification) "
                     "as the last draw that used it without looking its translations up (read at "
                     "each frame start)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_dynamic_constants, true, "GPU/Vulkan",
+                    "Bind the guest draw constants as dynamic uniform buffers: a draw whose "
+                    "constants changed selects its slices with offsets at bind time, reusing a "
+                    "descriptor set of the frame instead of writing a new one (at startup)");
+
+REXCVAR_DEFINE_BOOL(vulkan_texture_descriptor_reuse, true, "GPU/Vulkan",
+                    "A draw whose texture and sampler descriptors are the same as an earlier "
+                    "draw's of the frame uses that draw's descriptor set instead of writing a new "
+                    "one (read at each frame start)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_binding_request_reuse, true, "GPU/Vulkan",
+                    "Within a submission, a draw whose sampled fetch constants and textures are "
+                    "unchanged keeps the previous draw's samplers and skips its texture request "
+                    "(read at each frame start)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(gpu_shader_translation_memo_verify, false, "GPU/Vulkan",
@@ -895,6 +913,10 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
     SpirvShaderTranslator::kConstantBufferCount* kLinkedTypeDescriptorPoolSetCount};
 
+const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeDynamicUniformBuffer = {
+    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+    SpirvShaderTranslator::kConstantBufferCount * kLinkedTypeDescriptorPoolSetCount};
+
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
 
@@ -915,6 +937,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
           &kDescriptorPoolSizeUniformBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
+      transient_descriptor_allocator_dynamic_uniform_buffer_(
+          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+              ->vulkan_device(),
+          &kDescriptorPoolSizeDynamicUniformBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_storage_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -1664,13 +1690,26 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to create an empty Vulkan descriptor set layout");
     return false;
   }
+  // Vulkan guarantees at least eight dynamic uniform descriptors per set;
+  // the guest layout requires five. No optional device feature is needed.
+  static_assert(SpirvShaderTranslator::kConstantBufferCount <= 8);
+  // FORZA_VK_DYNAMIC_CONSTANTS=0/1 overrides the cvar (A/B runs without a config change).
+  const char* dynamic_env = std::getenv("FORZA_VK_DYNAMIC_CONSTANTS");
+  dynamic_uniform_constants_ = dynamic_env && *dynamic_env ? std::strcmp(dynamic_env, "1") == 0
+                                                           : REXCVAR_GET(vulkan_dynamic_constants);
+  const char* stats_env = std::getenv("FORZA_VK_BINDING_STATS");
+  binding_stats_ = stats_env && std::strcmp(stats_env, "1") == 0;
+  REXLOG_INFO("VKBIND: dynamic_constants={} stats={}", dynamic_uniform_constants_, binding_stats_);
+
   // Guest draw constants.
   VkDescriptorSetLayoutBinding
       descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferCount] = {};
   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
     VkDescriptorSetLayoutBinding& constants_binding = descriptor_set_layout_bindings_constants[i];
     constants_binding.binding = i;
-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constants_binding.descriptorType = dynamic_uniform_constants_
+                                           ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                                           : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     constants_binding.descriptorCount = 1;
     constants_binding.pImmutableSamplers = nullptr;
   }
@@ -7146,19 +7185,25 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // different for some reason (like a race condition with the guest in index
     // buffer processing in the primitive processor resulting in different host
     // vertex shader types), the bindings will stay the same.
-    // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
-    // submission.
+    const uint32_t sampler_fetch_writes = texture_cache_->ConsumeSamplerFetchWrites();
+    for (auto& state : sampler_reuse_) state.dirty |= sampler_fetch_writes;
     uint32_t samplers_overflowed_count = 0;
     for (uint32_t j = 0; j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
           j ? current_samplers_pixel_ : current_samplers_vertex_;
-      if (!i) {
-        shader_samplers.clear();
-      }
       const VulkanShader* shader = j ? pixel_shader : vertex_shader;
-      if (!shader) {
-        continue;
-      }
+      auto& reuse_state = sampler_reuse_[j];
+      const uint32_t sampled_mask = shader ? shader->GetUsedTextureMaskAfterTranslation() : 0;
+      const int32_t anisotropy = REXCVAR_GET(anisotropic_override);
+      const bool reuse_samplers = BindingReuseEnabled() && !i &&
+          reuse_state.Matches(shader, texture_cache_.get(), GetCurrentSubmission(),
+                              anisotropy, sampled_mask);
+      if (BindingReuseStats()) { ++binding_sampler_calls_; binding_sampler_hits_ += reuse_samplers; }
+      if (reuse_samplers && !BindingReuseVerify()) continue;
+      const auto previous_samplers = reuse_samplers ? shader_samplers :
+          std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>{};
+      if (!i) shader_samplers.clear();
+      if (!shader) { reuse_state = {}; continue; }
       const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
           shader->GetSamplerBindingsAfterTranslation();
       if (!i) {
@@ -7191,6 +7236,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           ++samplers_overflowed_count;
         }
       }
+      if (reuse_samplers) {
+        ++binding_sampler_verified_;
+        bool same = previous_samplers.size() == shader_samplers.size();
+        for (size_t k = 0; same && k < shader_samplers.size(); ++k) {
+          same = previous_samplers[k].first.value == shader_samplers[k].first.value &&
+                 previous_samplers[k].second == shader_samplers[k].second;
+        }
+        if (!same) { ++binding_mismatches_; REXGPU_ERROR("VKBINDING: sampler mismatch"); }
+      }
+      reuse_state.shader = shader; reuse_state.cache = texture_cache_.get();
+      reuse_state.submission = samplers_overflowed_count ||
+          anisotropy != REXCVAR_GET(anisotropic_override) ? UINT64_MAX : GetCurrentSubmission();
+      reuse_state.anisotropy = anisotropy; reuse_state.dirty = 0;
     }
     if (!samplers_overflowed_count) {
       break;
@@ -7381,6 +7439,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
       }
+      current_graphics_descriptor_sets_bound_up_to_date_ &=
+          BindingCompatiblePrefixMask(descriptor_sets_kept);
     } else {
       // No or unknown pipeline layout previously bound - all bindings are in an
       // indeterminate state.
@@ -9447,6 +9507,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // FH1 (#45, patch 0362).
     Shader::fh1_translation_memo_enabled = REXCVAR_GET(gpu_shader_translation_memo);
     Shader::fh1_translation_memo_verify = REXCVAR_GET(gpu_shader_translation_memo_verify);
+    // FH1 (#192, patches 0443/0444).
+    binding_request_reuse_enabled = BindingReuseEnvOverride(REXCVAR_GET(vulkan_binding_request_reuse));
+    fh1_texture_set_reuse_ = Fh1TextureSetReuseEnvOverride(REXCVAR_GET(vulkan_texture_descriptor_reuse));
     if (fh1_other_render_targets_) Fh1SelectNativeHud(false);
     if (fh1_dlss_) fh1_dlss_->BeginFrame(frame_current_);
     fh1_scene_composited_ = false;
@@ -9522,6 +9585,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
     primitive_processor_->BeginFrame();
 
+    if (frame_current_ == 1) {
+      REXLOG_INFO("VKBINDING: reuse={} verify={} texture_sets={}", BindingReuseEnabled(),
+                  BindingReuseVerify(), fh1_texture_set_reuse_);
+    }
+    if (BindingReuseStats() && frame_current_ % 300 == 0) {
+      REXLOG_INFO("VKBINDING: samplers={} sampler_hits={} verified={} mismatches={}",
+          binding_sampler_calls_, binding_sampler_hits_, binding_sampler_verified_, binding_mismatches_);
+      binding_sampler_calls_ = binding_sampler_hits_ = binding_sampler_verified_ = binding_mismatches_ = 0;
+    }
     texture_cache_->BeginFrame();
     if (fh1_other_textures_) fh1_other_textures_->BeginFrame();
   }
@@ -9895,6 +9967,16 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
   }
 
+  if (is_closing_frame && binding_stats_ && frame_current_ % 300 == 0) {
+    REXLOG_INFO("VKBIND: draws={} constant_sets={} cache_hits={} dynamic={} texture_sets={} "
+                "texture_set_hits={} kept_bound={} memo_clears={}",
+                binding_draws_, binding_constant_sets_, binding_constant_hits_,
+                dynamic_uniform_constants_, binding_texture_sets_, binding_texture_set_hits_,
+                binding_texture_set_kept_, binding_texture_set_clears_);
+    binding_draws_ = binding_constant_sets_ = binding_constant_hits_ = 0;
+    binding_texture_sets_ = binding_texture_set_hits_ = 0;
+    binding_texture_set_kept_ = binding_texture_set_clears_ = 0;
+  }
   if (is_closing_frame) Fh1ApplyGraphicsRequest();
   return true;
 }
@@ -9914,6 +9996,11 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   transient_descriptor_allocator_storage_image_.Reset();
   transient_descriptor_allocator_storage_buffer_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
+  transient_descriptor_allocator_dynamic_uniform_buffer_.Reset();
+  dynamic_constants_sets_.clear();
+  dynamic_constants_frame_ = UINT64_MAX;
+  fh1_texture_set_memo_.Clear();
+  fh1_texture_set_memo_frame_ = UINT64_MAX;
 }
 
 void VulkanCommandProcessor::SplitPendingBarrier() {
@@ -10838,6 +10925,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  if (binding_stats_) ++binding_draws_;
+
   const RegisterFile& regs = *register_file_;
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -11032,10 +11121,19 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // The texture sets are made again for every draw; with vulkan_texture_descriptor_reuse
+  // (patch 0444) one with the same contents as a set written earlier in the frame is used
+  // again, and stays bound if it is the one bound now.
+  constexpr uint32_t kTextureSetBits =
+      (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+      (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+  const uint32_t texture_sets_bound_before = current_graphics_descriptor_sets_bound_up_to_date_ &
+                                             current_graphics_descriptor_set_values_up_to_date_ &
+                                             kTextureSetBits;
+  const VkDescriptorSet texture_sets_before[2] = {
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex],
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel]};
+  current_graphics_descriptor_set_values_up_to_date_ &= ~kTextureSetBits;
 
   // Make sure new descriptor sets are bound to the command buffer.
 
@@ -11097,6 +11195,69 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
 
+  // Patch 0444: a texture set of this frame with the same contents.
+  uint64_t texture_set_hashes[2] = {};
+  size_t texture_set_word_offsets[2] = {};
+  uint32_t texture_set_word_counts[2] = {};
+  if (fh1_texture_set_reuse_ && (write_vertex_textures || write_pixel_textures)) {
+    const uint64_t handles_destroyed =
+        fh1_descriptor_handles_destroyed.load(std::memory_order_relaxed);
+    if (fh1_texture_set_memo_frame_ != frame_current_ ||
+        fh1_texture_set_memo_handles_ != handles_destroyed) {
+      if (fh1_texture_set_memo_.size() && fh1_texture_set_memo_frame_ == frame_current_) {
+        ++binding_texture_set_clears_;
+      }
+      fh1_texture_set_memo_.Clear();
+      fh1_texture_set_memo_frame_ = frame_current_;
+      fh1_texture_set_memo_handles_ = handles_destroyed;
+    }
+    fh1_texture_set_words_.clear();
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+      bool& write = stage ? write_pixel_textures : write_vertex_textures;
+      if (!write) continue;
+      const uint32_t texture_count = stage ? texture_count_pixel : texture_count_vertex;
+      const uint32_t sampler_count = stage ? sampler_count_pixel : sampler_count_vertex;
+      const size_t texture_offset =
+          stage ? pixel_texture_image_info_offset : vertex_texture_image_info_offset;
+      const size_t sampler_offset =
+          stage ? pixel_sampler_image_info_offset : vertex_sampler_image_info_offset;
+      // The layout (as WriteTransientTextureBindings keys it), then the handles in binding
+      // order; an image's layout follows from whether it has a view.
+      const size_t offset = fh1_texture_set_words_.size();
+      fh1_texture_set_words_.push_back(uint64_t(texture_count) | (uint64_t(sampler_count) << 16) |
+                                       (uint64_t(stage == 0) << 32));
+      for (uint32_t i = 0; i < texture_count; ++i) {
+        fh1_texture_set_words_.push_back(
+            uint64_t(descriptor_write_image_info_[texture_offset + i].imageView));
+      }
+      for (uint32_t i = 0; i < sampler_count; ++i) {
+        fh1_texture_set_words_.push_back(
+            uint64_t(descriptor_write_image_info_[sampler_offset + i].sampler));
+      }
+      const uint32_t count = uint32_t(fh1_texture_set_words_.size() - offset);
+      const uint64_t hash =
+          fh1_descriptor_memo::HashWords(fh1_texture_set_words_.data() + offset, count);
+      texture_set_hashes[stage] = hash;
+      texture_set_word_offsets[stage] = offset;
+      texture_set_word_counts[stage] = count;
+      if (binding_stats_) ++binding_texture_sets_;
+      const VkDescriptorSet found =
+          fh1_texture_set_memo_.Find(fh1_texture_set_words_.data() + offset, count, hash);
+      if (found == VK_NULL_HANDLE) continue;
+      const uint32_t set_index = stage ? SpirvShaderTranslator::kDescriptorSetTexturesPixel
+                                       : SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+      const uint32_t set_bit = UINT32_C(1) << set_index;
+      current_graphics_descriptor_sets_[set_index] = found;
+      current_graphics_descriptor_set_values_up_to_date_ |= set_bit;
+      if ((texture_sets_bound_before & set_bit) && texture_sets_before[stage] == found) {
+        current_graphics_descriptor_sets_bound_up_to_date_ |= set_bit;
+        if (binding_stats_) ++binding_texture_set_kept_;
+      }
+      if (binding_stats_) ++binding_texture_set_hits_;
+      write = false;
+    }
+  }
+
   // Write the new descriptor sets.
 
   // Consecutive bindings updated via a single VkWriteDescriptorSet must have
@@ -11108,38 +11269,74 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   uint32_t write_descriptor_set_bits = 0;
   assert_not_zero(current_graphics_descriptor_set_values_up_to_date_ &
                   (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram));
-  // Constant buffers.
-  if (!(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants))) {
-    VkDescriptorSet constants_descriptor_set;
-    if (!constants_transient_descriptors_free_.empty()) {
-      constants_descriptor_set = constants_transient_descriptors_free_.back();
-      constants_transient_descriptors_free_.pop_back();
-    } else {
-      VkDescriptorPoolSize constants_descriptor_count;
-      constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-      constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
-      constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_.Allocate(
-          descriptor_set_layout_constants_, &constants_descriptor_count, 1);
-      if (constants_descriptor_set == VK_NULL_HANDLE) {
+  // Constant buffers. Descriptor offsets stay zero in dynamic mode; the
+  // immutable per-draw slices are selected by copied command-buffer offsets.
+  uint32_t dynamic_offsets[SpirvShaderTranslator::kConstantBufferCount] = {};
+  std::array<VkDescriptorBufferInfo, SpirvShaderTranslator::kConstantBufferCount>
+      dynamic_infos;
+  DynamicConstantsKey dynamic_key;
+  if (dynamic_uniform_constants_) {
+    if (dynamic_constants_frame_ != frame_current_) {
+      dynamic_constants_sets_.clear();
+      dynamic_constants_frame_ = frame_current_;
+    }
+    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+      const VkDescriptorBufferInfo& info = current_constant_buffer_infos_[i];
+      if (info.offset > UINT32_MAX) {
+        REXLOG_ERROR("Dynamic uniform offset exceeds the Vulkan 32-bit limit");
         return false;
       }
+      dynamic_offsets[i] = uint32_t(info.offset);
+      dynamic_infos[i] = info;
+      dynamic_infos[i].offset = 0;
+      dynamic_key[i] = {info.buffer, info.range};
     }
-    constants_transient_descriptors_used_.emplace_back(frame_current_, constants_descriptor_set);
-    // Consecutive bindings updated via a single VkWriteDescriptorSet must have
-    // identical stage flags, but for the constants they vary.
-    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
-      VkWriteDescriptorSet& write_constants = write_descriptor_sets[write_descriptor_set_count++];
-      write_constants.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      write_constants.pNext = nullptr;
-      write_constants.dstSet = constants_descriptor_set;
-      write_constants.dstBinding = i;
-      write_constants.dstArrayElement = 0;
-      write_constants.descriptorCount = 1;
-      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-      write_constants.pImageInfo = nullptr;
-      write_constants.pBufferInfo = &current_constant_buffer_infos_[i];
-      write_constants.pTexelBufferView = nullptr;
+  }
+  if (!(current_graphics_descriptor_set_values_up_to_date_ &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants))) {
+    VkDescriptorSet constants_descriptor_set = VK_NULL_HANDLE;
+    if (dynamic_uniform_constants_) {
+      auto cached = dynamic_constants_sets_.find(dynamic_key);
+      if (cached != dynamic_constants_sets_.end()) {
+        constants_descriptor_set = cached->second;
+        if (binding_stats_) ++binding_constant_hits_;
+      }
+    }
+    if (constants_descriptor_set == VK_NULL_HANDLE) {
+      if (!constants_transient_descriptors_free_.empty()) {
+        constants_descriptor_set = constants_transient_descriptors_free_.back();
+        constants_transient_descriptors_free_.pop_back();
+      } else {
+        VkDescriptorPoolSize constants_descriptor_count;
+        constants_descriptor_count.type = dynamic_uniform_constants_
+            ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
+        auto& allocator = dynamic_uniform_constants_
+            ? transient_descriptor_allocator_dynamic_uniform_buffer_
+            : transient_descriptor_allocator_uniform_buffer_;
+        constants_descriptor_set = allocator.Allocate(
+            descriptor_set_layout_constants_, &constants_descriptor_count, 1);
+        if (constants_descriptor_set == VK_NULL_HANDLE) return false;
+      }
+      constants_transient_descriptors_used_.emplace_back(frame_current_, constants_descriptor_set);
+      if (binding_stats_) ++binding_constant_sets_;
+      // Stage flags differ, so each binding needs its own write.
+      for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+        VkWriteDescriptorSet& write_constants = write_descriptor_sets[write_descriptor_set_count++];
+        write_constants = {};
+        write_constants.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write_constants.dstSet = constants_descriptor_set;
+        write_constants.dstBinding = i;
+        write_constants.descriptorCount = 1;
+        write_constants.descriptorType = dynamic_uniform_constants_
+            ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        write_constants.pBufferInfo = dynamic_uniform_constants_
+            ? &dynamic_infos[i] : &current_constant_buffer_infos_[i];
+      }
+      // Bounded memo: misses beyond the cap still use ordinary transient sets.
+      if (dynamic_uniform_constants_ && dynamic_constants_sets_.size() < 256) {
+        dynamic_constants_sets_.emplace(dynamic_key, constants_descriptor_set);
+      }
     }
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants] =
@@ -11184,6 +11381,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
                                nullptr);
   }
+  // Patch 0444: remembered once written (a failed draw above writes none of its sets).
+  for (uint32_t stage = 0; stage < 2; ++stage) {
+    const uint32_t set_index = stage ? SpirvShaderTranslator::kDescriptorSetTexturesPixel
+                                     : SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+    if (texture_set_word_counts[stage] && (write_descriptor_set_bits & (UINT32_C(1) << set_index))) {
+      fh1_texture_set_memo_.Insert(fh1_texture_set_words_.data() + texture_set_word_offsets[stage],
+                                   texture_set_word_counts[stage], texture_set_hashes[stage],
+                                   current_graphics_descriptor_sets_[set_index]);
+    }
+  }
   // Only make valid if all descriptor sets have been allocated and written
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
@@ -11202,11 +11409,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   while (rex::bit_scan_forward(descriptor_sets_remaining, &descriptor_set_index)) {
     uint32_t descriptor_set_mask_tzcnt =
         rex::tzcnt(~(descriptor_sets_remaining | ((UINT32_C(1) << descriptor_set_index) - 1)));
+    const bool bind_dynamic = dynamic_uniform_constants_ &&
+        descriptor_set_index <= SpirvShaderTranslator::kDescriptorSetConstants &&
+        descriptor_set_mask_tzcnt > SpirvShaderTranslator::kDescriptorSetConstants;
     deferred_command_buffer_.CmdVkBindDescriptorSets(
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         current_guest_graphics_pipeline_layout_->GetPipelineLayout(), descriptor_set_index,
         descriptor_set_mask_tzcnt - descriptor_set_index,
-        current_graphics_descriptor_sets_ + descriptor_set_index, 0, nullptr);
+        current_graphics_descriptor_sets_ + descriptor_set_index,
+        bind_dynamic ? SpirvShaderTranslator::kConstantBufferCount : 0,
+        bind_dynamic ? dynamic_offsets : nullptr);
     if (descriptor_set_mask_tzcnt >= 32) {
       break;
     }

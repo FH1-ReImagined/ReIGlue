@@ -244,6 +244,10 @@ bool PredictPrimitiveProcessing(const RegisterFile& regs, const PrimitiveProcess
 }  // namespace
 
 void VulkanCommandProcessor::Fh1PipelineLookahead() {
+  // #474: split, the draws run on the recorder while the decoder moves the cursor on.
+  if (record_split()) {
+    return;
+  }
   const auto walk_start = std::chrono::steady_clock::now();
   auto& cursor = fh1_command_cursor::cursor;
   const memory::RingBuffer* ring = cursor.ring;

@@ -12,7 +12,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -227,6 +229,18 @@ class CommandProcessor {
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
   virtual bool IssueCopy() = 0;
 
+  // FH1 (#474), after Pinyon Shift (ShiftGlue 9362a07, BSD-3): gpu_split_command_processor.
+  // This thread ("GPU Commands", the decoder) parses the PM4 stream against a shadow of the
+  // register file and records, in order, the register writes (copied: the ring and the game's
+  // constant memory are reused) and the backend work (draws, shader loads, swaps, fence writes,
+  // interrupts); a second thread ("GPU Recorder") applies them to the register file and runs
+  // them. Everything that reads the register file, the caches or the backend state runs on the
+  // recorder. Packets whose result the CPU reads directly wait for the recorder first. Backends
+  // opt in; the split is decided once, when the thread starts.
+  virtual bool SupportsRecordThread() const { return false; }
+  // Whether the stream is decoded and recorded on two threads.
+  bool record_split() const { return record_split_; }
+
   // Patch 0396 (VR true stereo): the main view drawn for both eyes from one frame's commands.
   // The packets from the clear before the main view's scene up to the first HUD draw are
   // executed as usual (the left eye) and logged; before that HUD draw the register state of the
@@ -345,6 +359,101 @@ class CommandProcessor {
   const uint64_t* fh1_plain_registers_ = nullptr;
 
  private:
+  // FH1 (#474): the decode/record split (SupportsRecordThread).
+  // A draw as the packet gave it, for ExecuteDraw (the same on one thread and two).
+  struct DrawRecord {
+    uint32_t initiator;  // VGT_DRAW_INITIATOR
+    uint32_t flags;      // kDrawIndexed, kDrawIndx2
+    uint32_t index_format, index_endianness, index_count, index_guest_base, index_length;
+  };
+  static constexpr uint32_t kDrawIndexed = 1, kDrawIndx2 = 2;
+  bool ExecuteDraw(const DrawRecord& draw);
+  // A batch of records, in order, in `words`: kRecordRun start count, then count guest-endian
+  // register values; kRecordOne index value; kRecordDraw, a DrawRecord; kRecordShader type
+  // address dwords (IM_LOAD); kRecordShaderImmediate type dwords, then the dwords (copied from
+  // the ring); kRecordStore physical address, value (already in guest byte order): a word the
+  // CPU waits on, stored and its waiters woken; kRecordInterrupt cpu_mask; kRecordCall index
+  // into `fns`.
+  enum : uint32_t {
+    kRecordRun,
+    kRecordOne,
+    kRecordDraw,
+    kRecordShader,
+    kRecordShaderImmediate,
+    kRecordStore,
+    kRecordInterrupt,
+    kRecordCall,
+  };
+  struct RecordBatch {
+    std::vector<uint32_t> words;
+    std::vector<std::function<void()>> fns;
+    uint32_t actions = 0;  // draws and other backend work, for when to publish
+  };
+  // Why the decoder waited for the recorder (counted, logged once a minute).
+  enum RecordSyncReason : uint32_t {
+    kSyncMemWrite,
+    kSyncCondWrite,
+    kSyncRegToMem,
+    kSyncOcclusionQuery,
+    kSyncWaitRegister,
+    kSyncWaitMemory,
+    kSyncRegisterRead,
+    kSyncCallInThread,
+    kSyncQueueFull,
+    kSyncReasonCount,
+  };
+  void StartRecordThread();
+  void StopRecordThread();
+  void RecordThreadMain();
+  void ExecuteRecordBatch(RecordBatch& batch);
+  // Register writes from packets: applied at once, or recorded (and put in the shadow).
+  void PacketWriteRegister(uint32_t index, uint32_t value);
+  // `base`: guest-endian values.
+  void PacketWriteRegistersFromMem(uint32_t start_index, const uint32_t* base,
+                                   uint32_t num_registers);
+  void PacketWriteRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
+  // A register's value for the decoder: the shadow, or the register file after a RecordSync for
+  // the registers outside the context and constant blocks (the CPU and the backend write some
+  // of those directly).
+  uint32_t DecoderRegisterValue(uint32_t index);
+  uint32_t* RecordWords(uint32_t count);
+  void RecordCall(std::function<void()> fn);
+  void RecordStore(uint32_t address, uint32_t guest_value);
+  void RecordAction();
+  // Hands what is recorded so far to the recorder.
+  void PublishRecordBatch();
+  // Returns once the recorder has run everything recorded so far. The recorder then waits for
+  // the next batch, so the decoder may use the register file and the backend until it records
+  // again.
+  void RecordSync(RecordSyncReason reason);
+  // WAIT_REG_MEM for memory: returns once the recorder has finished a batch, or after 100 us.
+  void RecordWaitProgress();
+  bool wait_progress_first_ = false;
+  void LogRecordSplit();
+
+  bool record_split_ = false;
+  bool record_elide_ = false;  // gpu_split_elide_unchanged_registers
+  std::unique_ptr<RegisterFile> decode_register_file_;
+  std::unique_ptr<RecordBatch> record_batch_;
+  std::mutex record_mutex_;
+  std::condition_variable record_ready_cond_;
+  std::condition_variable record_done_cond_;
+  std::deque<std::unique_ptr<RecordBatch>> record_queue_;
+  std::vector<std::unique_ptr<RecordBatch>> record_free_;
+  bool record_stop_ = false;              // record_mutex_
+  bool record_recorder_sleeping_ = false;  // record_mutex_
+  bool record_decoder_waiting_ = false;    // record_mutex_
+  uint64_t record_published_ = 0;          // decoder
+  std::atomic<uint64_t> record_published_shared_{0};
+  std::atomic<uint64_t> record_completed_{0};
+  // WAIT_REG_MEM's time on the decoder, added to the frame's cost by the recorder at the swap.
+  std::atomic<int64_t> record_guest_wait_ns_{0};
+  uint64_t record_syncs_[kSyncReasonCount] = {};
+  uint64_t record_batches_ = 0, record_swaps_ = 0;
+  uint64_t record_registers_in_ = 0, record_registers_out_ = 0;
+  uint32_t record_sync_register_ = 0;
+  system::object_ref<system::XHostThread> record_thread_;
+
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;

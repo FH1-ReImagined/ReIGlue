@@ -490,6 +490,7 @@ VulkanTextureCache::~VulkanTextureCache() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  Fh1DescriptorHandlesDestroyed();
   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
   }
@@ -586,6 +587,11 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
 
 void VulkanTextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+  if (BindingReuseStats() && ++binding_stats_frames_ % 300 == 0) {
+    REXLOG_INFO("VKBINDING_TEXTURE: calls={} hits={} verified={} mismatches={}",
+        binding_request_calls_, binding_request_hits_, binding_request_verified_, binding_request_mismatches_);
+    binding_request_calls_ = binding_request_hits_ = binding_request_verified_ = binding_request_mismatches_ = 0;
+  }
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
 }
@@ -614,6 +620,16 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  bool reuse = BindingReuseEnabled() &&
+      binding_request_reuse_.Matches(command_processor_.GetCurrentSubmission(),
+          binding_usage_epoch_, used_texture_mask, UINT32_MAX,
+          !TextureRequestBindingsReady(used_texture_mask));
+  if (BindingReuseStats()) { ++binding_request_calls_; binding_request_hits_ += reuse; }
+  if (reuse && !BindingReuseVerify()) return;
+  // Verification runs the complete request, including ownership selection,
+  // uploads, usage transitions and lifetime marking.
+  const auto previous_bindings = reuse ? vulkan_texture_bindings_ : decltype(vulkan_texture_bindings_){};
+  const uint64_t previous_usage = binding_usage_epoch_;
   TextureCache::RequestTextures(used_texture_mask);
 
   // Pre-create 3D-as-2D wrappers while still in texture request phase.
@@ -685,6 +701,17 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
     }
   }
+  if (reuse) {
+    ++binding_request_verified_;
+    bool same = previous_usage == binding_usage_epoch_;
+    for (uint32_t i = 0; i < xenos::kTextureFetchConstantCount; ++i) {
+      if (!(used_texture_mask & (UINT32_C(1) << i))) continue;
+      same &= previous_bindings[i].image_view_unsigned == vulkan_texture_bindings_[i].image_view_unsigned &&
+              previous_bindings[i].image_view_signed == vulkan_texture_bindings_[i].image_view_signed;
+    }
+    if (!same) { ++binding_request_mismatches_; REXGPU_ERROR("VKBINDING: texture request mismatch"); }
+  }
+  binding_request_reuse_.Remember(command_processor_.GetCurrentSubmission(), binding_usage_epoch_, used_texture_mask);
 }
 
 VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
@@ -881,6 +908,7 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
       }
     }
     dfn.vkDestroySampler(device, sampler_used_first_->second.sampler, nullptr);
+    Fh1DescriptorHandlesDestroyed();
     if (sampler_used_first_->second.used_next) {
       sampler_used_first_->second.used_next->second.used_previous =
           sampler_used_first_->second.used_previous;
@@ -2143,6 +2171,7 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  Fh1DescriptorHandlesDestroyed();
   if (storage_view_)
     dfn.vkDestroyImageView(device, storage_view_, nullptr);
   for (const auto& view_pair : views_) {
@@ -3720,6 +3749,7 @@ void VulkanTextureCache::DestroyRetiredTexturePackImages(uint64_t completed_subm
   while (!pack_retired_.empty() &&
          (all || pack_retired_.front().submission <= completed_submission_index)) {
     const PackRetired& retired = pack_retired_.front();
+    if (!retired.views.empty()) Fh1DescriptorHandlesDestroyed();
     for (VkImageView view : retired.views) dfn.vkDestroyImageView(device, view, nullptr);
     device_memory::Get().Freed(device_memory::Use::kTexture, retired.memory_type, retired.size);
     vmaDestroyImage(vma_allocator_, retired.image, retired.allocation);
@@ -4053,6 +4083,7 @@ void VulkanTextureCache::DestroyTexturePackReplacements() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   for (auto& [fingerprint, replacement] : pack_replacements_) {
+    if (!replacement.views.empty()) Fh1DescriptorHandlesDestroyed();
     for (const auto& view : replacement.views) dfn.vkDestroyImageView(device, view.second, nullptr);
     if (replacement.image) {
       VmaAllocationInfo info;
