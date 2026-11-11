@@ -540,6 +540,9 @@ void Memory::UnmapViews() {
     if (views_.all_views[n]) {
       size_t length = map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1;
       rex::memory::UnmapFileView(mapping_, views_.all_views[n], length);
+      // A failed MapViews attempt unmaps its views; the next attempt must not
+      // unmap this one again (something else may have been mapped there).
+      views_.all_views[n] = nullptr;
     }
   }
 }
