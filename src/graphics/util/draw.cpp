@@ -770,6 +770,55 @@ const ResolveCopyShaderInfo resolve_copy_shader_info[size_t(ResolveCopyShaderInd
     {"Resolve Copy Full 128bpp", true, 2, 4, 4, 3},
 };
 
+bool Fh1MoveResolveCopy(const RegisterFile& regs, uint32_t old_x, uint32_t old_y, uint32_t new_x,
+                        uint32_t new_y, uint32_t width, uint32_t height, ResolveInfo& info) {
+  if (!info.copy_dest_extent_length || !width || !height || (new_x | new_y | width | height) & 7 ||
+      info.copy_dest_coordinate_info.offset_x_div_8 ||
+      info.copy_dest_coordinate_info.offset_y_div_8)
+    return false;
+  const auto rb_copy_dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
+  if (rb_copy_dest_info.copy_dest_array)
+    return false;
+  const bool is_depth = info.rb_copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
+  const xenos::TextureFormat dest_format =
+      is_depth ? DepthRenderTargetToTextureFormat(regs.Get<reg::RB_DEPTH_INFO>().depth_format)
+               : xenos::TextureFormat(rb_copy_dest_info.copy_dest_format);
+  const FormatInfo& format_info = *FormatInfo::Get(dest_format);
+  if (!is_depth && format_info.type != FormatType::kResolvable)
+    return false;
+  const uint32_t bpp_log2 = rex::log2_floor(format_info.bits_per_pixel >> 3);
+  const uint32_t x_mask =
+      (UINT32_C(1) << xenos::GetTextureTiledXBaseGranularityLog2(false, bpp_log2)) - 1;
+  const uint32_t y_mask =
+      (UINT32_C(1) << xenos::GetTextureTiledYBaseGranularityLog2(false, bpp_log2)) - 1;
+  if ((old_x & x_mask) || (old_y & y_mask))
+    return false;
+  const uint32_t pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch;
+  const int32_t old_offset =
+      texture_util::GetTiledOffset2D(int32_t(old_x), int32_t(old_y), pitch, bpp_log2);
+  if (old_offset < 0 || uint32_t(old_offset) > info.copy_dest_base)
+    return false;
+  const uint32_t texture_base = info.copy_dest_base - uint32_t(old_offset);
+  const uint32_t old_start = info.copy_dest_extent_start;
+  const uint32_t old_end = old_start + info.copy_dest_extent_length;
+  const uint32_t new_start =
+      texture_base + texture_util::GetTiledAddressLowerBound2D(new_x, new_y, pitch, bpp_log2);
+  const uint32_t new_end = texture_base + texture_util::GetTiledAddressUpperBound2D(
+                                              new_x + width, new_y + height, pitch, bpp_log2);
+  info.copy_dest_base =
+      texture_base + uint32_t(texture_util::GetTiledOffset2D(
+                         int32_t(new_x & ~x_mask), int32_t(new_y & ~y_mask), pitch, bpp_log2));
+  info.copy_dest_coordinate_info.offset_x_div_8 =
+      (new_x & x_mask) >> xenos::kResolveAlignmentPixelsLog2;
+  info.copy_dest_coordinate_info.offset_y_div_8 =
+      (new_y & y_mask) >> xenos::kResolveAlignmentPixelsLog2;
+  info.coordinate_info.width_div_8 = width >> xenos::kResolveAlignmentPixelsLog2;
+  info.height_div_8 = height >> xenos::kResolveAlignmentPixelsLog2;
+  info.copy_dest_extent_start = std::min(old_start, new_start);
+  info.copy_dest_extent_length = std::max(old_end, new_end) - info.copy_dest_extent_start;
+  return true;
+}
+
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,

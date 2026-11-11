@@ -10294,6 +10294,9 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     viewport.width = 1.0f;
     viewport.height = 1.0f;
   }
+  render_target_cache_->Fh1NoteDraw(render_target_cache_->UsesFractionalRaster(),
+                                    int(pa_sc_window_offset.window_x_offset),
+                                    int(pa_sc_window_offset.window_y_offset));
   if (render_target_cache_->UsesFractionalRaster()) {
   viewport.x *= render_target_cache_->raster_scale_x();
   viewport.y *= render_target_cache_->raster_scale_y();

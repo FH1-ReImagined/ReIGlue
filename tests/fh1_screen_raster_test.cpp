@@ -44,6 +44,25 @@ int main() {
   check(IsNativeScreenViewport(1280, true, true, 640, -232, 1280, 464));
   check(IsNativeScreenViewport(1280, false, false, 1, 1, 1280, 720));
   check(!IsNativeScreenViewport(1280, false, false, 1, 1, 512, 288));
+  // #785: the race intro's three 1280x256 tiles on the 1080p HUD target (raster 0.75).
+  FractionalTileResolve tile{};
+  check(GetFractionalTileResolve(0, -256, 0.75f, 0.75f, 1280, 256, tile) && tile.x == 0 &&
+        tile.y == 192 && tile.width == 960 && tile.height == 192);
+  check(GetFractionalTileResolve(0, -512, 0.75f, 0.75f, 1280, 208, tile) && tile.x == 0 &&
+        tile.y == 384 && tile.width == 960 && tile.height == 160);
+  // Columns too; the moved copy never grows past the tile.
+  check(GetFractionalTileResolve(-640, 0, 0.75f, 0.75f, 640, 720, tile) && tile.x == 480 &&
+        tile.y == 0 && tile.width == 480 && tile.height == 544);
+  check(GetFractionalTileResolve(0, -256, 1.0f, 0.75f, 1280, 8, tile) && tile.width == 1280 &&
+        tile.height == 8);
+  // Nothing moves: the first tile, an untiled resolve, an integer raster (1440p, 4K), a
+  // position off the 8-pixel alignment (0.75 * 8 = 6), a positive offset.
+  check(!GetFractionalTileResolve(0, 0, 0.75f, 0.75f, 1280, 256, tile));
+  check(!GetFractionalTileResolve(0, -256, 1.0f, 1.0f, 1280, 256, tile));
+  check(!GetFractionalTileResolve(0, -8, 0.75f, 0.75f, 1280, 256, tile));
+  check(!GetFractionalTileResolve(0, 256, 0.75f, 0.75f, 1280, 256, tile));
+  check(!GetFractionalTileResolve(0, -256, 0.75f, 0.75f, 1280, 0, tile));
+  check(!GetFractionalTileResolve(0, -256, 1.5f, 0.75f, 1280, 256, tile));
   std::printf("FH1 instrument/native raster policy: %u failures\n", failures);
   return failures ? 1 : 0;
 }

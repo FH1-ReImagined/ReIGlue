@@ -130,6 +130,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   float raster_scale_x() const { return raster_scale_x_; }
   float raster_scale_y() const { return raster_scale_y_; }
   float raster_scale_x_ = 1.0f, raster_scale_y_ = 1.0f;
+  // #785: the last draw's fractional raster and window offset, for the tile resolve after it.
+  void Fh1NoteDraw(bool fractional, int window_x, int window_y) {
+    fh1_last_draw_fractional_ = fractional;
+    fh1_last_draw_window_x_ = window_x;
+    fh1_last_draw_window_y_ = window_y;
+  }
+  bool fh1_last_draw_fractional_ = false;
+  int fh1_last_draw_window_x_ = 0, fh1_last_draw_window_y_ = 0;
+  uint64_t fh1_fractional_tile_resolves_ = 0;
   bool SeedNativeHud(VulkanRenderTargetCache& scene, uint32_t width, uint32_t height);
   bool CopyHdrScene(VkImage destination, uint32_t width, uint32_t height);
   bool HasNativeHudColorTarget() const {
