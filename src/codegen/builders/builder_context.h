@@ -24,6 +24,7 @@ struct ppc_insn;
 namespace rex::codegen {
 
 class FunctionNode;
+struct ReservationSections;
 
 struct RecompilerLocalVariables {
   bool ctr{};
@@ -97,6 +98,9 @@ struct BuilderContext {
 
   /// Pointer to active jump table for bctr dispatch, or nullptr
   const JumpTable* activeJumpTable = nullptr;
+
+  /// The function's lock-free reservation sections (0470), or nullptr
+  const ReservationSections* reservations = nullptr;
 
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;

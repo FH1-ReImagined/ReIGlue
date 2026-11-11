@@ -19,6 +19,7 @@
 #include <rex/logging.h>
 
 #include "../codegen_logging.h"
+#include "../reservation_sections.h"
 
 #include <dis-asm.h>
 #include <ppc-inst.h>
@@ -280,8 +281,17 @@ inline void emitAtomicLoadReserve(BuilderContext& ctx, const char* ptr_type, con
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
   ctx.println("{}.u32;", ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.{} = *({}*)REX_RAW_ADDR({});", ctx.reserved(), reserved_field, ptr_type,
-              ctx.ea());
+  if (ctx.reservations && ctx.reservations->inLockFreeSection(ctx.base)) {
+    // No lock around it (0470): an atomic load, so the compiler reads the word
+    // once, here.
+    ctx.println(
+        "\t{}.{} = reinterpret_cast<std::atomic<{}>*>(REX_RAW_ADDR({}))->load("
+        "std::memory_order_relaxed);",
+        ctx.reserved(), reserved_field, ptr_type, ctx.ea());
+  } else {
+    ctx.println("\t{}.{} = *({}*)REX_RAW_ADDR({});", ctx.reserved(), reserved_field, ptr_type,
+                ctx.ea());
+  }
   ctx.println("\t{}.u64 = {}({}.{});", ctx.r(ctx.insn.operands[0]), bswap_func, ctx.reserved(),
               reserved_field);
 }
