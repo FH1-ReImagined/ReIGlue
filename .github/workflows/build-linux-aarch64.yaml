@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - "v*"
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
 
 permissions:
   contents: write
@@ -11,9 +19,108 @@ permissions:
 
 jobs:
   build:
+    if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/_build-platform.yaml
     with:
       platform: linux-arm64
       ref: ${{ github.ref }}
       publish_mode: release
     secrets: inherit
+
+  # ARM64 Linux on every PR (0502, FH1 #788): the SDK built with its tests on an ARM64 runner,
+  # then ctest: the unit tests, the 0xE0000000 view at 4, 16 and 64 KB granularity, and the PPC
+  # instruction tests with the FMA cases, which compile recompiled guest code for aarch64 and
+  # run it on NEON. The runner's kernel has 4 KB pages; the 16 and 64 KB layouts are forced.
+  tests:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      # The patches the README lists: 0413 (FFmpeg's XMA decoder) is linked by the runtime.
+      - name: Apply submodule patches
+        run: |
+          git -C thirdparty/sdl3 apply "$PWD"/patches/sdl3/*.patch
+          git -C thirdparty/FFmpeg apply "$PWD"/patches/ffmpeg/*.patch
+
+      - name: Install clang 20
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg lsb-release
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
+          sudo apt-get install -y clang-20 lld-20
+
+      - name: Install build deps
+        run: |
+          sudo apt install -y cmake ninja-build build-essential git curl unzip autoconf python3.12-venv \
+            libgtk-3-dev libx11-xcb-dev libxss-dev libvulkan-dev \
+            libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev libdecor-0-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            qemu-user-static
+
+      # The PPC tests are assembled with tools/binutils (binutils 2.24 with Xenon's VMX128;
+      # distribution binutils reject -mvmx128), built for x86-64: they run under qemu-user
+      # with x86-64 glibc and zlib from Ubuntu 24.04's release pocket.
+      - name: PowerPC binutils under qemu
+        run: |
+          root="$RUNNER_TEMP/amd64-root"
+          tools="$RUNNER_TEMP/ppc-tools"
+          mkdir -p "$root" "$tools"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8_amd64.deb
+          curl -fsSLO http://archive.ubuntu.com/ubuntu/pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2_amd64.deb
+          sha256sum -c <<'EOF'
+          af36c7ac770770fe3d3c10e85d6bc538e76e57570ba7db7d397fb9f654783ef3  libc6_2.39-0ubuntu8_amd64.deb
+          0b93d16d7498f092fa3070fbbad28cdbc6b3d640f1a7681b96fc37f20d1219f1  zlib1g_1.3.dfsg-3.1ubuntu2_amd64.deb
+          EOF
+          for deb in libc6_*.deb zlib1g_*.deb; do dpkg-deb -x "$deb" "$root"; done
+          ln -sfn usr/lib64 "$root/lib64"
+          ln -sfn usr/lib "$root/lib"
+          for tool in as ld nm; do
+            printf '#!/bin/sh\nexec qemu-x86_64-static -L "%s" "%s/tools/binutils/powerpc-none-elf-%s" "$@"\n' \
+              "$root" "$GITHUB_WORKSPACE" "$tool" > "$tools/powerpc-none-elf-$tool"
+            chmod +x "$tools/powerpc-none-elf-$tool"
+          done
+          "$tools/powerpc-none-elf-as" --version | head -1
+          echo "PPC_TOOLS_DIR=$tools" >> "$GITHUB_ENV"
+
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1.2.22
+        with:
+          variant: sccache
+          key: linux-arm64-tests
+
+      - name: Configure
+        run: >
+          cmake --preset linux-arm64
+          -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CONFIGURATION_TYPES=Release -DCMAKE_DEFAULT_BUILD_TYPE=Release
+          -DREXGLUE_BUILD_TESTS=ON
+          -DPPC_TOOLS_DIR="$PPC_TOOLS_DIR"
+
+      - name: Build
+        run: cmake --build out/build/linux-arm64 --config Release --parallel
+
+      # Left out: four calendar tests of dates before 1678, which fail on any libstdc++ (x86-64
+      # too): rex::chrono::WinSystemClock::to_sys converts to system_clock's nanoseconds, and
+      # 1601-01-01 is out of their 64-bit range.
+      - name: Test
+        run: >
+          ctest --test-dir out/build/linux-arm64 -C Release --output-on-failure --parallel 2
+          -E "^unit\.(calendar (decomposition: NT epoch|recomposition: known dates|recomposition: decompose then recompose)|from_sys then to_sys round-trips)"
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
