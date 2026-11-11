@@ -82,6 +82,7 @@ std::string FingerprintModule(const RecompilerConfig& cfg,
   std::vector<std::string> flags{
       fmt::format("templates={}", EmbeddedTemplatesHash()),
       fmt::format("generate_exception_handlers={}", cfg.generateExceptionHandlers),
+      fmt::format("lock_free_reservations={}", cfg.lockFreeReservations),
       fmt::format("max_jump_extension={}", cfg.maxJumpExtension),
       fmt::format("data_region_threshold={}", cfg.dataRegionThreshold),
       fmt::format("max_file_size_bytes={}", REXCVAR_GET(max_file_size_bytes)),

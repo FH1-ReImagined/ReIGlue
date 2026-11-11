@@ -625,7 +625,9 @@ void ParseControlFlowAlloc(const ucode::ControlFlowAllocInstruction& cf, uint32_
 bool ParseVertexFetchInstruction(const ucode::VertexFetchInstruction& op,
                                  const ucode::VertexFetchInstruction& previous_full_op,
                                  ParsedVertexFetchInstruction& instr);
-void ParseTextureFetchInstruction(const ucode::TextureFetchInstruction& op,
+// Returns false for a fetch opcode the GPU does not define (2-15, 20-23, 27-31): instr is
+// then parsed as an instruction that does nothing (no result, no operands, opcode_name null).
+bool ParseTextureFetchInstruction(const ucode::TextureFetchInstruction& op,
                                   ParsedTextureFetchInstruction& instr);
 void ParseAluInstruction(const ucode::AluInstruction& op, xenos::ShaderType shader_type,
                          ParsedAluInstruction& instr);
@@ -1015,6 +1017,8 @@ class Shader {
   bool is_ucode_analyzed_ = false;
 
   std::string ucode_disassembly_;
+  // Whether an exec past the end of the microcode was logged (FH1 #808: once a shader).
+  bool ucode_past_end_logged_ = false;
   std::vector<VertexBinding> vertex_bindings_;
   std::vector<TextureBinding> texture_bindings_;
   ConstantRegisterMap constant_register_map_ = {};

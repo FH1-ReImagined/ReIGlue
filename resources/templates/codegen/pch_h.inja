@@ -323,27 +323,76 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
 // Interrupt Locks
 //=============================================================================
 
-inline std::atomic<i32>& ppc_global_lock_count_() {
-  static std::atomic<i32> count{0};
-  return count;
+// Measurement builds (-DREX_GUEST_LOCK_STATS, FH1 #506): an info line every
+// second with the totals so far of the guest's mfmsr, of its interrupts-off
+// sections that took the global lock and of those that did not (0470).
+#ifdef REX_GUEST_LOCK_STATS
+#include <chrono>
+#include <thread>
+struct PPCGuestLockStats {
+  std::atomic<u64> mfmsr{0};
+  std::atomic<u64> locked{0};
+  std::atomic<u64> lock_free{0};
+};
+inline PPCGuestLockStats& ppc_guest_lock_stats_() {
+  static PPCGuestLockStats* stats = [] {
+    auto* s = new PPCGuestLockStats();
+    std::thread([s] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        REXLOG_INFO("Guest lock stats: mfmsr {} locked sections {} lock-free sections {}",
+                    s->mfmsr.load(std::memory_order_relaxed),
+                    s->locked.load(std::memory_order_relaxed),
+                    s->lock_free.load(std::memory_order_relaxed));
+      }
+    }).detach();
+    return s;
+  }();
+  return *stats;
+}
+#define REX_GUEST_LOCK_STAT(field) \
+  ppc_guest_lock_stats_().field.fetch_add(1, std::memory_order_relaxed)
+#else
+#define REX_GUEST_LOCK_STAT(field) \
+  do {                             \
+  } while (0)
+#endif
+
+// The locked interrupts-off sections this thread is in (0471). mfmsr reads it
+// without the lock: while a thread holds the global lock for a section, no
+// other thread is in one, so a count of all threads' sections read under the
+// lock (as before) said the same, only after waiting for the lock.
+inline i32& ppc_guest_interrupts_off_() {
+  static thread_local i32 depth = 0;
+  return depth;
 }
 
-#define REX_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> u64 {                                                      \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
+#define REX_CHECK_GLOBAL_LOCK()                         \
+  ([&]() -> u64 {                                       \
+    REX_GUEST_LOCK_STAT(mfmsr);                         \
+    return ppc_guest_interrupts_off_() ? 0 : 0x8000;    \
   }())
 
 #define REX_ENTER_GLOBAL_LOCK()                          \
   do {                                                   \
+    REX_GUEST_LOCK_STAT(locked);                         \
     rex::thread::global_critical_region::mutex().lock(); \
-    ppc_global_lock_count_().fetch_add(1);               \
+    ++ppc_guest_interrupts_off_();                       \
+  } while (0)
+
+// An interrupts-off section the code generator found to be one atomic
+// read-modify-write (0470): its store-conditional is a host compare-exchange,
+// so it runs without the global lock, as on the console, where such a section
+// only keeps this CPU's interrupts out.
+#define REX_ENTER_RESERVATION_SECTION() REX_GUEST_LOCK_STAT(lock_free)
+#define REX_LEAVE_RESERVATION_SECTION() \
+  do {                                  \
   } while (0)
 
 #define REX_LEAVE_GLOBAL_LOCK()                                                           \
   do {                                                                                    \
-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
+    auto old_depth_ = ppc_guest_interrupts_off_()--;                                      \
+    assert(old_depth_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
     rex::thread::global_critical_region::mutex().unlock();                                \
   } while (0)
 
