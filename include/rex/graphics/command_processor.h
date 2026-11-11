@@ -151,6 +151,10 @@ class CommandProcessor {
   virtual void WriteRegister(uint32_t index, uint32_t value);
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+  // FH1 (#607, patch 0450): as WriteRegistersFromMem, with the values in host byte order (the
+  // decode/record split's recorder: the decoder has swapped them already for its shadow).
+  virtual void WriteRegistersFromHost(uint32_t start_index, const uint32_t* values,
+                                      uint32_t num_registers);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                           uint32_t num_registers);
   void WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
@@ -368,14 +372,16 @@ class CommandProcessor {
   };
   static constexpr uint32_t kDrawIndexed = 1, kDrawIndx2 = 2;
   bool ExecuteDraw(const DrawRecord& draw);
-  // A batch of records, in order, in `words`: kRecordRun start count, then count guest-endian
-  // register values; kRecordOne index value; kRecordDraw, a DrawRecord; kRecordShader type
+  // A batch of records, in order, in `words`: kRecordRun start count, then count register
+  // values (host byte order, 0450); kRecordPlainRun the same for a range of registers that are
+  // all in fh1_plain_registers_ (stored, nothing else); kRecordOne index value; kRecordDraw, a DrawRecord; kRecordShader type
   // address dwords (IM_LOAD); kRecordShaderImmediate type dwords, then the dwords (copied from
   // the ring); kRecordStore physical address, value (already in guest byte order): a word the
   // CPU waits on, stored and its waiters woken; kRecordInterrupt cpu_mask; kRecordCall index
   // into `fns`.
   enum : uint32_t {
     kRecordRun,
+    kRecordPlainRun,
     kRecordOne,
     kRecordDraw,
     kRecordShader,
@@ -384,8 +390,28 @@ class CommandProcessor {
     kRecordInterrupt,
     kRecordCall,
   };
+  // FH1 (#607, patch 0451): a vector that grows without zeroing the new words (RecordWords
+  // writes every one of them right after).
+  template <typename T>
+  struct UninitializedAllocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+      using other = UninitializedAllocator<U>;
+    };
+    UninitializedAllocator() = default;
+    template <typename U>
+    UninitializedAllocator(const UninitializedAllocator<U>&) noexcept {}
+    template <typename U>
+    void construct(U* p) noexcept {
+      ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+      ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+  };
   struct RecordBatch {
-    std::vector<uint32_t> words;
+    std::vector<uint32_t, UninitializedAllocator<uint32_t>> words;
     std::vector<std::function<void()>> fns;
     uint32_t actions = 0;  // draws and other backend work, for when to publish
   };
@@ -417,6 +443,8 @@ class CommandProcessor {
   // of those directly).
   uint32_t DecoderRegisterValue(uint32_t index);
   uint32_t* RecordWords(uint32_t count);
+  // A kRecordRun or kRecordPlainRun header; returns where its values go.
+  uint32_t* RecordRun(uint32_t start_index, uint32_t num_registers);
   void RecordCall(std::function<void()> fn);
   void RecordStore(uint32_t address, uint32_t guest_value);
   void RecordAction();
@@ -428,6 +456,20 @@ class CommandProcessor {
   void RecordSync(RecordSyncReason reason);
   // WAIT_REG_MEM for memory: returns once the recorder has finished a batch, or after 100 us.
   void RecordWaitProgress();
+  // FH1 (#607, patch 0452): the memory words the recorder is still to store (EVENT_WRITE_SHD,
+  // scratch write-back) and the batch each is in. RecordWaitStore: for WAIT_REG_MEM, false if
+  // the word is not one of them (or stored already); otherwise waits for that batch (at most
+  // 100 us at a time) and returns true.
+  void RecordNoteStore(uint32_t address);
+  bool RecordWaitStore(uint32_t address);
+  struct RecordedStore {
+    uint32_t address = UINT32_MAX;
+    uint64_t batch = 0;
+  };
+  static constexpr uint32_t kRecordStoreSlots = 8;
+  RecordedStore record_stores_[kRecordStoreSlots];
+  uint32_t record_store_next_ = 0;
+  uint64_t record_wake_at_ = 0;  // record_mutex_: the completed batch that wakes the decoder
   bool wait_progress_first_ = false;
   void LogRecordSplit();
 

@@ -110,7 +110,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
         VkMemoryRequirements memory_requirements_expanded;
         dfn.vkGetBufferMemoryRequirements(device, buffer_expanded, &memory_requirements_expanded);
         uint32_t memory_type_expanded = util::ChooseHostMemoryType(
-            vulkan_device_->memory_types(), memory_requirements.memoryTypeBits, false);
+            vulkan_device_->memory_types(), memory_requirements_expanded.memoryTypeBits, false);
         if (memory_requirements_expanded.size <= allocation_size_ &&
             memory_type_expanded != UINT32_MAX) {
           page_size_ = size_t(allocation_size_);
