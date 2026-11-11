@@ -102,6 +102,8 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
   auto hasBool = [&](const char* key) -> bool { return toml[key].is_boolean(); };
   MergeBool(cfg.skipLr, toml["skip_lr"].value_or(false), hasBool("skip_lr"), "skip_lr");
   MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");
+  MergeBool(cfg.lockFreeReservations, toml["lock_free_reservations"].value_or(true),
+            hasBool("lock_free_reservations"), "lock_free_reservations");
   MergeBool(cfg.ctrAsLocalVariable, toml["ctr_as_local"].value_or(false), hasBool("ctr_as_local"),
             "ctr_as_local");
   MergeBool(cfg.xerAsLocalVariable, toml["xer_as_local"].value_or(false), hasBool("xer_as_local"),
