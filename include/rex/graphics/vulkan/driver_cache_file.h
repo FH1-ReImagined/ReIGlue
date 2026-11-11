@@ -10,6 +10,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -29,7 +30,11 @@ namespace rex::graphics::vulkan::driver_cache_file {
 // translator change, or when a driver keys it differently) was added a second time at every
 // start, and dead data was never dropped. Entries are replaced instead, and entries of
 // descriptions no longer in the pipeline store are dropped, so the file follows the store.
-constexpr uint32_t kFormatVersion = 2;
+constexpr uint32_t kPreviousFormatVersion = 2;
+constexpr uint32_t kFormatVersion = 3;
+// A reference uses the size field to name an earlier record's payload. Its own key
+// and fresh size still describe this pipeline.
+constexpr uint32_t kPayloadReference = uint32_t(1) << 31;
 constexpr size_t kHeaderSize = 64;
 constexpr size_t kEntryHeaderSize = 24;
 // One pipeline's opaque driver data; size varies substantially by driver.
@@ -52,6 +57,49 @@ struct Entry {
   uint64_t checksum = 0;
   std::shared_ptr<const std::vector<uint8_t>> data;
   size_t size() const { return data ? data->size() : 0; }
+};
+
+// Tracks the retained entries, including seeds temporarily held by pipeline creation.
+class RetainedPayloads {
+ public:
+  uint64_t bytes() const { return bytes_; }
+
+  void Add(Entry& entry) {
+    const auto [begin, end] = blobs_.equal_range(entry.checksum);
+    bytes_ += kEntryHeaderSize;
+    for (auto it = begin; it != end; ++it) {
+      auto& blob = it->second;
+      if (blob.data == entry.data || *blob.data == *entry.data) {
+        entry.data = blob.data;
+        ++blob.references;
+        return;
+      }
+    }
+    blobs_.emplace(entry.checksum, Blob{entry.data, 1});
+    bytes_ += entry.size();
+  }
+
+  void Remove(const Entry& entry) {
+    if (!entry.data) return;
+    const auto [begin, end] = blobs_.equal_range(entry.checksum);
+    for (auto it = begin; it != end; ++it) {
+      if (it->second.data != entry.data) continue;
+      bytes_ -= kEntryHeaderSize;
+      if (--it->second.references == 0) {
+        bytes_ -= entry.size();
+        blobs_.erase(it);
+      }
+      return;
+    }
+  }
+
+ private:
+  struct Blob {
+    std::shared_ptr<const std::vector<uint8_t>> data;
+    size_t references;
+  };
+  std::unordered_multimap<uint64_t, Blob> blobs_;
+  uint64_t bytes_ = 0;
 };
 
 inline uint32_t U32(const uint8_t* p) {
@@ -111,9 +159,12 @@ inline std::array<uint8_t, kHeaderSize> EncodeHeader(const Identity& id, uint64_
   Put64(h.data() + 56, Checksum(h.data(), 56));
   return h;
 }
-inline bool DecodeHeader(const uint8_t* h, const Identity& id, uint64_t* count) {
+inline bool DecodeHeader(const uint8_t* h, const Identity& id, uint64_t* count,
+                         uint32_t* version) {
   const uint8_t magic[8] = {'F','H','1','V','K','P','C',0};
-  if (!std::equal(magic, magic + 8, h) || U32(h + 8) != kFormatVersion ||
+  *version = U32(h + 8);
+  if (!std::equal(magic, magic + 8, h) ||
+      (*version != kFormatVersion && *version != kPreviousFormatVersion) ||
       U32(h + 12) != id.vendor || U32(h + 16) != id.device || U32(h + 20) != id.driver ||
       U64(h + 24) != id.abi || !std::equal(id.uuid.begin(), id.uuid.end(), h + 32) ||
       U64(h + 56) != Checksum(h, 56)) return false;
@@ -141,8 +192,9 @@ inline ReadResult Read(const std::filesystem::path& path, const Identity& id) {
   file.seekg(0);
   std::array<uint8_t, kHeaderSize> header;
   uint64_t count = 0;
+  uint32_t version = 0;
   if (!file.read(reinterpret_cast<char*>(header.data()), kHeaderSize) ||
-      !DecodeHeader(header.data(), id, &count)) {
+      !DecodeHeader(header.data(), id, &count, &version)) {
     result.rejected = true;
     return result;
   }
@@ -151,19 +203,27 @@ inline ReadResult Read(const std::filesystem::path& path, const Identity& id) {
     uint8_t eh[kEntryHeaderSize];
     if (remaining < kEntryHeaderSize || !file.read(reinterpret_cast<char*>(eh), kEntryHeaderSize)) break;
     remaining -= kEntryHeaderSize;
-    const uint32_t entry_size = U32(eh + 12);
-    if (entry_size > kMaxEntrySize || entry_size > remaining) break;
-    std::vector<uint8_t> data(entry_size);
-    if (!file.read(reinterpret_cast<char*>(data.data()), std::streamsize(entry_size))) break;
-    remaining -= entry_size;
-    // The entry checksum covers the data, then the key and sizes.
-    const uint64_t checksum = Checksum(data.data(), data.size());
-    if (Checksum(eh, 16, checksum) != U64(eh + 16) || !ValidPayload(data, id)) break;
+    const uint32_t size_or_reference = U32(eh + 12);
     Entry entry;
+    if (version == kFormatVersion && (size_or_reference & kPayloadReference)) {
+      const uint32_t index = size_or_reference & ~kPayloadReference;
+      if (index >= result.entries.size()) break;
+      const auto& original = result.entries[index];
+      entry.data = original.data;
+      entry.checksum = original.checksum;
+    } else {
+      if (size_or_reference > kMaxEntrySize || size_or_reference > remaining) break;
+      std::vector<uint8_t> data(size_or_reference);
+      if (!file.read(reinterpret_cast<char*>(data.data()), std::streamsize(data.size()))) break;
+      remaining -= data.size();
+      if (!ValidPayload(data, id)) break;
+      entry.checksum = Checksum(data.data(), data.size());
+      entry.data = std::make_shared<const std::vector<uint8_t>>(std::move(data));
+    }
+    // Bind this record's key and sizes (or reference index) to the payload.
+    if (Checksum(eh, 16, entry.checksum) != U64(eh + 16)) break;
     entry.key = U64(eh);
     entry.fresh_size = U32(eh + 8);
-    entry.checksum = checksum;
-    entry.data = std::make_shared<const std::vector<uint8_t>>(std::move(data));
     result.entries.push_back(std::move(entry));
   }
   if (result.entries.size() != count || remaining) result.rejected = true;
@@ -197,16 +257,32 @@ inline WriteResult Write(const std::filesystem::path& path, const std::vector<En
   WriteResult result;
   budget = std::min(budget, kMaxFileSize);
   if (budget < kHeaderSize) return result;
-  std::vector<const Entry*> valid;
+  struct Record {
+    const Entry* entry;
+    uint32_t size_or_reference;
+  };
+  std::vector<Record> valid;
+  std::unordered_multimap<uint64_t, uint32_t> payloads;
   valid.reserve(entries.size());
   uint64_t bytes = kHeaderSize;
   for (const auto& entry : entries) {
     if (!entry.data || !ValidPayload(*entry.data, id)) continue;
-    const uint64_t entry_bytes = kEntryHeaderSize + entry.size();
+    uint32_t size_or_reference = uint32_t(entry.size());
+    const auto [begin, end] = payloads.equal_range(entry.checksum);
+    for (auto it = begin; it != end; ++it) {
+      const auto& existing = *valid[it->second].entry;
+      if (existing.data == entry.data || *existing.data == *entry.data) {
+        size_or_reference = kPayloadReference | it->second;
+        break;
+      }
+    }
+    const bool reference = (size_or_reference & kPayloadReference) != 0;
+    const uint64_t entry_bytes = kEntryHeaderSize + (reference ? 0 : entry.size());
     // The caller sorts by description key, so the retained subset is stable across
     // starts. Skip whole entries, then keep looking for smaller ones that fit.
     if (entry_bytes > budget - bytes) { ++result.skipped; continue; }
-    valid.push_back(&entry);
+    if (!reference) payloads.emplace(entry.checksum, uint32_t(valid.size()));
+    valid.push_back({&entry, size_or_reference});
     bytes += entry_bytes;
   }
   result.bytes = bytes;
@@ -217,7 +293,7 @@ inline WriteResult Write(const std::filesystem::path& path, const std::vector<En
     bool same = true;
     for (size_t i = 0; i < valid.size(); ++i) {
       const auto& saved = state->entries[i];
-      const auto& entry = *valid[i];
+      const auto& entry = *valid[i].entry;
       const auto data = saved.data.lock();
       // Check bytes as well as the checksum when the immutable payload changed:
       // collisions must never suppress a changed retained entry.
@@ -246,15 +322,18 @@ inline WriteResult Write(const std::filesystem::path& path, const std::vector<En
   {
     std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
     bool ok = bool(file.write(reinterpret_cast<const char*>(header.data()), kHeaderSize));
-    for (const Entry* entry : valid) {
+    for (const auto& record : valid) {
+      const Entry* entry = record.entry;
       if (!ok) break;
       uint8_t eh[kEntryHeaderSize];
       Put64(eh, entry->key);
       Put32(eh + 8, entry->fresh_size);
-      Put32(eh + 12, uint32_t(entry->size()));
+      Put32(eh + 12, record.size_or_reference);
       Put64(eh + 16, Checksum(eh, 16, entry->checksum));
-      ok = file.write(reinterpret_cast<const char*>(eh), kEntryHeaderSize) &&
-          file.write(reinterpret_cast<const char*>(entry->data->data()), std::streamsize(entry->size()));
+      ok = bool(file.write(reinterpret_cast<const char*>(eh), kEntryHeaderSize));
+      if (ok && !(record.size_or_reference & kPayloadReference))
+        ok = bool(file.write(reinterpret_cast<const char*>(entry->data->data()),
+                             std::streamsize(entry->size())));
     }
     if (ok) {
       file.flush();
@@ -275,8 +354,10 @@ inline WriteResult Write(const std::filesystem::path& path, const std::vector<En
     state->header = header;
     state->entries.clear();
     state->entries.reserve(valid.size());
-    for (const Entry* entry : valid)
-      state->entries.push_back({entry->key, entry->fresh_size, entry->checksum, entry->data});
+    for (const auto& record : valid) {
+      const auto& entry = *record.entry;
+      state->entries.push_back({entry.key, entry.fresh_size, entry.checksum, entry.data});
+    }
   }
   result.written = written;
   return result;
