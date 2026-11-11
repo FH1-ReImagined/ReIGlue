@@ -256,8 +256,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1, 2)
     // #70. Must be enabled for VK_KHR_sampler_ycbcr_conversion.
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance1, 1, 1)
-    // #141.
-    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
+    // #141. Test hook (FH1 #640): FORZA_TEST_NO_STENCIL_EXPORT=1 leaves it off, for the paths
+    // of drivers without it (NVIDIA's) on others.
+    {
+      const char* test = std::getenv("FORZA_TEST_NO_STENCIL_EXPORT");
+      if (!test || std::strcmp(test, "1") != 0) {
+        XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
+      }
+    }
     // #148.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_image_format_list, 1, 2)
     if (get_physical_device_properties2_supported) {
