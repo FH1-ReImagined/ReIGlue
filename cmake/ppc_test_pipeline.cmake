@@ -3,8 +3,12 @@
 # Provides ppc_add_test_binary() for assembling, linking, and generating
 # symbol maps from PPC assembly test files.
 
-# Locate PPC toolchain in tools/ directory
-set(PPC_TOOLS_DIR "${PROJECT_SOURCE_DIR}/tools/binutils")
+# Locate PPC toolchain: binutils 2.24 with Xenon's VMX128 (-mvmx128, which distribution
+# binutils do not have) in tools/, built for x86-64 Linux and Windows. Other hosts point
+# PPC_TOOLS_DIR at wrappers of the same name: ARM64 Linux CI runs these under qemu-user
+# (.github/workflows/build-linux-aarch64.yaml).
+set(PPC_TOOLS_DIR "${PROJECT_SOURCE_DIR}/tools/binutils" CACHE PATH
+    "Directory of the powerpc-none-elf-as, -ld and -nm the PPC tests are built with")
 
 if(WIN32)
     set(PPC_ASSEMBLER "${PPC_TOOLS_DIR}/powerpc-none-elf-as.exe")

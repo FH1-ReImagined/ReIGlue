@@ -74,14 +74,19 @@
 #endif
 
 // As in codegen/pch_h.inja: 0x1000 only where the runtime maps the 0xE0000000
-// view 4 KB short.
+// view 4 KB short (REX_PHYSICAL_VIEW_ROUNDED in rex/system/xmemory.h).
 #ifndef REX_WIN32_ROUNDED_PHYSICAL_VIEW
 #define REX_WIN32_ROUNDED_PHYSICAL_VIEW 0
 #endif
-#if (REX_PLATFORM_WIN32 && REX_WIN32_ROUNDED_PHYSICAL_VIEW) || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+#if (REX_PLATFORM_WIN32 && REX_WIN32_ROUNDED_PHYSICAL_VIEW) || \
+    (!REX_PLATFORM_WIN32 && (REX_ARCH_ARM64 || REX_PLATFORM_ANDROID))
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define REX_PHYS_HOST_OFFSET(addr) 0u
+#endif
+#ifdef REX_PHYSICAL_VIEW_ROUNDED
+static_assert(REX_PHYS_HOST_OFFSET(0xE0000000u) == (REX_PHYSICAL_VIEW_ROUNDED ? 0x1000u : 0u),
+              "REX_PHYS_HOST_OFFSET disagrees with the runtime's REX_PHYSICAL_VIEW_ROUNDED");
 #endif
 
 #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))

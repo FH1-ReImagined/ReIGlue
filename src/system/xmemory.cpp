@@ -52,11 +52,14 @@ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_s
 
 namespace {
 
-// The granularity of the backing file offsets that Memory::MapViews maps the
-// guest views at. The 0xE0000000 view starts 4KB into physical memory; where
-// this is coarser, that view is mapped rounded down, and host_address_offset
-// (and detail::PhysicalHostOffset in compiled code) adds the 0x1000 back.
-size_t ViewOffsetGranularity() {
+// SetHostViewOffsetGranularityForTesting; 0: the host's.
+size_t host_view_offset_granularity_for_testing = 0;
+
+// The granularity of the file offsets MapFileView takes on this host.
+size_t HostViewOffsetGranularity() {
+  if (host_view_offset_granularity_for_testing) {
+    return host_view_offset_granularity_for_testing;
+  }
 #if REX_PLATFORM_WIN32 && !REX_WIN32_ROUNDED_PHYSICAL_VIEW
   // Placeholder views map at any page; Memory::Initialize refuses a Windows
   // without them.
@@ -66,7 +69,34 @@ size_t ViewOffsetGranularity() {
 #endif
 }
 
+// The granularity of the backing file offsets that Memory::MapViews maps the
+// guest views at. The 0xE0000000 view starts 4KB into physical memory; where
+// this is coarser, that view is mapped rounded down, and host_address_offset
+// (and detail::PhysicalHostOffset in compiled code) adds the 0x1000 back.
+size_t ViewOffsetGranularity() {
+  return rex::memory::detail::ViewOffsetGranularityFor(HostViewOffsetGranularity());
+}
+
 }  // namespace
+
+namespace detail {
+
+size_t ViewOffsetGranularityFor(size_t host_granularity) noexcept {
+#if REX_PHYSICAL_VIEW_ROUNDED && !REX_PLATFORM_WIN32
+  // The same views on 4, 16 and 64KB kernels. Every view's offset but the
+  // 0xE0000000 one's is a multiple of 16MB, so only that view moves.
+  constexpr size_t kRoundedViewOffsetGranularity = 0x10000;
+  return std::max(host_granularity, kRoundedViewOffsetGranularity);
+#else
+  return host_granularity;
+#endif
+}
+
+void SetHostViewOffsetGranularityForTesting(size_t host_granularity) noexcept {
+  host_view_offset_granularity_for_testing = host_granularity;
+}
+
+}  // namespace detail
 
 // FH1 (#640): what the guest's memory costs the host, in the log. Guest Release and
 // Decommit keep the host memory (Windows cannot decommit pages of a mapped view, and the
@@ -243,6 +273,21 @@ bool Memory::Initialize() {
     return false;
   }
 #endif
+
+  // The compiled guest accesses add 0x1000 at 0xE0000000 and up only in a
+  // REX_PHYSICAL_VIEW_ROUNDED build, so the views must be mapped to match: a
+  // build without it cannot map that view where its pages are larger than 4KB.
+  if (!host_view_offset_granularity_for_testing &&
+      !detail::ViewOffsetGranularityMatchesBuild(ViewOffsetGranularity())) {
+    const std::string message = fmt::format(
+        "This build maps the guest's memory for 4 KB memory pages, and this system uses "
+        "{} KB pages. It needs a build for this system (ARM64 and Android builds work with "
+        "any page size).",
+        rex::memory::allocation_granularity() / 1024);
+    REXSYS_ERROR("{}", message);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, message);
+    return false;
+  }
 
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
 
@@ -443,7 +488,7 @@ int Memory::MapViewsMac() {
   }
 
   uint8_t* mapping_base = reinterpret_cast<uint8_t*>(reserved_base);
-  uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+  uint64_t granularity_mask = ~uint64_t(ViewOffsetGranularity() - 1);
 
   for (size_t n = 0; n < rex::countof(map_info); n++) {
     size_t view_size = static_cast<size_t>(map_info[n].virtual_address_end -
@@ -495,6 +540,9 @@ void Memory::UnmapViews() {
     if (views_.all_views[n]) {
       size_t length = map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1;
       rex::memory::UnmapFileView(mapping_, views_.all_views[n], length);
+      // A failed MapViews attempt unmaps its views; the next attempt must not
+      // unmap this one again (something else may have been mapped there).
+      views_.all_views[n] = nullptr;
     }
   }
 }

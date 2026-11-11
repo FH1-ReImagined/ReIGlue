@@ -565,11 +565,16 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
 
   int flags = MAP_SHARED;
 
-  // For file views, we need MAP_FIXED to replace existing reservations.
-  // The emulator reserves address space first, then maps file views into it.
-  // MAP_FIXED_NOREPLACE would fail with EEXIST in this case.
+  // A view at base_address must never replace what is already mapped there
+  // (Memory::MapViews maps the guest views at 1 << n, nothing reserved first,
+  // and tries the next n when one fails): MAP_FIXED_NOREPLACE (Linux 4.17+,
+  // Android) fails with EEXIST instead. Without it, or on an older kernel that
+  // ignores the flag, base_address is a hint, and a view the kernel placed
+  // elsewhere is unmapped below.
   if (base_address) {
-    flags |= MAP_FIXED;
+#ifdef MAP_FIXED_NOREPLACE
+    flags |= MAP_FIXED_NOREPLACE;
+#endif
   }
 
   uint32_t prot = ToPosixProtectFlags(access);

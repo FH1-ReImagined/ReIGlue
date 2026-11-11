@@ -32,31 +32,65 @@ class ByteStream;
 #define REX_WIN32_ROUNDED_PHYSICAL_VIEW 0
 #endif
 
+// 1 where the runtime maps the 0xE0000000 view 4KB short of its offset and guest
+// accesses at 0xE0000000 and up add 0x1000 (PhysicalHostOffset, and
+// REX_PHYS_HOST_OFFSET in the generated code, which repeats this condition):
+//   - Windows:      only with REX_WIN32_ROUNDED_PHYSICAL_VIEW (placeholder views
+//                   map it at its exact offset otherwise);
+//   - ARM64 (any OS) and Android (any CPU): always. Their kernels may use 4, 16
+//                   or 64KB pages (Apple silicon, Asahi, Android 15+ devices and
+//                   the 16KB x86_64 emulator images, 64KB server kernels), and a
+//                   view's file offset must be a multiple of the page size. The
+//                   runtime then maps the views at 64KB-rounded offsets whatever
+//                   the page size, so one binary is right on all of them;
+//   - otherwise (x86_64 Linux and macOS): never. Memory::Initialize refuses a
+//                   host whose pages are larger than 4KB.
+// Derived from the target only; do not define it by hand.
+#ifndef REX_PHYSICAL_VIEW_ROUNDED
+#if REX_PLATFORM_WIN32
+#define REX_PHYSICAL_VIEW_ROUNDED REX_WIN32_ROUNDED_PHYSICAL_VIEW
+#elif defined(__aarch64__) || defined(__ANDROID__)
+#define REX_PHYSICAL_VIEW_ROUNDED 1
+#else
+#define REX_PHYSICAL_VIEW_ROUNDED 0
+#endif
+#endif
+
 namespace rex::memory::detail {
 
 /// Compensates for a 0xE0 physical view mapped short of its 4KB offset. The
 /// 0xE0 heap starts 0x1000 bytes into physical memory; where the backing file
-/// can only be mapped at offsets coarser than that, the view is mapped rounded
+/// offset granularity is coarser than 4KB, Memory::MapViews maps that view rounded
 /// down and guest accesses must add the 0x1000 back. This must agree with
 /// Memory::MapViews and PhysicalHeap::Initialize (host_address_offset), and
-/// with REX_PHYS_HOST_OFFSET in the generated code:
-///   - Windows:        placeholder views (VirtualAlloc2, MapViewOfFile3) map it
-///                     at its exact offset -> no offset; Memory::Initialize
-///                     refuses a Windows without them (before 10 version 1803).
-///                     A build with REX_WIN32_ROUNDED_PHYSICAL_VIEW maps it
-///                     with MapViewOfFileEx, its offset rounded down to the
-///                     64KB granularity -> offset
-///   - macOS arm64:    16KB granularity  -> offset
-///   - macOS x86_64:    4KB granularity  -> no offset
-///   - Linux (any):     4KB granularity  -> no offset (mmap handles it natively)
+/// with REX_PHYS_HOST_OFFSET in the generated code: see REX_PHYSICAL_VIEW_ROUNDED.
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
-#if (REX_PLATFORM_WIN32 && REX_WIN32_ROUNDED_PHYSICAL_VIEW) || \
-    (REX_PLATFORM_MAC && defined(__aarch64__))
+#if REX_PHYSICAL_VIEW_ROUNDED
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
 #else
   return 0u;
 #endif
 }
+
+/// The backing file offset granularity Memory::MapViews maps the guest views at,
+/// for a host whose MapFileView offsets must be multiples of
+/// host_granularity: in a REX_PHYSICAL_VIEW_ROUNDED build on POSIX at least
+/// 64KB (the largest page size of the kernels it may run on), else
+/// host_granularity. Coarser than 4KB means the 0xE0000000 view is rounded down.
+size_t ViewOffsetGranularityFor(size_t host_granularity) noexcept;
+
+/// Whether views mapped at view_granularity agree with this build's compiled
+/// guest accesses (PhysicalHostOffset): Memory::Initialize fails where not.
+constexpr bool ViewOffsetGranularityMatchesBuild(size_t view_granularity) noexcept {
+  return (view_granularity > 0x1000) == bool(REX_PHYSICAL_VIEW_ROUNDED);
+}
+
+/// Tests only: makes the next Memory::Initialize map the views as on a host with
+/// this MapFileView offset granularity (0 restores the host's). It skips the
+/// check against the compiled guest accesses, so a test that sets it must
+/// translate through the heaps' host_address_offset() (Memory::TranslateVirtual),
+/// not PhysicalHostOffset.
+void SetHostViewOffsetGranularityForTesting(size_t host_granularity) noexcept;
 
 }  // namespace rex::memory::detail
 
