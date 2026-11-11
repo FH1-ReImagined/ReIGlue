@@ -13,6 +13,7 @@
 #include "fh1_frame_cost.h"
 #include "fh1_vr_stereo.h"
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -41,6 +42,10 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+
+#if REX_ARCH_AMD64
+#include <tmmintrin.h>
+#endif
 
 #if REX_PLATFORM_LINUX
 #include <linux/futex.h>
@@ -400,6 +405,10 @@ constexpr uint32_t kRecordSpin = 1024;
 constexpr uint64_t kRecordMaxQueued = 512;
 // A batch is published after this many draws (and other backend work) or words.
 constexpr uint32_t kRecordBatchActions = 32;
+// FH1 (#607, patch 0452): or after this many while the recorder has run everything published.
+constexpr uint32_t kRecordBatchActionsIdle = 4;
+// The physical address bits of a word the recorder stores (RecordNoteStore).
+constexpr uint32_t kRecordStoreAddressMask = 0x1FFFFFFC;
 constexpr size_t kRecordBatchWords = 32768;
 }  // namespace
 
@@ -474,7 +483,8 @@ void CommandProcessor::RecordThreadMain() {
       std::lock_guard<std::mutex> lock(record_mutex_);
       record_free_.push_back(std::move(batch));
       record_completed_.store(taken, std::memory_order_release);
-      wake = record_decoder_waiting_;
+      // FH1 (#607, patch 0452): only once the batch the decoder waits for is done.
+      wake = record_decoder_waiting_ && taken >= record_wake_at_;
     }
     if (wake) {
       record_done_cond_.notify_one();
@@ -489,7 +499,14 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
     switch (words[i]) {
       case kRecordRun: {
         const uint32_t start = words[i + 1], run = words[i + 2];
-        WriteRegistersFromMem(start, const_cast<uint32_t*>(words + i + 3), run);
+        WriteRegistersFromHost(start, words + i + 3, run);
+        i += 3 + run;
+      } break;
+      case kRecordPlainRun: {
+        // FH1 (#607, patch 0450): registers whose write only stores the value (0360's direct
+        // copy, which the split could not take from the ring), without the backend's call.
+        const uint32_t start = words[i + 1], run = words[i + 2];
+        std::memcpy(register_file_->values + start, words + i + 3, sizeof(uint32_t) * run);
         i += 3 + run;
       } break;
       case kRecordOne:
@@ -547,14 +564,20 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
 }
 
 uint32_t* CommandProcessor::RecordWords(uint32_t count) {
-  std::vector<uint32_t>& words = record_batch_->words;
+  auto& words = record_batch_->words;
   const size_t offset = words.size();
   words.resize(offset + count);
   return words.data() + offset;
 }
 
 void CommandProcessor::RecordAction() {
-  if (++record_batch_->actions >= kRecordBatchActions) {
+  // FH1 (#607, patch 0452): a recorder with nothing to do gets the work sooner, in a smaller
+  // batch (after a wait, at the start of the game's next commands), rather than idling until
+  // the decoder has decoded 32 draws.
+  const uint32_t actions = ++record_batch_->actions;
+  if (actions >= kRecordBatchActions ||
+      (actions >= kRecordBatchActionsIdle &&
+       record_completed_.load(std::memory_order_relaxed) == record_published_)) {
     PublishRecordBatch();
   }
 }
@@ -571,7 +594,68 @@ inline bool ElidableOne(uint32_t index) {
 // Unchanged registers between two changed ones that are recorded with them rather than starting
 // a new run (a run costs more than storing a few values again).
 constexpr uint32_t kElideGap = 8;
+// FH1 (#607, patch 0451): bit i set if shadow[i] (host byte order) differs from guest[i] (guest
+// byte order), for count <= 64.
+inline uint64_t ChangedRegisters(const uint32_t* shadow, const uint32_t* guest, uint32_t count) {
+  uint64_t changed = 0;
+  uint32_t i = 0;
+#if REX_ARCH_AMD64
+  const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+  for (; i + 8 <= count; i += 8) {
+    const __m128i g0 =
+        _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(guest + i)), swap);
+    const __m128i g1 =
+        _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(guest + i + 4)), swap);
+    const __m128i s0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(shadow + i));
+    const __m128i s1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(shadow + i + 4));
+    const uint32_t same = uint32_t(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(g0, s0)))) |
+                          (uint32_t(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(g1, s1))))
+                           << 4);
+    changed |= uint64_t(~same & 0xFF) << i;
+  }
+#endif
+  for (; i < count; ++i) {
+    if (shadow[i] != memory::load_and_swap<uint32_t>(guest + i)) {
+      changed |= uint64_t(1) << i;
+    }
+  }
+  return changed;
+}
+// FH1 (#607, patch 0450): whether every register of [first, first + count) has its bit set.
+inline bool AllBitsSet(const uint64_t* bits, uint32_t first, uint32_t count) {
+  const uint32_t last = first + count - 1;
+  uint32_t word = first >> 6;
+  const uint32_t last_word = last >> 6;
+  const uint64_t first_mask = ~UINT64_C(0) << (first & 63);
+  const uint64_t last_mask = ~UINT64_C(0) >> (63 - (last & 63));
+  if (word == last_word) {
+    const uint64_t mask = first_mask & last_mask;
+    return (bits[word] & mask) == mask;
+  }
+  if ((bits[word] & first_mask) != first_mask) {
+    return false;
+  }
+  for (++word; word < last_word; ++word) {
+    if (bits[word] != ~UINT64_C(0)) {
+      return false;
+    }
+  }
+  return (bits[last_word] & last_mask) == last_mask;
+}
 }  // namespace
+
+uint32_t* CommandProcessor::RecordRun(uint32_t start_index, uint32_t num_registers) {
+  uint32_t* record = RecordWords(3 + num_registers);
+  // The registers the backend only stores (all of them outside the constant blocks) go
+  // straight to the register file on the recorder.
+  record[0] = fh1_plain_registers_ && start_index < XE_GPU_REG_SHADER_CONSTANT_000_X &&
+                      AllBitsSet(fh1_plain_registers_, start_index, num_registers)
+                  ? kRecordPlainRun
+                  : kRecordRun;
+  record[1] = start_index;
+  record[2] = num_registers;
+  return record + 3;
+}
 
 void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
   if (!record_split_) {
@@ -583,6 +667,15 @@ void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
     return;
   }
   ++record_registers_out_;
+  if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
+    // FH1 (#607, patch 0452): the recorder's WriteRegister stores it to memory (Direct3D's
+    // fences, which WAIT_REG_MEM waits for): where, for RecordWaitStore.
+    const uint32_t* shadow = decode_register_file_->values;
+    const uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
+    if ((1 << scratch_reg) & shadow[XE_GPU_REG_SCRATCH_UMSK]) {
+      RecordNoteStore(shadow[XE_GPU_REG_SCRATCH_ADDR] + scratch_reg * 4);
+    }
+  }
   if (index < RegisterFile::kRegisterCount) {
     uint32_t shadow_value = value;
     if (index == XE_GPU_REG_COHER_STATUS_HOST) {
@@ -590,6 +683,16 @@ void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
       shadow_value |= UINT32_C(0x80000000);
     }
     decode_register_file_->values[index] = shadow_value;
+    if (fh1_plain_registers_ && ((fh1_plain_registers_[index >> 6] >> (index & 63)) & 1)) {
+      // FH1 (#607, patch 0450): the draw initiators and index buffer registers among them,
+      // stored on the recorder without the backend's WriteRegister.
+      uint32_t* record = RecordWords(4);
+      record[0] = kRecordPlainRun;
+      record[1] = index;
+      record[2] = 1;
+      record[3] = value;
+      return;
+    }
   }
   uint32_t* record = RecordWords(3);
   record[0] = kRecordOne;
@@ -618,34 +721,38 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
       !(start_index <= XE_GPU_REG_VGT_DRAW_INITIATOR &&
         start_index + num_registers > XE_GPU_REG_VGT_EVENT_INITIATOR)) {
     // After Pinyon Shift (ShiftGlue 9bf779f): only the parts of the range that change a value.
+    // FH1 (#607, patch 0451): which values change is found 64 registers at a time (a bit
+    // each, four compared per step), then the runs of changes, with gaps of up to kElideGap
+    // unchanged registers inside a run, are read from the bits. A run is written to the
+    // shadow when it ends, behind the comparisons (which are against the old values).
     uint32_t* shadow = decode_register_file_->values + start_index;
-    uint32_t i = 0;
-    while (i < num_registers) {
-      while (i < num_registers && shadow[i] == memory::load_and_swap<uint32_t>(base + i)) {
-        ++i;
-      }
-      if (i >= num_registers) {
-        break;
-      }
-      const uint32_t first = i;
-      uint32_t last = i;
-      for (uint32_t j = i + 1, gap = 0; j < num_registers; ++j) {
-        if (shadow[j] != memory::load_and_swap<uint32_t>(base + j)) {
-          last = j;
-          gap = 0;
-        } else if (++gap > kElideGap) {
-          break;
-        }
-      }
+    uint32_t run_first = UINT32_MAX, run_last = 0;
+    auto record_run = [&](uint32_t first, uint32_t last) {
       const uint32_t run = last - first + 1;
-      memory::copy_and_swap(shadow + first, base + first, run);
-      uint32_t* record = RecordWords(3 + run);
-      record[0] = kRecordRun;
-      record[1] = start_index + first;
-      record[2] = run;
-      std::memcpy(record + 3, base + first, sizeof(uint32_t) * run);
+      uint32_t* values = RecordRun(start_index + first, run);
+      for (uint32_t k = 0; k < run; ++k) {
+        values[k] = memory::load_and_swap<uint32_t>(base + first + k);
+      }
+      std::memcpy(shadow + first, values, sizeof(uint32_t) * run);
       record_registers_out_ += run;
-      i = last + 1;
+    };
+    for (uint32_t block = 0; block < num_registers; block += 64) {
+      uint64_t changed = ChangedRegisters(shadow + block, base + block,
+                                          std::min<uint32_t>(64, num_registers - block));
+      while (changed) {
+        const uint32_t i = block + uint32_t(std::countr_zero(changed));
+        changed &= changed - 1;
+        if (run_first == UINT32_MAX) {
+          run_first = i;
+        } else if (i - run_last - 1 > kElideGap) {
+          record_run(run_first, run_last);
+          run_first = i;
+        }
+        run_last = i;
+      }
+    }
+    if (run_first != UINT32_MAX) {
+      record_run(run_first, run_last);
     }
     if (record_batch_->words.size() >= kRecordBatchWords) {
       PublishRecordBatch();
@@ -653,16 +760,25 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
     return;
   }
   record_registers_out_ += num_registers;
-  memory::copy_and_swap(decode_register_file_->values + start_index, base, num_registers);
+  uint32_t* values = RecordRun(start_index, num_registers);
+  memory::copy_and_swap(values, base, num_registers);
+  std::memcpy(decode_register_file_->values + start_index, values,
+              sizeof(uint32_t) * num_registers);
   if (start_index <= XE_GPU_REG_COHER_STATUS_HOST &&
       start_index + num_registers > XE_GPU_REG_COHER_STATUS_HOST) {
     decode_register_file_->values[XE_GPU_REG_COHER_STATUS_HOST] |= UINT32_C(0x80000000);
   }
-  uint32_t* record = RecordWords(3 + num_registers);
-  record[0] = kRecordRun;
-  record[1] = start_index;
-  record[2] = num_registers;
-  std::memcpy(record + 3, base, sizeof(uint32_t) * num_registers);
+  if (start_index <= XE_GPU_REG_SCRATCH_REG7 &&
+      start_index + num_registers > XE_GPU_REG_SCRATCH_REG0) {
+    const uint32_t* shadow = decode_register_file_->values;
+    for (uint32_t index = std::max<uint32_t>(start_index, XE_GPU_REG_SCRATCH_REG0);
+         index <= XE_GPU_REG_SCRATCH_REG7 && index < start_index + num_registers; ++index) {
+      const uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
+      if ((1 << scratch_reg) & shadow[XE_GPU_REG_SCRATCH_UMSK]) {
+        RecordNoteStore(shadow[XE_GPU_REG_SCRATCH_ADDR] + scratch_reg * 4);
+      }
+    }
+  }
   if (record_batch_->words.size() >= kRecordBatchWords) {
     PublishRecordBatch();
   }
@@ -726,6 +842,7 @@ void CommandProcessor::RecordCall(std::function<void()> fn) {
 }
 
 void CommandProcessor::RecordStore(uint32_t address, uint32_t guest_value) {
+  RecordNoteStore(address);
   uint32_t* record = RecordWords(3);
   record[0] = kRecordStore;
   record[1] = address;
@@ -743,6 +860,7 @@ void CommandProcessor::PublishRecordBatch() {
     const uint64_t target = record_published_ - kRecordMaxQueued / 2;
     std::unique_lock<std::mutex> lock(record_mutex_);
     record_decoder_waiting_ = true;
+    record_wake_at_ = target;
     record_done_cond_.wait(lock, [&]() {
       return record_completed_.load(std::memory_order_acquire) >= target;
     });
@@ -786,6 +904,7 @@ void CommandProcessor::RecordSync(RecordSyncReason reason) {
   }
   std::unique_lock<std::mutex> lock(record_mutex_);
   record_decoder_waiting_ = true;
+  record_wake_at_ = target;
   record_done_cond_.wait(
       lock, [&]() { return record_completed_.load(std::memory_order_acquire) >= target; });
   record_decoder_waiting_ = false;
@@ -809,10 +928,77 @@ void CommandProcessor::RecordWaitProgress() {
   }
   std::unique_lock<std::mutex> lock(record_mutex_);
   record_decoder_waiting_ = true;
+  record_wake_at_ = completed + 1;
   record_done_cond_.wait_for(lock, std::chrono::microseconds(100), [&]() {
     return record_completed_.load(std::memory_order_acquire) != completed;
   });
   record_decoder_waiting_ = false;
+}
+
+void CommandProcessor::RecordNoteStore(uint32_t address) {
+  // Physical addresses, as TranslatePhysical takes them. The batch being recorded is published
+  // as number record_published_ + 1.
+  address &= kRecordStoreAddressMask;
+  for (RecordedStore& store : record_stores_) {
+    if (store.address == address) {
+      store.batch = record_published_ + 1;
+      return;
+    }
+  }
+  RecordedStore& slot = record_stores_[record_store_next_++ % kRecordStoreSlots];
+  slot.address = address;
+  slot.batch = record_published_ + 1;
+}
+
+bool CommandProcessor::RecordWaitStore(uint32_t address) {
+  address &= kRecordStoreAddressMask;
+  uint64_t target = 0;
+  for (const RecordedStore& store : record_stores_) {
+    if (store.address == address) {
+      target = store.batch;
+      break;
+    }
+  }
+  if (target <= record_completed_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  if (wait_progress_first_) {
+    ++record_syncs_[kSyncWaitMemory];
+  }
+  PublishRecordBatch();
+  target = std::min(target, record_published_);
+  // Asleep until the recorder runs the batch with the store (woken once, not after each batch
+  // before it), polling only while it runs that batch; at most 100 us at a time, as the CPU may
+  // write the word too.
+  uint64_t completed = record_completed_.load(std::memory_order_acquire);
+  if (completed + 1 < target) {
+    std::unique_lock<std::mutex> lock(record_mutex_);
+    record_decoder_waiting_ = true;
+    record_wake_at_ = target - 1;
+    record_done_cond_.wait_for(lock, std::chrono::microseconds(100), [&]() {
+      return record_completed_.load(std::memory_order_acquire) + 1 >= target;
+    });
+    record_decoder_waiting_ = false;
+    completed = record_completed_.load(std::memory_order_acquire);
+    if (completed + 1 < target) {
+      return true;
+    }
+  }
+  for (uint32_t i = 0;
+       i < kRecordSpin && record_completed_.load(std::memory_order_acquire) < target; ++i) {
+    SpinPause();
+  }
+  if (record_completed_.load(std::memory_order_acquire) >= target) {
+    return true;
+  }
+  std::unique_lock<std::mutex> lock(record_mutex_);
+  record_decoder_waiting_ = true;
+  record_wake_at_ = target;
+  record_done_cond_.wait_for(lock, std::chrono::microseconds(100), [&]() {
+    return record_completed_.load(std::memory_order_acquire) >= target;
+  });
+  record_decoder_waiting_ = false;
+  return true;
 }
 
 void CommandProcessor::LogRecordSplit() {
@@ -1113,6 +1299,13 @@ void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* bas
   for (uint32_t i = 0; i < num_registers; ++i) {
     uint32_t data = memory::load_and_swap<uint32_t>(base + i);
     WriteRegister(start_index + i, data);
+  }
+}
+
+void CommandProcessor::WriteRegistersFromHost(uint32_t start_index, const uint32_t* values,
+                                              uint32_t num_registers) {
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    WriteRegister(start_index + i, values[i]);
   }
 }
 
@@ -2045,7 +2238,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         // #474: the word may be one the recorder is still to write (a fence, the scratch
         // write-back), and the sleep below lasts until a vblank: while the recorder has work,
         // poll again each time it finishes a batch (or after 100 us, the game may write it).
-        RecordWaitProgress();
+        // FH1 (#607, patch 0452): a word the recorder is still to store (a recorded fence or
+        // scratch write-back), as the waits in a frame are: once its batch is done.
+        if (!RecordWaitStore(poll_reg_addr & ~uint32_t(0x3))) {
+          RecordWaitProgress();
+        }
         continue;
       }
       // Wait.
