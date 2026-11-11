@@ -594,4 +594,12 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out);
 
+// FH1 (#785): moves the copy of a predicated tiling tile resolve whose RB_COPY_DEST_BASE points
+// at the tile's position (old_x, old_y) in a 2D texture (the copy itself at offset 0) to
+// (new_x, new_y) of that texture, copying width x height pixels. The extent is the union of
+// the old and the new one, so the same memory is marked as resolved. False (info unchanged)
+// for a destination this can't move: an array, an offset copy, or misaligned positions.
+bool Fh1MoveResolveCopy(const RegisterFile& regs, uint32_t old_x, uint32_t old_y, uint32_t new_x,
+                        uint32_t new_y, uint32_t width, uint32_t height, ResolveInfo& info);
+
 }  // namespace rex::graphics::draw_util

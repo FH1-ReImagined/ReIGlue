@@ -1318,14 +1318,43 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   const VkDevice device = vulkan_device->device();
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
+  // #785: a predicated tiling tile drawn on the fractional raster lands at its fractional
+  // position (fh1_screen_raster.h). Only the copy moves; the clear stays the tile's.
+  draw_util::ResolveInfo copy_info = resolve_info;
+  if (fh1_last_draw_fractional_ && (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f) &&
+      register_file().Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+    const auto window_offset = register_file().Get<reg::PA_SC_WINDOW_OFFSET>();
+    const int window_x = int(window_offset.window_x_offset);
+    const int window_y = int(window_offset.window_y_offset);
+    fh1::FractionalTileResolve tile{};
+    if (window_x == fh1_last_draw_window_x_ && window_y == fh1_last_draw_window_y_ &&
+        !resolve_info.coordinate_info.edram_offset_x_div_8 &&
+        !resolve_info.coordinate_info.edram_offset_y_div_8 &&
+        fh1::GetFractionalTileResolve(
+            window_x, window_y, raster_scale_x_, raster_scale_y_,
+            uint32_t(resolve_info.coordinate_info.width_div_8)
+                << xenos::kResolveAlignmentPixelsLog2,
+            resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2, tile) &&
+        draw_util::Fh1MoveResolveCopy(register_file(), uint32_t(-window_x), uint32_t(-window_y),
+                                      tile.x, tile.y, tile.width, tile.height, copy_info)) {
+      ++fh1_fractional_tile_resolves_;
+      if (fh1_fractional_tile_resolves_ <= 4) {
+        REXGPU_INFO(
+            "FH1 fractional raster: tile resolve at screen ({}, {}) placed at ({}, {}), "
+            "{}x{} (#785)",
+            -window_x, -window_y, tile.x, tile.y, tile.width, tile.height);
+      }
+    }
+  }
+
   // Copying.
   bool copied = false;
-  if (resolve_info.copy_dest_extent_length) {
+  if (copy_info.copy_dest_extent_length) {
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =
-        resolve_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
-                                   copy_shader_constants, copy_group_count_x, copy_group_count_y);
+        copy_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
+                                copy_shader_constants, copy_group_count_x, copy_group_count_y);
     assert_true(copy_group_count_x && copy_group_count_y);
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
@@ -1334,8 +1363,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
           Fh1GpuZoneScope gpu_zone(command_buffer, Fh1GpuProfile::kResolveDirect);
-          direct_resolved =
-              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
+          direct_resolved = TryResolveCopyDirectly(copy_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
             ++direct_resolve_success_count_;
           } else {
@@ -1349,7 +1377,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           uint32_t dump_row_length_used;
           uint32_t dump_rows;
           uint32_t dump_pitch;
-          resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+          copy_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
           Fh1GpuZoneScope gpu_zone(command_buffer, Fh1GpuProfile::kResolveDump);
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
@@ -1358,24 +1386,24 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         }
       }
 
-      uint32_t copy_dest_range_unscaled = resolve_info.copy_dest_extent_start -
-                                          resolve_info.copy_dest_base +
-                                          resolve_info.copy_dest_extent_length;
-      uint64_t copy_dest_base = resolve_info.copy_dest_base;
+      uint32_t copy_dest_range_unscaled = copy_info.copy_dest_extent_start -
+                                          copy_info.copy_dest_base +
+                                          copy_info.copy_dest_extent_length;
+      uint64_t copy_dest_base = copy_info.copy_dest_base;
       uint64_t copy_dest_range_length = copy_dest_range_unscaled;
-      uint64_t copy_dest_use_start = resolve_info.copy_dest_extent_start;
-      uint64_t copy_dest_use_length = resolve_info.copy_dest_extent_length;
+      uint64_t copy_dest_use_start = copy_info.copy_dest_extent_start;
+      uint64_t copy_dest_use_length = copy_info.copy_dest_extent_length;
       if (draw_resolution_scaled) {
-        if (!texture_cache.GetScaledResolveRange(
-                resolve_info.copy_dest_base, copy_dest_range_unscaled,
-                copy_shader_info.dest_bpe_log2, copy_dest_base, copy_dest_range_length) ||
+        if (!texture_cache.GetScaledResolveRange(copy_info.copy_dest_base, copy_dest_range_unscaled,
+                                                 copy_shader_info.dest_bpe_log2, copy_dest_base,
+                                                 copy_dest_range_length) ||
             !texture_cache.GetScaledResolveRange(
-                resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+                copy_info.copy_dest_extent_start, copy_info.copy_dest_extent_length,
                 copy_shader_info.dest_bpe_log2, copy_dest_use_start, copy_dest_use_length)) {
           REXGPU_ERROR(
               "VulkanRenderTargetCache: Failed to map scaled resolve "
               "destination range (base={:08X}, length={:08X})",
-              resolve_info.copy_dest_base, copy_dest_range_unscaled);
+              copy_info.copy_dest_base, copy_dest_range_unscaled);
           return false;
         }
       }
@@ -1384,10 +1412,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       bool copy_dest_committed;
       if (draw_resolution_scaled) {
         copy_dest_committed = texture_cache.CommitScaledResolveRange(
-            resolve_info.copy_dest_base, copy_dest_range_unscaled, copy_shader_info.dest_bpe_log2);
+            copy_info.copy_dest_base, copy_dest_range_unscaled, copy_shader_info.dest_bpe_log2);
       } else {
-        copy_dest_committed = shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
-                                                         resolve_info.copy_dest_extent_length);
+        copy_dest_committed = shared_memory.RequestRange(copy_info.copy_dest_extent_start,
+                                                         copy_info.copy_dest_extent_length);
       }
       if (!copy_dest_committed) {
         REXGPU_ERROR(
@@ -1456,10 +1484,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
 
           // Invalidate textures and mark the range as scaled if needed.
-          texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
-          written_address_out = resolve_info.copy_dest_extent_start;
-          written_length_out = resolve_info.copy_dest_extent_length;
+          texture_cache.MarkRangeAsResolved(copy_info.copy_dest_extent_start,
+                                            copy_info.copy_dest_extent_length);
+          written_address_out = copy_info.copy_dest_extent_start;
+          written_length_out = copy_info.copy_dest_extent_length;
           copied = true;
         }
       }
