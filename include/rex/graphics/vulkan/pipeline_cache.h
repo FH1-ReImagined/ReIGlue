@@ -445,15 +445,11 @@ class VulkanPipelineCache {
   uint64_t driver_cache_saved_generation_ = 0;
   driver_cache_file::WriteState driver_cache_write_state_;
   bool driver_cache_limit_logged_ = false;
-  // FH1 (#640): bytes the entries of both maps take in a file (entry headers included), and
-  // whether a pipeline's data was dropped because they reached the most a save keeps.
-  uint64_t driver_cache_bytes_ = 0;
+  driver_cache_file::RetainedPayloads driver_cache_payloads_;
   bool driver_cache_memory_logged_ = false;
-  // Keeps an entry in driver_cache_used_ in place of the pipeline's seed (held: its bytes, taken
-  // out of driver_cache_stored_ and still counted) if the maps stay within the budget, or always
-  // (the entry is that seed); under the lock.
-  bool KeepDriverCacheEntry(uint64_t key, driver_cache_file::Entry entry, uint64_t held,
-                            bool always);
+  // Replaces a pipeline's in-flight seed and any previously used entry under the cache lock.
+  bool KeepDriverCacheEntry(uint64_t key, driver_cache_file::Entry entry,
+                            const driver_cache_file::Entry& seed, bool always);
   std::atomic<uint32_t> driver_cache_reused_{0};
   std::atomic<uint32_t> driver_cache_compiled_{0};
   std::atomic<uint32_t> driver_cache_rebuilt_{0};

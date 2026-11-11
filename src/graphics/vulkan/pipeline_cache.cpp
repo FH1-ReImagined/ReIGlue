@@ -448,7 +448,7 @@ void VulkanPipelineCache::DestroyDriverPipelineCache() {
   driver_cache_saved_generation_ = 0;
   driver_cache_write_state_ = {};
   driver_cache_limit_logged_ = false;
-  driver_cache_bytes_ = 0;
+  driver_cache_payloads_ = {};
   driver_cache_memory_logged_ = false;
   driver_cache_reused_ = 0;
   driver_cache_compiled_ = 0;
@@ -507,7 +507,9 @@ void VulkanPipelineCache::InitializeDriverPipelineCache(const std::filesystem::p
     driver_cache_path_ = directory / name;
     for (auto& entry : stored.entries) {
       const uint64_t key = entry.key;
-      driver_cache_bytes_ += driver_cache_file::kEntryHeaderSize + entry.size();
+      auto it = driver_cache_stored_.find(key);
+      if (it != driver_cache_stored_.end()) driver_cache_payloads_.Remove(it->second);
+      driver_cache_payloads_.Add(entry);
       driver_cache_stored_.insert_or_assign(key, std::move(entry));
     }
     // A file of another format, or damaged, is replaced at the next save.
@@ -574,8 +576,7 @@ void VulkanPipelineCache::CreatePipelineWithDriverCache(
   const VkDevice device = vulkan_device->device();
   const uint64_t key = description.GetHash();
   driver_cache_file::Entry seed;
-  // The seed stays counted in driver_cache_bytes_ while the pipeline is created.
-  uint64_t seed_bytes = 0;
+  // The seed remains charged to the budget while pipeline creation uses it.
   driver_cache_file::Identity identity;
   bool enabled;
   {
@@ -586,7 +587,6 @@ void VulkanPipelineCache::CreatePipelineWithDriverCache(
     if (enabled && it != driver_cache_stored_.end()) {
       seed = std::move(it->second);
       driver_cache_stored_.erase(it);
-      seed_bytes = driver_cache_file::kEntryHeaderSize + seed.size();
     }
   }
   bool seeded = false;
@@ -616,7 +616,7 @@ void VulkanPipelineCache::CreatePipelineWithDriverCache(
     ++driver_cache_reused_;
     std::lock_guard lock(driver_cache_mutex_);
     if (driver_cache_enabled_) {
-      KeepDriverCacheEntry(key, std::move(seed), seed_bytes, true);
+      KeepDriverCacheEntry(key, seed, seed, true);
     }
     return;
   }
@@ -624,8 +624,8 @@ void VulkanPipelineCache::CreatePipelineWithDriverCache(
     // Nothing to keep from this creation.
     if (seed.data) {
       std::lock_guard lock(driver_cache_mutex_);
-      if (driver_cache_enabled_ && !driver_cache_stored_.emplace(key, std::move(seed)).second) {
-        driver_cache_bytes_ -= seed_bytes;
+      if (driver_cache_enabled_ && !driver_cache_stored_.emplace(key, seed).second) {
+        driver_cache_payloads_.Remove(seed);
       }
     }
     return;
@@ -642,7 +642,7 @@ void VulkanPipelineCache::CreatePipelineWithDriverCache(
   bool changed = true;
   switch (outcome) {
     case driver_cache_file::Outcome::kReused:
-      entry = std::move(seed);
+      entry = seed;
       changed = false;
       ++driver_cache_reused_;
       break;
@@ -679,43 +679,39 @@ void VulkanPipelineCache::CreatePipelineWithDriverCache(
   std::lock_guard lock(driver_cache_mutex_);
   if (!driver_cache_enabled_) return;
   if (!entry.data) {
-    driver_cache_bytes_ -= seed_bytes;  // the stale seed, with nothing to replace it
-  } else if (!KeepDriverCacheEntry(key, std::move(entry), seed_bytes, !changed)) {
+    driver_cache_payloads_.Remove(seed);  // the stale seed, with nothing to replace it
+  } else if (!KeepDriverCacheEntry(key, std::move(entry), seed, !changed)) {
     return;
   }
   if (changed) ++driver_cache_generation_;
 }
 
 bool VulkanPipelineCache::KeepDriverCacheEntry(uint64_t key, driver_cache_file::Entry entry,
-                                               uint64_t held, bool always) {
-  // FH1 (#640): every entry stays in memory until the game exits, to be saved, and a save keeps
-  // at most kMaxFileSize. NVIDIA's data is about 2 MB a pipeline (#406), so a session of 800
-  // pipelines held 1.6 GB, most of which no save could keep. Past that size a new pipeline's
-  // data is dropped (the pipeline is created as before; it is compiled again next time).
+                                               const driver_cache_file::Entry& seed, bool always) {
+  // Charge each retained key header and each distinct driver blob before admitting the
+  // entry. Shared blobs count once in memory and once in the persisted file.
   const uint32_t budget_mb = REXCVAR_GET(vulkan_store_pipeline_cache_memory_mb);
   const uint64_t budget =
       (budget_mb ? std::min(uint64_t(budget_mb) << 20, driver_cache_file::kMaxFileSize)
                  : driver_cache_file::kMaxFileSize) -
       driver_cache_file::kHeaderSize;
-  const uint64_t bytes = driver_cache_file::kEntryHeaderSize + entry.size();
   auto it = driver_cache_used_.find(key);
-  const uint64_t replaced =
-      it != driver_cache_used_.end() ? driver_cache_file::kEntryHeaderSize + it->second.size() : 0;
-  // The pipeline's seed (held) and the entry it replaces give their place to the new one.
-  const uint64_t after = driver_cache_bytes_ - held - replaced + bytes;
-  if (!always && after > budget) {
-    driver_cache_bytes_ -= held;
+  driver_cache_payloads_.Remove(seed);
+  if (it != driver_cache_used_.end()) driver_cache_payloads_.Remove(it->second);
+  driver_cache_payloads_.Add(entry);
+  if (!always && driver_cache_payloads_.bytes() > budget) {
+    driver_cache_payloads_.Remove(entry);
+    if (it != driver_cache_used_.end()) driver_cache_payloads_.Add(it->second);
     if (!driver_cache_memory_logged_) {
       driver_cache_memory_logged_ = true;
       REXGPU_INFO(
           "Vulkan driver pipeline cache: {} MB held for {} pipelines, the most a save keeps; "
           "the data of pipelines created after this is not kept (they compile again next time)",
-          (driver_cache_bytes_ + (uint64_t(1) << 19)) >> 20,
+          (driver_cache_payloads_.bytes() + (uint64_t(1) << 19)) >> 20,
           driver_cache_used_.size() + driver_cache_stored_.size());
     }
     return false;
   }
-  driver_cache_bytes_ = after;
   if (it != driver_cache_used_.end()) {
     it->second = std::move(entry);
   } else {
@@ -737,7 +733,7 @@ void VulkanPipelineCache::PruneDriverPipelineCache(
       if (keys.count(it->first)) {
         ++it;
       } else {
-        driver_cache_bytes_ -= driver_cache_file::kEntryHeaderSize + it->second.size();
+        driver_cache_payloads_.Remove(it->second);
         it = driver_cache_stored_.erase(it);
         ++dropped;
       }
