@@ -75,3 +75,7 @@ target_link_libraries(shader_disasm_test PRIVATE rexruntime)
 set_target_properties(shader_disasm_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
 add_test(NAME gpu.shader_disasm COMMAND shader_disasm_test)
+
+add_executable(driver_cache_file_test driver_cache_file_test.cpp)
+target_include_directories(driver_cache_file_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME vulkan.driver_cache_file COMMAND driver_cache_file_test)
