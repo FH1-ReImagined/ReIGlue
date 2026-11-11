@@ -351,6 +351,21 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
     if (sequence & 0b10) {
       ucode_disasm_buffer.Append("         serialize\n             ");
     }
+    if (size_t(instr_offset) * 3 + 3 > ucode_data_.size()) {
+      // An exec past the end of the microcode: nothing there to run, the rest of the exec is
+      // skipped (FH1 #808: it read the heap after the microcode, and a fetch opcode there that
+      // the GPU does not define stopped the game).
+      if (!ucode_past_end_logged_) {
+        ucode_past_end_logged_ = true;
+        REXGPU_WARN(
+            "Shader {:016X} ({} shader, {} dwords): an exec runs instruction {}, past the end of "
+            "the microcode; skipped",
+            ucode_data_hash_, type() == xenos::ShaderType::kVertex ? "vertex" : "pixel",
+            ucode_data_.size(), instr_offset);
+      }
+      ucode_disasm_buffer.Append("      // past the end of the microcode\n");
+      break;
+    }
     const uint32_t* op_ptr = ucode_data_.data() + instr_offset * 3;
     if (sequence & 0b01) {
       auto& op = *reinterpret_cast<const FetchInstruction*>(op_ptr);
@@ -426,8 +441,18 @@ void Shader::GatherTextureFetchInformation(const TextureFetchInstruction& op,
                                            uint32_t& unique_texture_bindings,
                                            string::StringBuffer& ucode_disasm_buffer) {
   TextureBinding binding;
-  ParseTextureFetchInstruction(op, binding.fetch_instr);
+  const bool known = ParseTextureFetchInstruction(op, binding.fetch_instr);
   binding.fetch_instr.Disassemble(&ucode_disasm_buffer);
+  if (!known) {
+    const uint32_t* dwords = reinterpret_cast<const uint32_t*>(&op);
+    REXGPU_WARN(
+        "Shader {:016X} ({} shader): fetch instruction {} has opcode {}, which the GPU does not "
+        "define ({:08X} {:08X} {:08X}); it does nothing",
+        ucode_data_hash_, type() == xenos::ShaderType::kVertex ? "vertex" : "pixel",
+        (dwords - ucode_data_.data()) / 3, uint32_t(op.opcode()), dwords[0], dwords[1],
+        dwords[2]);
+    return;
+  }
 
   GatherFetchResultInformation(binding.fetch_instr.result);
   for (size_t i = 0; i < binding.fetch_instr.operand_count; ++i) {
@@ -886,6 +911,9 @@ void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& in
   for (uint32_t instr_offset = instr.instruction_address;
        instr_offset < instr.instruction_address + instr.instruction_count;
        ++instr_offset, sequence >>= 2) {
+    if (size_t(instr_offset) * 3 + 3 > current_shader().ucode_data().size()) {
+      break;  // past the end of the microcode (FH1 #808; Shader::AnalyzeUcode warns)
+    }
     const uint32_t* op_ptr = ucode_dwords + instr_offset * 3;
     if (sequence & 0b01) {
       auto& op = *reinterpret_cast<const FetchInstruction*>(op_ptr);
@@ -898,8 +926,10 @@ void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& in
         ProcessVertexFetchInstruction(vfetch_instr);
       } else {
         ParsedTextureFetchInstruction tfetch_instr;
-        ParseTextureFetchInstruction(op.texture_fetch(), tfetch_instr);
-        ProcessTextureFetchInstruction(tfetch_instr);
+        // A fetch opcode the GPU does not define does nothing (FH1 #808).
+        if (ParseTextureFetchInstruction(op.texture_fetch(), tfetch_instr)) {
+          ProcessTextureFetchInstruction(tfetch_instr);
+        }
       }
     } else {
       auto& op = *reinterpret_cast<const AluInstruction*>(op_ptr);
@@ -1008,7 +1038,7 @@ bool ParseVertexFetchInstruction(const VertexFetchInstruction& op,
   return !op.is_mini_fetch();
 }
 
-void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
+bool ParseTextureFetchInstruction(const TextureFetchInstruction& op,
                                   ParsedTextureFetchInstruction& instr) {
   struct TextureFetchOpcodeInfo {
     const char* name;
@@ -1049,8 +1079,16 @@ void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
       opcode_info = {"setGradientV", false, false, false, 3};
       break;
     default:
-      assert_unhandled_case(fetch_opcode);
-      return;
+      // No such fetch: nothing is read or written (FH1 #808: the disassembler appended the
+      // missing name, a null string, and the game stopped).
+      instr.opcode = op.opcode();
+      instr.opcode_name = nullptr;
+      instr.dimension = op.dimension();
+      instr.is_predicated = op.is_predicated();
+      instr.predicate_condition = op.predicate_condition();
+      instr.result.storage_target = InstructionStorageTarget::kNone;
+      instr.operand_count = 0;
+      return false;
   }
 
   instr.opcode = op.opcode();
@@ -1104,6 +1142,7 @@ void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
     instr.attributes.offset_y = op.offset_y();
     instr.attributes.offset_z = op.offset_z();
   }
+  return true;
 }
 
 uint32_t ParsedTextureFetchInstruction::GetNonZeroResultComponents() const {

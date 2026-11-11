@@ -57,3 +57,21 @@ target_link_libraries(input_system_concurrency_test PRIVATE rexruntime)
 set_target_properties(input_system_concurrency_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
 add_test(NAME input.system_concurrency COMMAND input_system_concurrency_test)
+
+# The shader disassembler with values that have no name (FH1 #808): a fetch opcode the GPU does
+# not define, an exec past the end of the microcode. No GPU: the plugin exports none of these, so
+# the test builds the parser and disassembler sources itself.
+add_executable(shader_disasm_test shader_disasm_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/format/ucode.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/shader.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator_disasm.cpp)
+target_include_directories(shader_disasm_test PRIVATE ${PROJECT_SOURCE_DIR}/include
+    $<TARGET_PROPERTY:rexgpu-xenos,INCLUDE_DIRECTORIES>)
+target_compile_definitions(shader_disasm_test PRIVATE
+    $<TARGET_PROPERTY:rexgpu-xenos,COMPILE_DEFINITIONS>)
+target_link_libraries(shader_disasm_test PRIVATE rexruntime)
+set_target_properties(shader_disasm_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
+add_test(NAME gpu.shader_disasm COMMAND shader_disasm_test)

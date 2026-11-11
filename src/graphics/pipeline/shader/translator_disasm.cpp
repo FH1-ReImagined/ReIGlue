@@ -20,6 +20,21 @@ namespace rex::graphics {
 
 using namespace ucode;
 
+namespace {
+
+// A value's name from a table, or the value as a number where the table has none (FH1 #808: a
+// missing name was appended as a null string).
+template <size_t N>
+void AppendName(string::StringBuffer* out, const char* const (&names)[N], uint32_t value) {
+  if (value < N && names[value]) {
+    out->Append(names[value]);
+  } else {
+    out->AppendFormat("{}", value);
+  }
+}
+
+}  // namespace
+
 void DisassembleResultOperand(const InstructionResult& result, string::StringBuffer* out) {
   bool uses_storage_index = false;
   switch (result.storage_target) {
@@ -341,8 +356,16 @@ void ParsedVertexFetchInstruction::Disassemble(string::StringBuffer* out) const 
     out->AppendFormat(", Offset={}", attributes.offset);
   }
   if (attributes.data_format != xenos::VertexFormat::kUndefined) {
-    out->AppendFormat(", DataFormat={}",
-                      kVertexFetchDataFormats[static_cast<int>(attributes.data_format)].name);
+    const uint32_t format = static_cast<uint32_t>(attributes.data_format);
+    const char* format_name =
+        format < rex::countof(kVertexFetchDataFormats) ? kVertexFetchDataFormats[format].name
+                                                        : nullptr;
+    if (format_name) {
+      out->AppendFormat(", DataFormat={}", format_name);
+    } else {
+      // A format with no name (FH1 #808: it was formatted as a null string).
+      out->AppendFormat(", DataFormat={}", format);
+    }
   }
   if (!is_mini_fetch && attributes.stride) {
     out->AppendFormat(", Stride={}", attributes.stride);
@@ -361,14 +384,15 @@ void ParsedVertexFetchInstruction::Disassemble(string::StringBuffer* out) const 
 }
 
 void ParsedTextureFetchInstruction::Disassemble(string::StringBuffer* out) const {
-  static const char* kTextureFilterNames[] = {
+  static const char* const kTextureFilterNames[] = {
       "point",
       "linear",
       "basemap",
       "keep",
   };
-  static const char* kAnisoFilterNames[] = {
-      "disabled", "max1to1", "max2to1", "max4to1", "max8to1", "max16to1", "keep",
+  // 6 has no name (7 is keep, the fetch constant's).
+  static const char* const kAnisoFilterNames[] = {
+      "disabled", "max1to1", "max2to1", "max4to1", "max8to1", "max16to1", nullptr, "keep",
   };
 
   out->Append("   ");
@@ -376,6 +400,11 @@ void ParsedTextureFetchInstruction::Disassemble(string::StringBuffer* out) const
     out->Append(predicate_condition ? " (p0) " : "(!p0) ");
   } else {
     out->Append("      ");
+  }
+  if (!opcode_name) {
+    // A fetch opcode the GPU does not define: parsed with no result and no operands.
+    out->AppendFormat("tfetch_opcode_{}\n", static_cast<uint32_t>(opcode));
+    return;
   }
   out->Append(opcode_name);
   out->Append(' ');
@@ -402,28 +431,28 @@ void ParsedTextureFetchInstruction::Disassemble(string::StringBuffer* out) const
     out->Append(", UnnormalizedTextureCoords=true");
   }
   if (attributes.mag_filter != xenos::TextureFilter::kUseFetchConst) {
-    out->AppendFormat(", MagFilter={}",
-                      kTextureFilterNames[static_cast<int>(attributes.mag_filter)]);
+    out->Append(", MagFilter=");
+    AppendName(out, kTextureFilterNames, static_cast<uint32_t>(attributes.mag_filter));
   }
   if (attributes.min_filter != xenos::TextureFilter::kUseFetchConst) {
-    out->AppendFormat(", MinFilter={}",
-                      kTextureFilterNames[static_cast<int>(attributes.min_filter)]);
+    out->Append(", MinFilter=");
+    AppendName(out, kTextureFilterNames, static_cast<uint32_t>(attributes.min_filter));
   }
   if (attributes.mip_filter != xenos::TextureFilter::kUseFetchConst) {
-    out->AppendFormat(", MipFilter={}",
-                      kTextureFilterNames[static_cast<int>(attributes.mip_filter)]);
+    out->Append(", MipFilter=");
+    AppendName(out, kTextureFilterNames, static_cast<uint32_t>(attributes.mip_filter));
   }
   if (attributes.aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
-    out->AppendFormat(", AnisoFilter={}",
-                      kAnisoFilterNames[static_cast<int>(attributes.aniso_filter)]);
+    out->Append(", AnisoFilter=");
+    AppendName(out, kAnisoFilterNames, static_cast<uint32_t>(attributes.aniso_filter));
   }
   if (attributes.vol_mag_filter != xenos::TextureFilter::kUseFetchConst) {
-    out->AppendFormat(", VolMagFilter={}",
-                      kTextureFilterNames[static_cast<int>(attributes.vol_mag_filter)]);
+    out->Append(", VolMagFilter=");
+    AppendName(out, kTextureFilterNames, static_cast<uint32_t>(attributes.vol_mag_filter));
   }
   if (attributes.vol_min_filter != xenos::TextureFilter::kUseFetchConst) {
-    out->AppendFormat(", VolMinFilter={}",
-                      kTextureFilterNames[static_cast<int>(attributes.vol_min_filter)]);
+    out->Append(", VolMinFilter=");
+    AppendName(out, kTextureFilterNames, static_cast<uint32_t>(attributes.vol_min_filter));
   }
   if (!attributes.use_computed_lod) {
     out->Append(", UseComputedLOD=false");
