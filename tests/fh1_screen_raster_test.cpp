@@ -184,6 +184,17 @@ int main() {
   check(!SupportsFractionalPredicatedTiles({2501, 751}, {2560, 1440}));
   check(!SupportsFractionalPredicatedTiles({959, 539}, {1280, 1440}));
 
+  constexpr RasterExtent scene_backing{2560, 1440};
+  constexpr RasterExtent exact_1080p{1920, 1080};
+  constexpr RasterExtent odd_1080p{1919, 1079};
+  check(KeepIntegerRaster(exact_1080p, scene_backing, true, false, false, true));
+  check(KeepIntegerRaster({2560, 1080}, scene_backing, true, false, false, true));
+  check(!KeepIntegerRaster(exact_1080p, scene_backing, true, false, false, false));
+  check(KeepIntegerRaster(odd_1080p, scene_backing, true, false, false, true));
+  check(!KeepIntegerRaster(exact_1080p, scene_backing, false, false, false, true));
+  check(!KeepIntegerRaster(scene_backing, scene_backing, true, false, false, true));
+  check(KeepIntegerRaster(exact_1080p, scene_backing, false, true, false, true));
+
   // The copied TU4 profile draws the 720p HUD on the seeded color target.
   // Guest draw and resolve use different packed views of the same base.
   using Color = rex::graphics::xenos::ColorRenderTargetFormat;
@@ -196,9 +207,9 @@ int main() {
   const bool hud_draw = hud_target(0, 0, true, Color::k_2_10_10_10_AS_10_10_10_10);
   const bool hud_copy = hud_target(0, 0, true, Color::k_2_10_10_10);
   check(hud_draw && hud_copy);
-  check(!KeepIntegerRaster(hud720, asymmetric_backing, true, false, hud_draw));
-  check(KeepIntegerRaster(hud720, asymmetric_backing, true, false, false));
-  check(KeepIntegerRaster(hud720, asymmetric_backing, true, true, hud_draw));
+  check(!KeepIntegerRaster(hud720, asymmetric_backing, true, false, hud_draw, false));
+  check(KeepIntegerRaster(hud720, asymmetric_backing, true, false, false, false));
+  check(KeepIntegerRaster(hud720, asymmetric_backing, true, true, hud_draw, false));
   ResolveProducerRaster hud_producer;
   const bool final_hud_resolve = IsNative720pHudResolve(hud_copy, true, hud720, false);
   check(final_hud_resolve && !hud_producer.IsFractional());

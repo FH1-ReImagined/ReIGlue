@@ -133,9 +133,13 @@ constexpr bool IsNative720pHudTarget(RasterExtent raster, unsigned expected_base
 }
 
 constexpr bool KeepIntegerRaster(RasterExtent active, RasterExtent backing, bool predicated,
-                                 bool pixel_memexport, bool native_hud_target) {
-  return pixel_memexport ||
-         (predicated && !native_hud_target && !SupportsFractionalPredicatedTiles(active, backing));
+                                 bool pixel_memexport, bool native_hud_target,
+                                 bool explicit_scene) {
+  if (pixel_memexport) return true;
+  if (!predicated || native_hud_target) return false;
+  // Explicit scene tiles require a phase-aware resolve, even when their ratio is 0.75.
+  if (explicit_scene) return active.width != backing.width || active.height != backing.height;
+  return !SupportsFractionalPredicatedTiles(active, backing);
 }
 
 constexpr bool IsNative720pHudResolve(bool hud_target, bool color_zero, RasterExtent extent,

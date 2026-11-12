@@ -162,7 +162,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     fh1_force_integer_raster_ = Fh1TracksResolveProducers() &&
         fh1::KeepIntegerRaster(fh1_raster_extent_,
             {1280 * draw_resolution_scale_x(), 720 * draw_resolution_scale_y()},
-            predicated, pixel_memexport, Fh1IsNative720pHudTarget());
+            predicated, pixel_memexport, Fh1IsNative720pHudTarget(),
+            fh1_resolve_raster_ == TextureCache::Fh1ResolveRaster::kScene);
   }
   void Fh1RecordResolveProducer(uint32_t color_mask, bool writes_depth);
   uint32_t Fh1RasterWidth() const {
