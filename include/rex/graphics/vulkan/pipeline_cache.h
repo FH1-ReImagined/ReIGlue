@@ -271,6 +271,22 @@ class VulkanPipelineCache {
     PipelineDescription description;
   });
 
+ public:
+  // FH1 (patch 0580): the stores' layouts, for the offline tools that read them (rexglue-shaders).
+  // <title>.xsh: 'XESH', kShaderStoreVersion (big-endian), then per shader a
+  // kShaderStoreRecordHeaderSize header (XXH3 of the microcode, dword count : 31, type : 1) and
+  // the microcode. <title>.<fbo|fsi>.vk.xpso: pipeline_store_file with kPipelineStoreVersions and
+  // kPipelineStoreRecordSize records; a record holds the vertex shader hash and modification and
+  // the pixel shader hash and modification at kPipelineStoreShadersOffset.
+  static constexpr uint32_t kShaderStoreVersion = ShaderStoredHeader::kVersion;
+  static constexpr size_t kShaderStoreRecordHeaderSize = sizeof(ShaderStoredHeader);
+  static constexpr pipeline_store_file::Versions kPipelineStoreVersions{
+      PipelineDescription::kVersion, SpirvShaderTranslator::Modification::kVersion};
+  static constexpr size_t kPipelineStoreRecordSize = sizeof(PipelineStoredDescription);
+  static constexpr size_t kPipelineStoreShadersOffset = sizeof(uint64_t);
+
+ private:
+
   // Adds the shader prebuild's pipelines for this device and partition to `descriptions`, and
   // their shader modifications to `translations_needed`.
   void ImportShaderPrebuild(uint32_t title_id, uint32_t api,

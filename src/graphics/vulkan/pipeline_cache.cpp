@@ -346,6 +346,8 @@ bool VulkanPipelineCache::Initialize() {
       render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y(),
       render_target_cache_.raster_scale_x(), render_target_cache_.raster_scale_y());
+  // FH1 (patch 0580): what the SPIR-V depends on besides the shaders, for the offline translator.
+  REXGPU_INFO("SPIR-V translator configuration: {}", shader_translator_->DescribeConfiguration());
 
   if (edram_fragment_shader_interlock) {
     std::vector<uint8_t> depth_only_fragment_shader_code =
@@ -2081,6 +2083,11 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   if (!translator.TranslateAnalyzedShader(translation)) {
     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
     return false;
+  }
+  // FH1 (patch 0580): dump_shaders writes the SPIR-V as the D3D12 backend writes its DXBC
+  // (shader_<hash>_<modification>.vk.bin.<vert|frag>), before the module frees it (0430).
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    translation.Dump(REXCVAR_GET(dump_shaders), "vk");
   }
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;

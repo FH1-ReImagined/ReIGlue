@@ -441,6 +441,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
         draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1),
         raster_scale_x_(raster_scale_x), raster_scale_y_(raster_scale_y) {}
 
+  // FH1 (patch 0580): everything besides the microcode and the modification that the SPIR-V
+  // depends on, as "key=value" words: logged when the Vulkan pipeline cache starts, and read by
+  // the offline translator (rexglue-shaders translate --config) to translate exactly as it.
+  std::string DescribeConfiguration() const;
+
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
       Shader::HostVertexShaderType host_vertex_shader_type =
