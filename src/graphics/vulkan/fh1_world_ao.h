@@ -25,6 +25,23 @@ ResourceStatus PrepareResourcesForDraw(Update&& update, IsOpen&& is_open, Resume
   return ready ? ResourceStatus::kReady : ResourceStatus::kUnavailable;
 }
 
+// The stencil's 8-bit view is a texture request through a fetch constant the draw does not use
+// (#823). A request that finds a texture outdated (a memory watch fired since the draw's own
+// request) resets every binding and resolves only the constants it was given, so after the
+// borrowed one is put back the draw's own textures are requested again: otherwise the first
+// shadow pass sampled null views for its depth and shadow map that frame, and its cascade (the
+// nearest ground) went black. Returns the borrowed constant's view.
+template <typename Borrow, typename Request, typename View, typename Restore>
+auto RequestThroughBorrowedFetch(uint32_t draw_mask, uint32_t borrowed_mask, Borrow&& borrow,
+                                 Request&& request, View&& view, Restore&& restore) {
+  borrow();
+  request(borrowed_mask);
+  auto result = view();
+  restore();
+  request(draw_mask);
+  return result;
+}
+
 // The game's `world_ambient_occlusion`: 0 off, 1 low, 2 high; anything else is off.
 inline int Level(std::string_view value) {
   return value == "high" ? 2 : value == "low" ? 1 : 0;
