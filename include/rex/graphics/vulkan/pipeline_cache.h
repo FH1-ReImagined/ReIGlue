@@ -400,6 +400,17 @@ class VulkanPipelineCache {
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                VulkanShader::VulkanTranslation& translation);
 
+  // FH1 (patch 0590): the parts of TranslateAnalyzedShader after the translator, and a
+  // translator like shader_translator_ for other threads.
+  // FinishTranslation: the dump_shaders files and the shader module; per translation, so any
+  // thread. SetUpShaderBindingLayouts: the texture binding layout map; one thread at a time.
+  bool FinishTranslation(VulkanShader::VulkanTranslation& translation);
+  void SetUpShaderBindingLayouts(VulkanShader& shader);
+  std::unique_ptr<SpirvShaderTranslator> CreateShaderTranslator() const;
+  // The stored and prebuild pipelines' shaders at start: the analysis serially, then the
+  // translations on several threads (vulkan_shader_translation_threads).
+  void TranslateStoredShaders(const std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
+
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
   bool GetCurrentStateDescription(
@@ -482,6 +493,15 @@ class VulkanPipelineCache {
   string::StringBuffer ucode_disasm_buffer_;
   // Reusable shader translator on the command processor thread.
   std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  // What shader_translator_ was made with, for the warm-up's translators (patch 0590).
+  struct ShaderTranslatorArguments {
+    SpirvShaderTranslator::Features features{true};
+    bool native_2x_msaa_with_attachments = false;
+    bool native_2x_msaa_no_attachments = false;
+    bool edram_fragment_shader_interlock = false;
+    uint32_t draw_resolution_scale_x = 1, draw_resolution_scale_y = 1;
+    float raster_scale_x = 1.0f, raster_scale_y = 1.0f;
+  } shader_translator_arguments_;
 
   struct LayoutUID {
     size_t uid;

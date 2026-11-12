@@ -79,6 +79,12 @@ REXCVAR_DEFINE_UINT32(vulkan_store_pipeline_cache_memory_mb, 0, "GPU/Vulkan",
 
 // FH1 (#378): fh1_pipeline_lookahead.cpp.
 REXCVAR_DECLARE(bool, vulkan_pipeline_lookahead);
+// FH1 (patch 0590): the start's translations on several threads.
+REXCVAR_DEFINE_INT32(vulkan_shader_translation_threads, -1, "GPU/Vulkan",
+                     "Threads that translate the stored and prebuild shaders at start (-1: 3/4 of "
+                     "the logical processors; 1: one)")
+    .range(-1, 64)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -339,13 +345,15 @@ bool VulkanPipelineCache::Initialize() {
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
-  shader_translator_ = std::make_unique<SpirvShaderTranslator>(
-      SpirvShaderTranslator::Features(vulkan_device),
-      render_target_cache_.msaa_2x_attachments_supported(),
-      render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
-      render_target_cache_.draw_resolution_scale_x(),
-      render_target_cache_.draw_resolution_scale_y(),
-      render_target_cache_.raster_scale_x(), render_target_cache_.raster_scale_y());
+  shader_translator_arguments_ = {SpirvShaderTranslator::Features(vulkan_device),
+                                  render_target_cache_.msaa_2x_attachments_supported(),
+                                  render_target_cache_.msaa_2x_no_attachments_supported(),
+                                  edram_fragment_shader_interlock,
+                                  render_target_cache_.draw_resolution_scale_x(),
+                                  render_target_cache_.draw_resolution_scale_y(),
+                                  render_target_cache_.raster_scale_x(),
+                                  render_target_cache_.raster_scale_y()};
+  shader_translator_ = CreateShaderTranslator();
   // FH1 (patch 0580): what the SPIR-V depends on besides the shaders, for the offline translator.
   REXGPU_INFO("SPIR-V translator configuration: {}", shader_translator_->DescribeConfiguration());
 
@@ -1015,26 +1023,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   ImportShaderPrebuild(title_id, pipeline_storage_magic_api, pipeline_storage_versions,
                        pipeline_stored_descriptions, shader_translations_needed);
 
-  // Translate shader modifications needed for stored pipelines.
-  for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
-    auto shader_it = shaders_.find(translation_needed.first);
-    if (shader_it == shaders_.end()) {
-      continue;
-    }
-    auto* shader = shader_it->second;
-    if (!shader->is_ucode_analyzed()) {
-      shader->AnalyzeUcode(ucode_disasm_buffer_);
-    }
-    bool translation_is_new = false;
-    auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
-        shader->GetOrCreateTranslation(translation_needed.second, &translation_is_new));
-    if (!translation->is_translated() &&
-        !TranslateAnalyzedShader(*shader_translator_, *translation)) {
-      if (translation_is_new) {
-        shader->DestroyTranslation(translation_needed.second);
-      }
-    }
-  }
+  // Translate shader modifications needed for stored pipelines (on several threads: patch 0590).
+  TranslateStoredShaders(shader_translations_needed);
 
   // Create the pipelines.
   std::vector<PipelineCreationArguments> pipeline_creations;
@@ -2084,18 +2074,27 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
     return false;
   }
-  // FH1 (patch 0580): dump_shaders writes the SPIR-V as the D3D12 backend writes its DXBC
-  // (shader_<hash>_<modification>.vk.bin.<vert|frag>), before the module frees it (0430).
-  if (!REXCVAR_GET(dump_shaders).empty()) {
-    translation.Dump(REXCVAR_GET(dump_shaders), "vk");
-  }
-  if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
+  if (!FinishTranslation(translation)) {
     return false;
   }
 
   // TODO(Triang3l): Log that the shader has been successfully translated in
   // common code.
 
+  SetUpShaderBindingLayouts(shader);
+  return true;
+}
+
+bool VulkanPipelineCache::FinishTranslation(VulkanShader::VulkanTranslation& translation) {
+  // FH1 (patch 0580): dump_shaders writes the SPIR-V as the D3D12 backend writes its DXBC
+  // (shader_<hash>_<modification>.vk.bin.<vert|frag>), before the module frees it (0430).
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    translation.Dump(REXCVAR_GET(dump_shaders), "vk");
+  }
+  return translation.GetOrCreateShaderModule() != VK_NULL_HANDLE;
+}
+
+void VulkanPipelineCache::SetUpShaderBindingLayouts(VulkanShader& shader) {
   // Set up the texture binding layout.
   if (shader.EnterBindingLayoutUserUIDSetup()) {
     // Obtain the unique IDs of the binding layout if there are any texture
@@ -2144,8 +2143,112 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
                   "UID is their count");
     shader.SetSamplerBindingLayoutUserUID(shader.GetSamplerBindingsAfterTranslation().size());
   }
+}
 
-  return true;
+std::unique_ptr<SpirvShaderTranslator> VulkanPipelineCache::CreateShaderTranslator() const {
+  const ShaderTranslatorArguments& a = shader_translator_arguments_;
+  return std::make_unique<SpirvShaderTranslator>(
+      a.features, a.native_2x_msaa_with_attachments, a.native_2x_msaa_no_attachments,
+      a.edram_fragment_shader_interlock, a.draw_resolution_scale_x, a.draw_resolution_scale_y,
+      a.raster_scale_x, a.raster_scale_y);
+}
+
+void VulkanPipelineCache::TranslateStoredShaders(
+    const std::set<std::pair<uint64_t, uint64_t>>& translations_needed) {
+  const auto start = std::chrono::steady_clock::now();
+  struct Job {
+    VulkanShader::VulkanTranslation* translation;
+    bool is_new;
+    bool valid = false;
+  };
+  // The analysis and the translation objects on this thread. Shader::AnalyzeUcode shares
+  // ucode_disasm_buffer_, and GetOrCreateTranslation the shader's map and its 0362 memo.
+  std::vector<Job> jobs;
+  for (const auto& [hash, modification] : translations_needed) {
+    auto shader_it = shaders_.find(hash);
+    if (shader_it == shaders_.end()) {
+      continue;
+    }
+    VulkanShader* shader = shader_it->second;
+    if (!shader->is_ucode_analyzed()) {
+      shader->AnalyzeUcode(ucode_disasm_buffer_);
+    }
+    bool is_new = false;
+    auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
+        shader->GetOrCreateTranslation(modification, &is_new));
+    if (!translation->is_translated()) {
+      jobs.push_back({translation, is_new});
+    }
+  }
+
+  // The translations on several threads, each with its own translator. A translation writes
+  // only its own object, and the bindings of its shader once (an atomic flag); the binding layout
+  // map is filled below, on this thread.
+  size_t thread_count = 1;
+  if (jobs.size() >= 16) {
+    uint32_t logical_processor_count = rex::thread::logical_processor_count();
+    if (!logical_processor_count) {
+      logical_processor_count = 6;
+    }
+    const int32_t threads = REXCVAR_GET(vulkan_shader_translation_threads);
+    thread_count = threads < 0 ? std::max<size_t>(logical_processor_count * 3 / 4, 1)
+                               : std::clamp<size_t>(size_t(threads), 1, logical_processor_count);
+    thread_count = std::min(thread_count, jobs.size() / 8);
+  }
+  std::atomic<size_t> next_job(0);
+  auto worker = [this, &jobs, &next_job]() {
+    std::unique_ptr<SpirvShaderTranslator> translator;
+    for (;;) {
+      const size_t index = next_job.fetch_add(1, std::memory_order_relaxed);
+      if (index >= jobs.size()) {
+        break;
+      }
+      Job& job = jobs[index];
+      VulkanShader::VulkanTranslation& translation = *job.translation;
+      if (!translator) {
+        translator = CreateShaderTranslator();
+      }
+      if (!translator->TranslateAnalyzedShader(translation)) {
+        REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored",
+                     translation.shader().ucode_data_hash());
+        continue;
+      }
+      job.valid = FinishTranslation(translation);
+    }
+  };
+  if (thread_count <= 1) {
+    worker();
+  } else {
+    std::vector<std::unique_ptr<rex::thread::Thread>> threads;
+    threads.reserve(thread_count);
+    for (size_t i = 0; i < thread_count; ++i) {
+      threads.push_back(rex::thread::Thread::Create({}, worker));
+      assert_not_null(threads.back());
+      threads.back()->set_name("Vulkan Shaders");
+    }
+    for (const auto& thread : threads) {
+      rex::thread::Wait(thread.get(), false);
+    }
+  }
+
+  size_t translated = 0;
+  for (Job& job : jobs) {
+    VulkanShader& shader = static_cast<VulkanShader&>(job.translation->shader());
+    if (!job.valid) {
+      if (job.is_new) {
+        shader.DestroyTranslation(job.translation->modification());
+      }
+      continue;
+    }
+    SetUpShaderBindingLayouts(shader);
+    ++translated;
+  }
+  REXGPU_INFO("Vulkan shader warm-up: {} translations in {} ms, {} translated on {} thread{}",
+              jobs.size(),
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count(),
+              translated, thread_count, thread_count == 1 ? "" : "s");
 }
 
 void VulkanPipelineCache::WritePipelineRenderTargetDescription(
