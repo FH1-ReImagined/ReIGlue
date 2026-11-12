@@ -140,6 +140,7 @@ class TextureCache {
   bool Fh1TracksFractionalResolves() const { return fh1_track_fractional_resolves_; }
   void Fh1MarkResolveRaster(uint32_t address, uint32_t length, Fh1ResolveRaster raster) {
     if (!length || address >= SharedMemory::kBufferSize) return;
+    auto lock = global_critical_region_.Acquire();
     const uint32_t last = (address + std::min(length, SharedMemory::kBufferSize - address) - 1) >> 12;
     for (uint32_t page = address >> 12; page <= last; ++page) {
       Fh1SetRasterPageBit(fh1_raster_pages_, page, raster == Fh1ResolveRaster::kScene);
@@ -148,6 +149,7 @@ class TextureCache {
   }
   Fh1ResolveRaster Fh1GetResolveRaster(uint32_t page) const {
     if (!fh1_track_fractional_resolves_) return Fh1ResolveRaster::kFull;
+    auto lock = thread::global_critical_region::AcquireDirect();
     if (Fh1RasterPageBit(fh1_raster_pages_, page)) return Fh1ResolveRaster::kScene;
     if (Fh1RasterPageBit(fh1_hud_raster_pages_, page)) return Fh1ResolveRaster::kHud;
     return Fh1ResolveRaster::kFull;
@@ -163,6 +165,8 @@ class TextureCache {
   }
   void Fh1MarkFullRasterResolve(uint32_t address, uint32_t length, bool full) {
     if (!length || address >= SharedMemory::kBufferSize) return;
+    auto lock = global_critical_region_.AcquireDeferred();
+    if (fh1_track_fractional_resolves_) lock.lock();
     const uint32_t last = (std::min(address + (length - 1), SharedMemory::kBufferSize - 1)) >> 12;
     for (uint32_t page = address >> 12; page <= last; ++page) {
       Fh1SetRasterPageBit(fh1_raster_pages_, page, full);
@@ -171,6 +175,8 @@ class TextureCache {
   bool IsActiveFh1FullRasterTexture(uint32_t index) const {
     if (!IsActiveFh1ScreenTexture(index)) return false;
     const uint32_t page = GetValidTextureBinding(index)->texture->key().base_page;
+    std::unique_lock lock(thread::global_critical_region::mutex(), std::defer_lock);
+    if (fh1_track_fractional_resolves_) lock.lock();
     return Fh1RasterPageBit(fh1_raster_pages_, page);
   }
   bool IsActiveFh1ScreenTexture(uint32_t index) const {

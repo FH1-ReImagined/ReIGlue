@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/vulkan/fh1_resolve_provenance.h>
 #include <rex/graphics/vulkan/fh1_screen_raster.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/binding_reuse.h>
@@ -127,9 +128,18 @@ class VulkanTextureCache final : public TextureCache {
                                  Fh1ResolveRaster* resolve_raster_out = nullptr,
                                  uint32_t* swap_source_page_out = nullptr);
 
-  void Fh1RecordResolveTrace(fh1::ResolveTrace trace) { fh1_resolve_trace_.Record(trace); }
-  const fh1::ResolveTrace* Fh1GetResolveTrace(uint32_t page) const {
-    return fh1_resolve_trace_.Find(page);
+  void Fh1TrackFractionalResolves() {
+    if (!fh1_resolve_provenance_) fh1_resolve_provenance_.emplace(*this, shared_memory());
+  }
+  void Fh1PublishResolve(Fh1ResolveRaster raster, const fh1::ResolveTrace& trace) {
+    assert_true(fh1_resolve_provenance_.has_value());
+    fh1_resolve_provenance_->Publish(raster, trace);
+  }
+  std::optional<fh1::ResolveTrace> Fh1GetResolveTrace(uint32_t page) const {
+    return fh1_resolve_provenance_ ? fh1_resolve_provenance_->Find(page) : std::nullopt;
+  }
+  void Fh1InvalidateResolveProvenance() {
+    if (fh1_resolve_provenance_) fh1_resolve_provenance_->InvalidateAll();
   }
 
   bool GetScaledResolveRange(uint32_t start_unscaled, uint32_t length_unscaled,
@@ -420,7 +430,7 @@ class VulkanTextureCache final : public TextureCache {
   std::pair<const SamplerParameters, Sampler>* sampler_used_last_ = nullptr;
   uint32_t custom_border_color_sampler_count_ = 0;
 
-  fh1::ResolveTraceHistory fh1_resolve_trace_;
+  std::optional<fh1::ResolveProvenance> fh1_resolve_provenance_;
   VkBuffer scaled_resolve_buffer_ = VK_NULL_HANDLE;
   uint64_t scaled_resolve_buffer_size_ = 0;
   bool scaled_resolve_buffer_sparse_ = false;

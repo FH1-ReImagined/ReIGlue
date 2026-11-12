@@ -197,10 +197,8 @@ struct ResolveTrace {
   bool color = false;
 
   constexpr bool CoversPage(uint32_t page) const {
-    return written_length &&
-        (page == destination_base >> 12 ||
-         (page >= written_address >> 12 &&
-          page <= (uint64_t(written_address) + written_length - 1) >> 12));
+    return written_length && page >= written_address >> 12 &&
+           page <= (uint64_t(written_address) + written_length - 1) >> 12;
   }
   constexpr bool MatchesBase(uint32_t page) const { return page == destination_base >> 12; }
 };
@@ -233,6 +231,20 @@ class ResolveTraceHistory {
       if (entry.CoversPage(page)) return &entry;
     }
     return nullptr;
+  }
+  constexpr void Invalidate(uint32_t first_page, uint32_t last_page) {
+    for (auto& entry : entries_) {
+      if (!entry.written_length) continue;
+      const uint32_t base_page = entry.destination_base >> 12;
+      const uint32_t written_first = entry.written_address >> 12;
+      const uint64_t written_last = (uint64_t(entry.written_address) + entry.written_length - 1) >> 12;
+      if ((base_page >= first_page && base_page <= last_page) ||
+          (written_first <= last_page && written_last >= first_page)) {
+        // A later partial write invalidates the full-texture proof. Clear every
+        // overlapping entry, so lookup cannot resurrect an older proof.
+        entry = {};
+      }
+    }
   }
 
  private:

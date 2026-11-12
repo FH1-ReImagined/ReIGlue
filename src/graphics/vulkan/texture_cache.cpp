@@ -492,6 +492,7 @@ const VulkanTextureCache::HostFormatPair VulkanTextureCache::kHostFormatDXT5AUna
     false};
 
 VulkanTextureCache::~VulkanTextureCache() {
+  fh1_resolve_provenance_.reset();
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();

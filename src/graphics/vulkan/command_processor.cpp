@@ -1410,7 +1410,9 @@ void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
   if (shared_memory_) {
+    auto lock = rex::thread::global_critical_region::AcquireDirect();
     shared_memory_->InvalidateAllPages();
+    if (texture_cache_) texture_cache_->Fh1InvalidateResolveProvenance();
   }
 }
 
@@ -5445,13 +5447,14 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   const uint32_t gamma_width = guest_output_width, gamma_height = guest_output_height;
   const fh1::RasterExtent output_extent{REXCVAR_GET(fh1_output_width), REXCVAR_GET(fh1_output_height)};
   bool resample_swap = false;
+  const auto swap_trace = texture_cache_->Fh1GetResolveTrace(swap_source_page);
   if (swap_resample_pipeline_ && swap_sampler_linear_clamp_ &&
       texture_cache_->Fh1TracksFractionalResolves() &&
       swap_raster == TextureCache::Fh1ResolveRaster::kFull &&
       frontbuffer_width == frontbuffer_width_unscaled && frontbuffer_height == frontbuffer_height_unscaled &&
       frontbuffer_width_scaled == gamma_width && frontbuffer_height_scaled == gamma_height &&
       !ui::vulkan::GetHdrOutputState().active && !Fh1VrLayersWanted() &&
-      fh1::CanResampleIntegerSwap(texture_cache_->Fh1GetResolveTrace(swap_source_page),
+      fh1::CanResampleIntegerSwap(swap_trace ? &*swap_trace : nullptr,
           swap_source_page << 12, frontbuffer_ptr, {frontbuffer_width, frontbuffer_height},
           {gamma_width, gamma_height}, output_extent)) {
     const bool use_pwl = frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
@@ -5488,7 +5491,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         if (texture_cache_->Fh1TracksFractionalResolves()) {
           const bool scaled = frontbuffer_width_scaled != frontbuffer_width_unscaled ||
                               frontbuffer_height_scaled != frontbuffer_height_unscaled;
-          const auto* trace = scaled ? texture_cache_->Fh1GetResolveTrace(swap_source_page) : nullptr;
+          const auto* trace = scaled && swap_trace ? &*swap_trace : nullptr;
           const char* tag = swap_raster == TextureCache::Fh1ResolveRaster::kScene ? "scene" :
               swap_raster == TextureCache::Fh1ResolveRaster::kHud ? "hud" : "full-or-unknown";
           REXGPU_INFO(

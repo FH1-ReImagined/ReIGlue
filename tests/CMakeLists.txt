@@ -87,3 +87,21 @@ add_test(NAME gpu.shader_disasm COMMAND shader_disasm_test)
 add_executable(driver_cache_file_test driver_cache_file_test.cpp)
 target_include_directories(driver_cache_file_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME vulkan.driver_cache_file COMMAND driver_cache_file_test)
+
+# These renderer internals are not exported from the plugin. Build the cache
+# sources with test host resources to exercise real guest write watches.
+add_executable(fh1_resolve_provenance_test fh1_resolve_provenance_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/pack.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/pack_format.cpp)
+target_include_directories(fh1_resolve_provenance_test PRIVATE ${PROJECT_SOURCE_DIR}/include
+    $<TARGET_PROPERTY:rexgpu-xenos,INCLUDE_DIRECTORIES>)
+target_compile_definitions(fh1_resolve_provenance_test PRIVATE
+    $<TARGET_PROPERTY:rexgpu-xenos,COMPILE_DEFINITIONS>)
+target_link_libraries(fh1_resolve_provenance_test PRIVATE rexruntime xxHash::xxhash)
+set_target_properties(fh1_resolve_provenance_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
+add_test(NAME vulkan.fh1_resolve_provenance COMMAND fh1_resolve_provenance_test)

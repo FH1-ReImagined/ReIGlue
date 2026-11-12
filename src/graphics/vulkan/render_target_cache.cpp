@@ -1529,25 +1529,20 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           command_processor_.SubmitBarriers(true);
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
 
-          // Invalidate textures and mark the range as scaled if needed.
-          texture_cache.MarkRangeAsResolved(copy_info.copy_dest_extent_start,
-                                            copy_info.copy_dest_extent_length);
           written_address_out = copy_info.copy_dest_extent_start;
           written_length_out = copy_info.copy_dest_extent_length;
           if (Fh1TracksResolveProducers()) {
-            // Record the copied region as well as the guest base for subrect
-            // resolves. The first tile of a tiled texture records its base.
             const auto raster = fractional_producer ? fh1_resolve_raster_
                                                     : TextureCache::Fh1ResolveRaster::kFull;
-            texture_cache.Fh1MarkResolveRaster(written_address_out, written_length_out, raster);
             const uint32_t destination_base = register_file()[XE_GPU_REG_RB_COPY_DEST_BASE];
-            texture_cache.Fh1MarkResolveRaster(destination_base, 1, raster);
-            texture_cache.Fh1RecordResolveTrace({
+            texture_cache.Fh1PublishResolve(raster, {
                 destination_base, written_address_out, written_length_out,
                 resolve_info.IsCopyingDepth() ? resolve_info.depth_original_base
                                               : resolve_info.color_original_base,
                 producer.Evidence(), final_native_hud, fh1_hud_frontbuffer_base_, resolve_extent,
                 !resolve_info.IsCopyingDepth()});
+          } else {
+            texture_cache.MarkRangeAsResolved(written_address_out, written_length_out);
           }
           copied = true;
         }
