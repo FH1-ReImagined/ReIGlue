@@ -441,6 +441,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     VkImage image() const { return image_; }
     bool fh1_fractional_producer = false;
+    bool fh1_producer_known = false;
 
     VkImageView view_depth_color() const { return view_depth_color_; }
     VkImageView view_depth_stencil() const { return view_depth_stencil_; }

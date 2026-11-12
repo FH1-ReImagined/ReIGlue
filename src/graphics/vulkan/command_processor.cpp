@@ -429,6 +429,23 @@ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
     },
 };
 
+constexpr char kSwapResampleComputeSource[] = R"(#version 450
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D source_image;
+layout(set = 1, binding = 0, rgb10_a2) writeonly uniform image2D destination_image;
+layout(push_constant) uniform SwapConstants {
+  uvec2 output_size;
+  vec2 inverse_output_size;
+};
+
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(pixel, output_size))) return;
+  vec2 uv = (vec2(pixel) + 0.5) * inverse_output_size;
+  imageStore(destination_image, ivec2(pixel), vec4(textureLod(source_image, uv, 0.0).rgb, 1.0));
+}
+)";
+
 const char* GetSwapFxaaComputeSource(bool extreme_quality) {
   return extreme_quality ? R"(#version 450
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
@@ -2821,6 +2838,22 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
 
+  if (REXCVAR_GET(fh1_native_scene_width) && REXCVAR_GET(fh1_native_scene_height)) {
+    VkFormatProperties properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), VK_FORMAT_R16G16B16A16_SFLOAT, &properties);
+    if (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) {
+      std::vector<uint32_t> spirv;
+      std::string error;
+      if (CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kSwapResampleComputeSource, spirv, error)) {
+        swap_resample_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+            vulkan_device, swap_fxaa_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
+      } else {
+        REXGPU_WARN("Failed to compile FH1 swap resampling shader: {}", error);
+      }
+    }
+  }
+
   VkPipelineLayoutCreateInfo resolve_downscale_layout_create_info = {};
   resolve_downscale_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   VkDescriptorSetLayout resolve_downscale_set_layout =
@@ -3239,6 +3272,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_fxaa_extreme_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_resample_pipeline_);
   for (auto& scene : hdr_scenes_)
     DestroyHdrScene(scene);
   Fh1VrDestroy();
@@ -5341,10 +5375,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
   auto swap_raster = TextureCache::Fh1ResolveRaster::kFull;
+  uint32_t swap_source_page = 0;
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap,
-      &swap_raster);
+      &swap_raster, &swap_source_page);
   if (swap_texture_view == VK_NULL_HANDLE) {
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
@@ -5407,6 +5442,38 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     guest_output_width = REXCVAR_GET(fh1_output_width);
     guest_output_height = REXCVAR_GET(fh1_output_height);
   }
+  const uint32_t gamma_width = guest_output_width, gamma_height = guest_output_height;
+  const fh1::RasterExtent output_extent{REXCVAR_GET(fh1_output_width), REXCVAR_GET(fh1_output_height)};
+  bool resample_swap = false;
+  if (swap_resample_pipeline_ && swap_sampler_linear_clamp_ &&
+      texture_cache_->Fh1TracksFractionalResolves() &&
+      swap_raster == TextureCache::Fh1ResolveRaster::kFull &&
+      frontbuffer_width == frontbuffer_width_unscaled && frontbuffer_height == frontbuffer_height_unscaled &&
+      frontbuffer_width_scaled == gamma_width && frontbuffer_height_scaled == gamma_height &&
+      !ui::vulkan::GetHdrOutputState().active && !Fh1VrLayersWanted() &&
+      fh1::CanResampleIntegerSwap(texture_cache_->Fh1GetResolveTrace(swap_source_page),
+          swap_source_page << 12, frontbuffer_ptr, {frontbuffer_width, frontbuffer_height},
+          {gamma_width, gamma_height}, output_extent)) {
+    const bool use_pwl = frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
+        frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
+    const bool swap_rb = !GetVulkanDevice()->properties().imageViewFormatSwizzle &&
+                         swap_source_needs_rb_swap;
+    if (SelectSwapGammaComputePipeline(use_pwl, swap_rb, true) &&
+        EnsureSwapFxaaSourceImage(gamma_width, gamma_height)) {
+      resample_swap = true;
+      guest_output_width = output_extent.width;
+      guest_output_height = output_extent.height;
+    }
+  }
+  if (texture_cache_->Fh1TracksFractionalResolves()) {
+    static bool previous_resample = false;
+    static unsigned resample_runs_logged = 0;
+    if (resample_swap && !previous_resample && resample_runs_logged++ < 16) {
+      REXGPU_INFO("FH1 swap raster: frame {} resamples full integer source {}x{} to {}x{}",
+                  frame_current_, gamma_width, gamma_height, guest_output_width, guest_output_height);
+    }
+    previous_resample = resample_swap;
+  }
   if (fh1_split_enabled_) {
     // Each change of size makes the presenter replace its output image. Log the first 16
     // sizes, then every 256th change, so a size that kept changing would show in the log.
@@ -5418,6 +5485,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                     guest_output_width, guest_output_height,
                     fh1_native_hud_active_ ? "HUD layer" : "no HUD layer: scene or unscaled source",
                     size_changes);
+        if (texture_cache_->Fh1TracksFractionalResolves()) {
+          const bool scaled = frontbuffer_width_scaled != frontbuffer_width_unscaled ||
+                              frontbuffer_height_scaled != frontbuffer_height_unscaled;
+          const auto* trace = scaled ? texture_cache_->Fh1GetResolveTrace(swap_source_page) : nullptr;
+          const char* tag = swap_raster == TextureCache::Fh1ResolveRaster::kScene ? "scene" :
+              swap_raster == TextureCache::Fh1ResolveRaster::kHud ? "hud" : "full-or-unknown";
+          REXGPU_INFO(
+              "FH1 swap raster: frame {} fetch0=0x{:08X} packet=0x{:08X} source={}x{} "
+              "tag={} evidence={} match={} resolve=0x{:08X}+{} dest=0x{:08X} edram=0x{:03X} "
+              "expected_hud_edram=0x{:03X} copy={}x{} final_hud={}",
+              frame_current_, swap_source_page << 12, frontbuffer_ptr,
+              frontbuffer_width_scaled, frontbuffer_height_scaled, tag,
+              !scaled ? "unscaled" : trace ? fh1::ResolveEvidenceName(trace->evidence) : "no-recent-resolve",
+              !trace ? "none" : trace->MatchesBase(swap_source_page) ? "base" : "overlapping-range",
+              trace ? trace->written_address : 0, trace ? trace->written_length : 0,
+              trace ? trace->destination_base : 0, trace ? trace->edram_base : 0,
+              trace ? trace->expected_hud_base : UINT32_MAX,
+              trace ? trace->copy_extent.width : 0, trace ? trace->copy_extent.height : 0,
+              trace && trace->final_hud);
+        }
       }
       presented_width = guest_output_width;
       presented_height = guest_output_height;
@@ -5500,8 +5587,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   AwaitPresentSteps();
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
-       swap_post_effect, swap_source_needs_rb_swap, hud_snapshot_view,
+      [this, guest_output_width, guest_output_height, gamma_width, gamma_height, resample_swap,
+       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap, hud_snapshot_view,
        vr_snapshot_view](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
@@ -5531,29 +5618,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
         bool swap_source_requires_compute_rb_swap =
             !vulkan_device->properties().imageViewFormatSwizzle && swap_source_needs_rb_swap;
-        auto select_swap_apply_gamma_compute_pipeline = [&](bool use_pwl,
-                                                            bool use_fxaa_luma) -> VkPipeline {
-          if (use_pwl) {
-            if (use_fxaa_luma) {
-              return swap_source_requires_compute_rb_swap
-                         ? swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_
-                         : swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_;
-            }
-            return swap_source_requires_compute_rb_swap
-                       ? swap_apply_gamma_compute_pwl_rb_swap_pipeline_
-                       : swap_apply_gamma_compute_pwl_pipeline_;
-          }
-          if (use_fxaa_luma) {
-            return swap_source_requires_compute_rb_swap
-                       ? swap_apply_gamma_compute_256_entry_table_fxaa_luma_rb_swap_pipeline_
-                       : swap_apply_gamma_compute_256_entry_table_fxaa_luma_pipeline_;
-          }
-          return swap_source_requires_compute_rb_swap
-                     ? swap_apply_gamma_compute_256_entry_table_rb_swap_pipeline_
-                     : swap_apply_gamma_compute_256_entry_table_pipeline_;
-        };
-        VkPipeline swap_apply_gamma_compute_pipeline =
-            select_swap_apply_gamma_compute_pipeline(use_pwl_gamma_ramp, use_fxaa);
+        VkPipeline swap_apply_gamma_compute_pipeline = SelectSwapGammaComputePipeline(
+            use_pwl_gamma_ramp, swap_source_requires_compute_rb_swap, use_fxaa || resample_swap);
 
         if (use_fxaa) {
           if (swap_apply_gamma_compute_pipeline == VK_NULL_HANDLE ||
@@ -5574,7 +5640,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               fxaa_pipelines_unavailable_logged = true;
             }
             use_fxaa = false;
-          } else if (!EnsureSwapFxaaSourceImage(guest_output_width, guest_output_height)) {
+          } else if (!resample_swap && !EnsureSwapFxaaSourceImage(guest_output_width, guest_output_height)) {
             static bool fxaa_source_image_failed_logged = false;
             if (!fxaa_source_image_failed_logged) {
               REXGPU_WARN(
@@ -5585,10 +5651,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             use_fxaa = false;
           }
         }
-        if (!use_fxaa) {
-          swap_apply_gamma_compute_pipeline =
-              select_swap_apply_gamma_compute_pipeline(use_pwl_gamma_ramp, false);
+        if (!use_fxaa && !resample_swap) {
+          swap_apply_gamma_compute_pipeline = SelectSwapGammaComputePipeline(
+              use_pwl_gamma_ramp, swap_source_requires_compute_rb_swap, false);
         }
+        const bool postprocess_swap = use_fxaa || resample_swap;
         if (swap_source_requires_compute_rb_swap &&
             swap_apply_gamma_compute_pipeline == VK_NULL_HANDLE) {
           static bool compute_rb_swap_fallback_missing_logged = false;
@@ -5608,7 +5675,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         }
 
         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
-        context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+        context.SetIs8bpc(!use_pwl_gamma_ramp && !postprocess_swap);
 
         // Update the gamma ramp if it's out of date.
         uint32_t& gamma_ramp_frame_index_ref = use_pwl_gamma_ramp
@@ -5711,7 +5778,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                      : 0,
                                  VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                                  VK_IMAGE_LAYOUT_GENERAL);
-          if (use_fxaa) {
+          if (postprocess_swap) {
             PushImageMemoryBarrier(swap_fxaa_source_image_, guest_output_subresource_range,
                                    swap_fxaa_source_stage_mask_ ? swap_fxaa_source_stage_mask_
                                                                 : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -5721,7 +5788,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           }
           SubmitBarriers(true);
 
-          if (use_fxaa) {
+          if (postprocess_swap) {
             swap_fxaa_source_stage_mask_ = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             swap_fxaa_source_access_mask_ = VK_ACCESS_SHADER_WRITE_BIT;
             swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_GENERAL;
@@ -5733,7 +5800,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           VkDescriptorImageInfo swap_descriptor_destination_storage_image_info;
           swap_descriptor_destination_storage_image_info.sampler = VK_NULL_HANDLE;
           swap_descriptor_destination_storage_image_info.imageView =
-              use_fxaa ? swap_fxaa_source_image_view_ : vulkan_context.image_view();
+              postprocess_swap ? swap_fxaa_source_image_view_ : vulkan_context.image_view();
           swap_descriptor_destination_storage_image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
           VkWriteDescriptorSet swap_descriptor_destination_storage_write;
           swap_descriptor_destination_storage_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -5765,16 +5832,14 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               uint32_t(swap_apply_gamma_compute_descriptor_sets.size()),
               swap_apply_gamma_compute_descriptor_sets.data(), 0, nullptr);
           SwapApplyGammaConstants swap_apply_gamma_constants = {
-              {guest_output_width, guest_output_height}};
+              {gamma_width, gamma_height}};
           deferred_command_buffer_.CmdVkPushConstants(
               swap_apply_gamma_compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
               sizeof(swap_apply_gamma_constants), &swap_apply_gamma_constants);
           BindExternalComputePipeline(swap_apply_gamma_compute_pipeline);
-          uint32_t group_count_x = (guest_output_width + 15) / 16;
-          uint32_t group_count_y = (guest_output_height + 7) / 8;
-          deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          deferred_command_buffer_.CmdVkDispatch((gamma_width + 15) / 16, (gamma_height + 7) / 8, 1);
 
-          if (use_fxaa) {
+          if (postprocess_swap) {
             // Make the FXAA source image readable and bind a separate
             // destination storage descriptor targeting the guest output image.
             PushImageMemoryBarrier(swap_fxaa_source_image_, guest_output_subresource_range,
@@ -5840,10 +5905,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             deferred_command_buffer_.CmdVkPushConstants(
                 swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(swap_fxaa_constants), &swap_fxaa_constants);
-            BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
-                                            ? swap_fxaa_extreme_pipeline_
-                                            : swap_fxaa_pipeline_);
-            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            const VkPipeline postprocess_pipeline = !use_fxaa ? swap_resample_pipeline_ :
+                swap_post_effect == SwapPostEffect::kFxaaExtreme ? swap_fxaa_extreme_pipeline_
+                                                                 : swap_fxaa_pipeline_;
+            BindExternalComputePipeline(postprocess_pipeline);
+            deferred_command_buffer_.CmdVkDispatch((guest_output_width + 15) / 16,
+                                                    (guest_output_height + 7) / 8, 1);
           }
 
           if (hud_snapshot_view != VK_NULL_HANDLE && EnsureSwapHudMask()) {
@@ -5878,13 +5945,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                                         sizeof(hud_mask_size), hud_mask_size);
             BindExternalComputePipeline(swap_hud_mask_pipeline_);
-            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            deferred_command_buffer_.CmdVkDispatch((guest_output_width + 15) / 16,
+                                                    (guest_output_height + 7) / 8, 1);
           }
 
           if (vr_snapshot_view != VK_NULL_HANDLE) {
             Fh1VrLayers(vulkan_context.image(), vulkan_context.image_view(), guest_output_width,
                         guest_output_height, vr_snapshot_view,
-                        select_swap_apply_gamma_compute_pipeline(use_pwl_gamma_ramp, false),
+                        SelectSwapGammaComputePipeline(use_pwl_gamma_ramp,
+                                                       swap_source_requires_compute_rb_swap, false),
                         swap_descriptors_gamma_ramp_[2 * gamma_ramp_frame_index_ref +
                                                      uint32_t(use_pwl_gamma_ramp)],
                         swap_frame_index);
@@ -10239,6 +10308,20 @@ void VulkanCommandProcessor::DestroyScratchBuffer() {
   scratch_buffer_size_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, scratch_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, scratch_buffer_memory_);
+}
+
+VkPipeline VulkanCommandProcessor::SelectSwapGammaComputePipeline(
+    bool use_pwl, bool swap_rb, bool luma) const {
+  if (use_pwl) {
+    if (luma) return swap_rb ? swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_
+                            : swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_;
+    return swap_rb ? swap_apply_gamma_compute_pwl_rb_swap_pipeline_
+                   : swap_apply_gamma_compute_pwl_pipeline_;
+  }
+  if (luma) return swap_rb ? swap_apply_gamma_compute_256_entry_table_fxaa_luma_rb_swap_pipeline_
+                          : swap_apply_gamma_compute_256_entry_table_fxaa_luma_pipeline_;
+  return swap_rb ? swap_apply_gamma_compute_256_entry_table_rb_swap_pipeline_
+                 : swap_apply_gamma_compute_256_entry_table_pipeline_;
 }
 
 bool VulkanCommandProcessor::EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height) {

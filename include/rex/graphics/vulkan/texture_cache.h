@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/vulkan/fh1_screen_raster.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/binding_reuse.h>
 #include <rex/graphics/vulkan/shared_memory.h>
@@ -123,7 +124,13 @@ class VulkanTextureCache final : public TextureCache {
                                  uint32_t* width_unscaled_out = nullptr,
                                  uint32_t* height_unscaled_out = nullptr,
                                  bool* swap_source_needs_rb_swap_out = nullptr,
-                                 Fh1ResolveRaster* resolve_raster_out = nullptr);
+                                 Fh1ResolveRaster* resolve_raster_out = nullptr,
+                                 uint32_t* swap_source_page_out = nullptr);
+
+  void Fh1RecordResolveTrace(fh1::ResolveTrace trace) { fh1_resolve_trace_.Record(trace); }
+  const fh1::ResolveTrace* Fh1GetResolveTrace(uint32_t page) const {
+    return fh1_resolve_trace_.Find(page);
+  }
 
   bool GetScaledResolveRange(uint32_t start_unscaled, uint32_t length_unscaled,
                              uint32_t length_scaled_alignment_log2, uint64_t& start_scaled_out,
@@ -413,6 +420,7 @@ class VulkanTextureCache final : public TextureCache {
   std::pair<const SamplerParameters, Sampler>* sampler_used_last_ = nullptr;
   uint32_t custom_border_color_sampler_count_ = 0;
 
+  fh1::ResolveTraceHistory fh1_resolve_trace_;
   VkBuffer scaled_resolve_buffer_ = VK_NULL_HANDLE;
   uint64_t scaled_resolve_buffer_size_ = 0;
   bool scaled_resolve_buffer_sparse_ = false;

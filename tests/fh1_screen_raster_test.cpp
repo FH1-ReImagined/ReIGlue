@@ -4,6 +4,78 @@
 #include <cstdio>
 #include <initializer_list>
 
+namespace {
+using namespace rex::graphics::vulkan::fh1;
+
+constexpr bool CheckResolveEvidence() {
+  ResolveProducerRaster producers;
+  if (producers.Evidence() != ResolveEvidence::kAbsent) return false;
+  producers.Add(false, false);
+  if (producers.Evidence() != ResolveEvidence::kUnknown) return false;
+  producers.Add(true);
+  if (producers.Evidence() != ResolveEvidence::kMixed || producers.IsFractional()) return false;
+  producers = {};
+  producers.Add(false);
+  if (producers.Evidence() != ResolveEvidence::kInteger || producers.IsFractional()) return false;
+  producers = {};
+  producers.Add(true);
+  return producers.Evidence() == ResolveEvidence::kFractional && producers.IsFractional();
+}
+
+constexpr bool CheckResolveTrace() {
+  ResolveTraceHistory history;
+  if (history.Find(0x100)) return false;
+  history.Record({0x100000, 0x100100, 0x1000, 7, ResolveEvidence::kFractional, true});
+  const auto* trace = history.Find(0x100);
+  if (!trace || !trace->MatchesBase(0x100) || !trace->final_hud) return false;
+  history.Record({0x0FF000, 0x0FF000, 0x2000, 9, ResolveEvidence::kMixed, false});
+  trace = history.Find(0x100);
+  if (!trace || trace->MatchesBase(0x100) || trace->edram_base != 9 ||
+      trace->evidence != ResolveEvidence::kMixed || history.Find(0x102))
+    return false;
+  for (unsigned i = 0; i < 64; ++i)
+    history.Record({0x200000, 0x200000, 1, 0, ResolveEvidence::kInteger, false});
+  return history.Find(0x200) && !history.Find(0x100);
+}
+
+constexpr bool CheckFullSwapNormalization() {
+  constexpr uint32_t address = 0x1BDB1000;
+  constexpr RasterExtent guest{1280, 720};
+  constexpr RasterExtent backing{1280, 1440};
+  ResolveTrace integer{address, address, 3768320, 0, ResolveEvidence::kInteger,
+                       false, UINT32_MAX, guest, true};
+  if (!CanResampleIntegerSwap(&integer, address, address, guest, backing, guest)) return false;
+  if (!CanResampleIntegerSwap(&integer, address, address, guest, {2560, 720}, guest)) return false;
+  if (CanResampleIntegerSwap(&integer, address, address, guest, {2560, 1440}, guest) ||
+      CanResampleIntegerSwap(&integer, address, address, guest, backing, backing) ||
+      CanResampleIntegerSwap(&integer, address, address, guest, backing, {1920, 1080}) ||
+      CanResampleIntegerSwap(&integer, address, address + 4096, guest, backing, guest) ||
+      CanResampleIntegerSwap(nullptr, address, address, guest, backing, guest))
+    return false;
+  auto other = integer;
+  other.destination_base -= 4096;
+  if (CanResampleIntegerSwap(&other, address, address, guest, backing, guest)) return false;
+  other = integer;
+  other.copy_extent = {1280, 256};
+  if (CanResampleIntegerSwap(&other, address, address, guest, backing, guest)) return false;
+  other = integer;
+  other.color = false;
+  if (CanResampleIntegerSwap(&other, address, address, guest, backing, guest)) return false;
+  other = integer;
+  other.written_length = 4;
+  if (CanResampleIntegerSwap(&other, address, address, guest, backing, guest)) return false;
+  other = integer;
+  other.evidence = ResolveEvidence::kMixed;
+  if (CanResampleIntegerSwap(&other, address, address, guest, backing, guest)) return false;
+  other.evidence = ResolveEvidence::kFractional;
+  return !CanResampleIntegerSwap(&other, address, address, guest, backing, guest);
+}
+
+static_assert(CheckResolveEvidence());
+static_assert(CheckResolveTrace());
+static_assert(CheckFullSwapNormalization());
+}  // namespace
+
 int main() {
   using namespace rex::graphics::vulkan::fh1;
   unsigned failures = 0;

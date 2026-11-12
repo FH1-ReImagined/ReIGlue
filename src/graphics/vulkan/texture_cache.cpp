@@ -1088,7 +1088,8 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
                                                    uint32_t* width_unscaled_out,
                                                    uint32_t* height_unscaled_out,
                                                    bool* swap_source_needs_rb_swap_out,
-                                                   Fh1ResolveRaster* resolve_raster_out) {
+                                                   Fh1ResolveRaster* resolve_raster_out,
+                                                   uint32_t* swap_source_page_out) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
@@ -1143,6 +1144,7 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   width_scaled_out = key.GetWidth() * (key.scaled_resolve ? draw_resolution_scale_x() : 1);
   height_scaled_out = key.GetHeight() * (key.scaled_resolve ? draw_resolution_scale_y() : 1);
   format_out = key.format;
+  if (swap_source_page_out) *swap_source_page_out = key.base_page;
   if (resolve_raster_out) {
     *resolve_raster_out = key.scaled_resolve ? Fh1GetResolveRaster(key.base_page)
                                             : Fh1ResolveRaster::kFull;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace rex::graphics::vulkan::fh1 {
@@ -145,16 +146,98 @@ constexpr bool IsNative720pHudResolve(bool hud_target, bool color_zero, RasterEx
 
 // A single coordinate transform is valid only when all owners in the EDRAM
 // copy rectangle wrote with the same raster. Unknown owners use integer UVs.
+enum class ResolveEvidence : uint8_t { kAbsent, kUnknown, kMixed, kInteger, kFractional };
+
+constexpr const char* ResolveEvidenceName(ResolveEvidence evidence) {
+  switch (evidence) {
+    case ResolveEvidence::kAbsent: return "absent";
+    case ResolveEvidence::kUnknown: return "unknown-owner";
+    case ResolveEvidence::kMixed: return "mixed";
+    case ResolveEvidence::kInteger: return "recorded-integer";
+    case ResolveEvidence::kFractional: return "recorded-fractional";
+  }
+  return "invalid";
+}
+
 struct ResolveProducerRaster {
   bool has_fractional = false;
   bool has_full_or_unknown = false;
+  bool has_integer = false;
+  bool has_unknown = false;
 
-  constexpr void Add(bool fractional) {
+  constexpr void Add(bool fractional, bool known = true) {
     has_fractional |= fractional;
     has_full_or_unknown |= !fractional;
+    has_integer |= known && !fractional;
+    has_unknown |= !known;
   }
   constexpr bool IsFractional() const { return has_fractional && !has_full_or_unknown; }
   constexpr bool IsMixed() const { return has_fractional && has_full_or_unknown; }
+  constexpr ResolveEvidence Evidence() const {
+    if (IsMixed()) return ResolveEvidence::kMixed;
+    if (has_unknown) return ResolveEvidence::kUnknown;
+    if (has_integer) return ResolveEvidence::kInteger;
+    if (has_fractional) return ResolveEvidence::kFractional;
+    return ResolveEvidence::kAbsent;
+  }
+};
+
+// For bounded size-change logs only. Presentation still uses the existing
+// raster map. The latest write covering the sampled base wins, even if that
+// write is another resolve whose byte range overlaps this texture.
+struct ResolveTrace {
+  uint32_t destination_base = 0;
+  uint32_t written_address = 0;
+  uint32_t written_length = 0;
+  uint32_t edram_base = 0;
+  ResolveEvidence evidence = ResolveEvidence::kAbsent;
+  bool final_hud = false;
+  uint32_t expected_hud_base = UINT32_MAX;
+  RasterExtent copy_extent{};
+  bool color = false;
+
+  constexpr bool CoversPage(uint32_t page) const {
+    return written_length &&
+        (page == destination_base >> 12 ||
+         (page >= written_address >> 12 &&
+          page <= (uint64_t(written_address) + written_length - 1) >> 12));
+  }
+  constexpr bool MatchesBase(uint32_t page) const { return page == destination_base >> 12; }
+};
+
+constexpr bool CanResampleIntegerSwap(const ResolveTrace* trace, uint32_t source_address,
+                                      uint32_t packet_address, RasterExtent guest_extent,
+                                      RasterExtent source, RasterExtent output) {
+  return trace && trace->color && trace->evidence == ResolveEvidence::kInteger &&
+         trace->destination_base == source_address && trace->written_address == source_address &&
+         trace->written_length >= 1280 * 720 * 4 && packet_address == source_address &&
+         guest_extent.width == 1280 && guest_extent.height == 720 &&
+         trace->copy_extent.width == guest_extent.width &&
+         trace->copy_extent.height == guest_extent.height &&
+         source.width >= guest_extent.width && source.height >= guest_extent.height &&
+         output.IsComplete() && output.width <= source.width && output.height <= source.height &&
+         (source.width != output.width || source.height != output.height) &&
+         uint64_t(source.width) * guest_extent.height !=
+             uint64_t(source.height) * guest_extent.width;
+}
+
+class ResolveTraceHistory {
+ public:
+  constexpr void Record(ResolveTrace trace) {
+    entries_[next_] = trace;
+    next_ = (next_ + 1) % entries_.size();
+  }
+  constexpr const ResolveTrace* Find(uint32_t page) const {
+    for (unsigned i = 0; i < entries_.size(); ++i) {
+      const auto& entry = entries_[(next_ + entries_.size() - 1 - i) % entries_.size()];
+      if (entry.CoversPage(page)) return &entry;
+    }
+    return nullptr;
+  }
+
+ private:
+  std::array<ResolveTrace, 64> entries_{};
+  unsigned next_ = 0;
 };
 
 // Predicated tiling on the fractional raster (#785). FH1 draws some scenes (the street race

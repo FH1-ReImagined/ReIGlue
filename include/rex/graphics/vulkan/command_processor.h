@@ -623,6 +623,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     // Bit 0: center sample; bit 1: RGBA8 box filter (thumbnail capture).
     uint32_t half_pixel_offset;
   };
+  VkPipeline SelectSwapGammaComputePipeline(bool use_pwl, bool swap_rb, bool luma) const;
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
   void DestroySwapFxaaSourceImage();
 
@@ -1021,6 +1022,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_apply_gamma_compute_256_entry_table_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline swap_resample_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
