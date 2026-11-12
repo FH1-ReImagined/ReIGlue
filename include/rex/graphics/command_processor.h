@@ -323,6 +323,7 @@ class CommandProcessor {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+  bool current_draw_predicated_ = false;
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
@@ -367,10 +368,10 @@ class CommandProcessor {
   // A draw as the packet gave it, for ExecuteDraw (the same on one thread and two).
   struct DrawRecord {
     uint32_t initiator;  // VGT_DRAW_INITIATOR
-    uint32_t flags;      // kDrawIndexed, kDrawIndx2
+    uint32_t flags;      // kDrawIndexed, kDrawIndx2, kDrawPredicated
     uint32_t index_format, index_endianness, index_count, index_guest_base, index_length;
   };
-  static constexpr uint32_t kDrawIndexed = 1, kDrawIndx2 = 2;
+  static constexpr uint32_t kDrawIndexed = 1, kDrawIndx2 = 2, kDrawPredicated = 4;
   bool ExecuteDraw(const DrawRecord& draw);
   // A batch of records, in order, in `words`: kRecordRun start count, then count register
   // values (host byte order, 0450); kRecordPlainRun the same for a range of registers that are

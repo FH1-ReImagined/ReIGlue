@@ -828,7 +828,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline Fh1WorldAoApplyPipeline(VulkanRenderTargetCache::RenderPassKey key);
   bool Fh1WorldAoProjection(float* params);
   void Fh1SelectNativeHud(bool native_hud);
-  bool Fh1CreateRenderCaches(uint32_t scale_x, uint32_t scale_y);
+  bool Fh1CreateRenderCaches(uint32_t scale_x, uint32_t scale_y,
+                             const fh1::NativeSceneRaster& native_scene);
   void Fh1ApplyGraphicsRequest();
   std::string fh1_last_graphics_request_;
   std::filesystem::path fh1_storage_root_;

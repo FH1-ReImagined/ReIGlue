@@ -53,6 +53,13 @@ bool IsGpuDebugMarkersEnabled() {
   return result;
 }
 
+REXCVAR_DEFINE_UINT32(fh1_native_scene_width, 0, "GPU",
+                      "FH1 explicit scene width in pixels (0 uses the default)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(fh1_native_scene_height, 0, "GPU",
+                      "FH1 explicit scene height in pixels (0 uses the default)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(forza_native_width, 0, "GPU",
                      "FH1 active drawing width (0 uses integer scale)")
     .range(0, 8960)

@@ -1292,6 +1292,22 @@ void VulkanRenderTargetCache::EndSubmission() {
   }
 }
 
+void VulkanRenderTargetCache::Fh1RecordResolveProducer(uint32_t color_mask, bool writes_depth) {
+  if (!Fh1TracksResolveProducers()) return;
+  const auto* targets = last_update_accumulated_render_targets();
+  if (targets[1] && (color_mask & 0xF) && Fh1IsNative720pHudTarget())
+    fh1_hud_frontbuffer_producers_.Add(fh1_last_draw_fractional_);
+  if (targets[0] && writes_depth) {
+    static_cast<VulkanRenderTarget*>(targets[0])->fh1_fractional_producer = fh1_last_draw_fractional_;
+  }
+  for (unsigned i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (targets[1 + i] && (color_mask & (0xFu << (i * 4)))) {
+      static_cast<VulkanRenderTarget*>(targets[1 + i])->fh1_fractional_producer =
+          fh1_last_draw_fractional_;
+    }
+  }
+}
+
 bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                       VulkanSharedMemory& shared_memory,
                                       VulkanTextureCache& texture_cache,
@@ -1320,8 +1336,33 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
   // #785: a predicated tiling tile drawn on the fractional raster lands at its fractional
   // position (fh1_screen_raster.h). Only the copy moves; the clear stays the tile's.
+  // The final HUD draw uses the native viewport even if its guest draw packet
+  // is predicated. A full copy of that same EDRAM color target can use the
+  // packed-format alias, so provenance comes from the known HUD attachment.
+  const bool final_native_hud = fh1::IsNative720pHudResolve(
+      Fh1IsNative720pHudTarget(), resolve_info.rb_copy_control.copy_src_select == 0,
+      {uint32_t(resolve_info.coordinate_info.width_div_8) << xenos::kResolveAlignmentPixelsLog2,
+       resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2},
+      resolve_info.coordinate_info.edram_offset_x_div_8 ||
+          resolve_info.coordinate_info.edram_offset_y_div_8);
+  bool fractional_producer = final_native_hud && fh1_hud_frontbuffer_producers_.IsFractional();
+  if (!final_native_hud && Fh1TracksResolveProducers() && resolve_info.copy_dest_extent_length) {
+    uint32_t base, row_length, rows, pitch;
+    resolve_info.GetCopyEdramTileSpan(base, row_length, rows, pitch);
+    GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, dump_rectangles_);
+    fh1::ResolveProducerRaster producer;
+    for (const auto& rectangle : dump_rectangles_) {
+      const auto* target = static_cast<const VulkanRenderTarget*>(rectangle.render_target);
+      producer.Add(target && target->fh1_fractional_producer);
+    }
+    fractional_producer = producer.IsFractional();
+    if (producer.IsMixed() && fh1_mixed_resolve_count_++ < 4) {
+      REXGPU_WARN("FH1 fractional scene: mixed EDRAM resolve producers at 0x{:08X}; using integer texture coordinates",
+                  resolve_info.copy_dest_extent_start);
+    }
+  }
   draw_util::ResolveInfo copy_info = resolve_info;
-  if (fh1_last_draw_fractional_ && (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f) &&
+  if (fh1_last_draw_fractional_ && (!Fh1TracksResolveProducers() || fractional_producer) && (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f) &&
       register_file().Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
     const auto window_offset = register_file().Get<reg::PA_SC_WINDOW_OFFSET>();
     const int window_x = int(window_offset.window_x_offset);
@@ -1488,6 +1529,15 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                             copy_info.copy_dest_extent_length);
           written_address_out = copy_info.copy_dest_extent_start;
           written_length_out = copy_info.copy_dest_extent_length;
+          if (Fh1TracksResolveProducers()) {
+            // Record the copied region as well as the guest base for subrect
+            // resolves. The first tile of a tiled texture records its base.
+            const auto raster = fractional_producer ? fh1_resolve_raster_
+                                                    : TextureCache::Fh1ResolveRaster::kFull;
+            texture_cache.Fh1MarkResolveRaster(written_address_out, written_length_out, raster);
+            texture_cache.Fh1MarkResolveRaster(register_file()[XE_GPU_REG_RB_COPY_DEST_BASE],
+                                               1, raster);
+          }
           copied = true;
         }
       }
@@ -6777,10 +6827,10 @@ bool VulkanRenderTargetCache::SeedNativeHud(VulkanRenderTargetCache& scene,
   command_processor_.SubmitBarriers(true);
   VkImageBlit region{};
   region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.srcOffsets[1] = {int32_t(width * scene.draw_resolution_scale_x() * scene.raster_scale_x()),
-                          int32_t(height * scene.draw_resolution_scale_y() * scene.raster_scale_y()), 1};
-  region.dstOffsets[1] = {int32_t(width * draw_resolution_scale_x() * raster_scale_x()),
-                          int32_t(height * draw_resolution_scale_y() * raster_scale_y()), 1};
+  const bool source_full = scene.Fh1TracksResolveProducers() && !src->fh1_fractional_producer;
+  region.srcOffsets[1] = {int32_t(source_full ? width * scene.draw_resolution_scale_x() : scene.Fh1RasterWidth()),
+                          int32_t(source_full ? height * scene.draw_resolution_scale_y() : scene.Fh1RasterHeight()), 1};
+  region.dstOffsets[1] = {int32_t(Fh1RasterWidth()), int32_t(Fh1RasterHeight()), 1};
   if (command_processor_.fh1_dlss()) {
     command_processor_.deferred_command_buffer().CmdFh1Dlss(
         command_processor_.fh1_dlss(), src->image(), dst->image());
@@ -6795,6 +6845,11 @@ bool VulkanRenderTargetCache::SeedNativeHud(VulkanRenderTargetCache& scene,
       VulkanRenderTarget::kColorDrawAccessMask, dst->current_layout(), VulkanRenderTarget::kColorDrawLayout);
   dst->SetUsage(VulkanRenderTarget::kColorDrawStageMask, VulkanRenderTarget::kColorDrawAccessMask,
                 VulkanRenderTarget::kColorDrawLayout);
+  if (Fh1TracksResolveProducers()) {
+    dst->fh1_fractional_producer = true;
+    if (Fh1IsNative720pHudTarget())
+      fh1_hud_frontbuffer_producers_.Add(true);
+  }
   return true;
 }
 

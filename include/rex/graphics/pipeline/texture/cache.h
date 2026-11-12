@@ -135,18 +135,43 @@ class TextureCache {
   // which fills only its top-left part. The HUD's shaders scale screen texture coordinates to
   // that part, which must not happen for the former (a startup movie frame, resolved from the
   // scene and drawn by the HUD). Set or cleared by each resolve, one bit per 4 KB page.
+  enum class Fh1ResolveRaster { kFull, kScene, kHud };
+  void Fh1TrackFractionalResolves() { fh1_track_fractional_resolves_ = true; }
+  bool Fh1TracksFractionalResolves() const { return fh1_track_fractional_resolves_; }
+  void Fh1MarkResolveRaster(uint32_t address, uint32_t length, Fh1ResolveRaster raster) {
+    if (!length || address >= SharedMemory::kBufferSize) return;
+    const uint32_t last = (address + std::min(length, SharedMemory::kBufferSize - address) - 1) >> 12;
+    for (uint32_t page = address >> 12; page <= last; ++page) {
+      Fh1SetRasterPageBit(fh1_raster_pages_, page, raster == Fh1ResolveRaster::kScene);
+      Fh1SetRasterPageBit(fh1_hud_raster_pages_, page, raster == Fh1ResolveRaster::kHud);
+    }
+  }
+  Fh1ResolveRaster Fh1GetResolveRaster(uint32_t page) const {
+    if (!fh1_track_fractional_resolves_) return Fh1ResolveRaster::kFull;
+    if (Fh1RasterPageBit(fh1_raster_pages_, page)) return Fh1ResolveRaster::kScene;
+    if (Fh1RasterPageBit(fh1_hud_raster_pages_, page)) return Fh1ResolveRaster::kHud;
+    return Fh1ResolveRaster::kFull;
+  }
+  Fh1ResolveRaster GetActiveFh1ResolveRaster(uint32_t index) const {
+    const auto* binding = GetValidTextureBinding(index);
+    if (binding) {
+      const auto* texture = binding->texture ? binding->texture : binding->texture_signed;
+      if (texture && texture->key().scaled_resolve)
+        return Fh1GetResolveRaster(texture->key().base_page);
+    }
+    return Fh1ResolveRaster::kFull;
+  }
   void Fh1MarkFullRasterResolve(uint32_t address, uint32_t length, bool full) {
     if (!length || address >= SharedMemory::kBufferSize) return;
     const uint32_t last = (std::min(address + (length - 1), SharedMemory::kBufferSize - 1)) >> 12;
     for (uint32_t page = address >> 12; page <= last; ++page) {
-      if (full) fh1_full_raster_pages_[page >> 6] |= UINT64_C(1) << (page & 63);
-      else fh1_full_raster_pages_[page >> 6] &= ~(UINT64_C(1) << (page & 63));
+      Fh1SetRasterPageBit(fh1_raster_pages_, page, full);
     }
   }
   bool IsActiveFh1FullRasterTexture(uint32_t index) const {
     if (!IsActiveFh1ScreenTexture(index)) return false;
     const uint32_t page = GetValidTextureBinding(index)->texture->key().base_page;
-    return (fh1_full_raster_pages_[page >> 6] >> (page & 63)) & 1;
+    return Fh1RasterPageBit(fh1_raster_pages_, page);
   }
   bool IsActiveFh1ScreenTexture(uint32_t index) const {
     const auto* binding = GetValidTextureBinding(index);
@@ -675,7 +700,19 @@ class TextureCache {
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
   // FH1 split (0409): Fh1MarkFullRasterResolve's pages.
-  uint64_t fh1_full_raster_pages_[SharedMemory::kBufferSize >> (12 + 6)] = {};
+  static bool Fh1RasterPageBit(const uint64_t* pages, uint32_t page) {
+    return (pages[page >> 6] >> (page & 63)) & 1;
+  }
+  static void Fh1SetRasterPageBit(uint64_t* pages, uint32_t page, bool set) {
+    const uint64_t mask = UINT64_C(1) << (page & 63);
+    if (set)
+      pages[page >> 6] |= mask;
+    else
+      pages[page >> 6] &= ~mask;
+  }
+  bool fh1_track_fractional_resolves_ = false;
+  uint64_t fh1_raster_pages_[SharedMemory::kBufferSize >> (12 + 6)] = {};
+  uint64_t fh1_hud_raster_pages_[SharedMemory::kBufferSize >> (12 + 6)] = {};
 
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;

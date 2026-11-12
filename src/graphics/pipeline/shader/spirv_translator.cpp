@@ -385,6 +385,9 @@ void SpirvShaderTranslator::StartTranslation() {
       {"fh1_native_textures", offsetof(SystemConstants, fh1_native_textures), type_uint_},
       {"fh1_full_raster_textures", offsetof(SystemConstants, fh1_full_raster_textures), type_uint_},
       {"fh1_vr_eye", offsetof(SystemConstants, fh1_vr_eye), type_float4_},
+      {"fh1_resolve_raster", offsetof(SystemConstants, fh1_resolve_raster), type_float4_},
+      {"fh1_scene_resolve_textures", offsetof(SystemConstants, fh1_scene_resolve_textures), type_uint_},
+      {"fh1_hud_resolve_textures", offsetof(SystemConstants, fh1_hud_resolve_textures), type_uint_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -3460,7 +3463,8 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_x_ > 1) {
+    if (draw_resolution_scale_x_ > 1 || (fh1_resolve_producers_ &&
+        (modification.value & kFh1FractionalRaster) && raster_scale_x_ != 1.0f)) {
       param_gen_x = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_x,
           builder_->makeFloatConstant(1.0f / (float(draw_resolution_scale_x_) * ((GetSpirvShaderModification().value & kFh1FractionalRaster) ? raster_scale_x_ : 1.0f))));
@@ -3506,7 +3510,8 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_y_ > 1) {
+    if (draw_resolution_scale_y_ > 1 || (fh1_resolve_producers_ &&
+        (modification.value & kFh1FractionalRaster) && raster_scale_y_ != 1.0f)) {
       param_gen_y = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_y,
           builder_->makeFloatConstant(1.0f / (float(draw_resolution_scale_y_) * ((GetSpirvShaderModification().value & kFh1FractionalRaster) ? raster_scale_y_ : 1.0f))));

@@ -211,12 +211,15 @@ void main() {
 
 constexpr char kApplyFragment[] = R"glsl(#version 450
 layout(binding=0) uniform sampler2D factorTex;
-layout(push_constant) uniform Params { ivec4 size; } pc;  // full width, height
+layout(push_constant) uniform Params { ivec4 size; } pc;  // AO factor and shadow mask sizes
 layout(location=0) out vec4 color;
 void main() {
   ivec2 q = ivec2(gl_FragCoord.xy);
   float f = 1.0;
-  if (all(lessThan(q, pc.size.xy))) f = texelFetch(factorTex, ivec2(q.x >> 2, q.y), 0)[q.x & 3];
+  if (all(lessThan(q, pc.size.zw))) {
+    if (any(notEqual(pc.size.xy, pc.size.zw))) q = q * pc.size.xy / pc.size.zw;
+    f = texelFetch(factorTex, ivec2(q.x >> 2, q.y), 0)[q.x & 3];
+  }
   color = vec4(f);
 }
 )glsl";
@@ -669,10 +672,18 @@ bool VulkanCommandProcessor::Fh1WorldAoBeforeDraw(const Shader* pixel_shader,
   ao->computed_frame = frame;
   ao->ready = false;
   if (!Fh1WorldAoProjection(ao->params)) return true;
-  const uint32_t width =
+  uint32_t width =
       (uint32_t(fetch.size_2d.width) + 1) * texture_cache_->draw_resolution_scale_x();
-  const uint32_t height =
+  uint32_t height =
       (uint32_t(fetch.size_2d.height) + 1) * texture_cache_->draw_resolution_scale_y();
+  const auto raster = texture_cache_->GetActiveFh1ResolveRaster(ao->depth_slot);
+  if (raster == TextureCache::Fh1ResolveRaster::kScene) {
+    width = std::min(width, REXCVAR_GET(fh1_native_scene_width));
+    height = std::min(height, REXCVAR_GET(fh1_native_scene_height));
+  } else if (raster == TextureCache::Fh1ResolveRaster::kHud) {
+    width = std::min(width, render_target_cache_->Fh1RasterWidth());
+    height = std::min(height, render_target_cache_->Fh1RasterHeight());
+  }
   // Resizing waits for the old images, closing the draw's current submission. Resume even
   // on allocation failure so the guest draw can continue without AO. On device loss the
   // caller must stop this draw instead of recording into a closed submission.
@@ -745,7 +756,18 @@ void VulkanCommandProcessor::Fh1WorldAoAfterDraw(const Shader* pixel_shader) {
   deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                    ao->apply_layout, 0, 1, &ao->apply_set, 0,
                                                    nullptr);
-  const int32_t size[4] = {int32_t(ao->full_width), int32_t(ao->full_height), 0, 0};
+  uint32_t mask_width = ao->full_width, mask_height = ao->full_height;
+  if (texture_cache_->Fh1TracksFractionalResolves()) {
+    if (render_target_cache_->UsesFractionalRaster()) {
+      mask_width = render_target_cache_->Fh1RasterWidth();
+      mask_height = render_target_cache_->Fh1RasterHeight();
+    } else {
+      mask_width = 1280 * render_target_cache_->draw_resolution_scale_x();
+      mask_height = 720 * render_target_cache_->draw_resolution_scale_y();
+    }
+  }
+  const int32_t size[4] = {int32_t(ao->full_width), int32_t(ao->full_height),
+                           int32_t(mask_width), int32_t(mask_height)};
   deferred_command_buffer_.CmdVkPushConstants(ao->apply_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                               sizeof(size), size);
   deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);

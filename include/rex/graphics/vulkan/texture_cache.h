@@ -122,7 +122,8 @@ class VulkanTextureCache final : public TextureCache {
                                  xenos::TextureFormat& format_out,
                                  uint32_t* width_unscaled_out = nullptr,
                                  uint32_t* height_unscaled_out = nullptr,
-                                 bool* swap_source_needs_rb_swap_out = nullptr);
+                                 bool* swap_source_needs_rb_swap_out = nullptr,
+                                 Fh1ResolveRaster* resolve_raster_out = nullptr);
 
   bool GetScaledResolveRange(uint32_t start_unscaled, uint32_t length_unscaled,
                              uint32_t length_scaled_alignment_log2, uint64_t& start_scaled_out,

@@ -329,9 +329,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // Patch 0396: VR true stereo: subtracted from the guest's clip-space position (the eye's
     // offset for the main view's 3D draws; zero for every other draw).
     float fh1_vr_eye[4];
+    // XY: scene-to-backing ratio. ZW: HUD-to-backing ratio.
+    float fh1_resolve_raster[4];
+    uint32_t fh1_scene_resolve_textures;
+    uint32_t fh1_hud_resolve_textures;
+    uint32_t fh1_resolve_padding[2];
   };
   static_assert(offsetof(SystemConstants, fh1_native) % 16 == 0);
   static_assert(offsetof(SystemConstants, fh1_vr_eye) % 16 == 0);
+  static_assert(offsetof(SystemConstants, fh1_resolve_raster) % 16 == 0);
 
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
@@ -432,14 +438,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
                         uint32_t draw_resolution_scale_x = 1, uint32_t draw_resolution_scale_y = 1,
-                        float raster_scale_x = 1.0f, float raster_scale_y = 1.0f)
+                        float raster_scale_x = 1.0f, float raster_scale_y = 1.0f,
+                        bool fh1_resolve_producers = false)
       : features_(features),
         native_2x_msaa_with_attachments_(native_2x_msaa_with_attachments),
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
         draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
         draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1),
-        raster_scale_x_(raster_scale_x), raster_scale_y_(raster_scale_y) {}
+        raster_scale_x_(raster_scale_x), raster_scale_y_(raster_scale_y),
+        fh1_resolve_producers_(fh1_resolve_producers) {}
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -799,6 +807,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool edram_fragment_shader_interlock_;
   static constexpr uint64_t kFh1FractionalRaster = UINT64_C(1) << 63;
   float raster_scale_x_, raster_scale_y_;
+  bool fh1_resolve_producers_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
 
@@ -926,6 +935,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantFh1NativeTextures,
     kSystemConstantFh1FullRasterTextures,
     kSystemConstantFh1VrEye,
+    kSystemConstantFh1ResolveRaster,
+    kSystemConstantFh1SceneResolveTextures,
+    kSystemConstantFh1HudResolveTextures,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
