@@ -49,6 +49,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
+#include <rex/graphics/vulkan/pipeline_share.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
@@ -69,6 +70,12 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
 
 REXCVAR_DEFINE_BOOL(vulkan_store_pipeline_cache, true, "GPU/Vulkan",
                     "Keep device-local driver pipelines for startup shader warm-up")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// 0520 (FH1 #607): Fh1PipelineShareKey.
+REXCVAR_DEFINE_BOOL(vulkan_pipeline_share_identical, true, "GPU/Vulkan",
+                    "Create one Vulkan pipeline for the pipeline descriptions that give the "
+                    "driver the same creation info (the same shader code and state)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_UINT32(vulkan_store_pipeline_cache_memory_mb, 0, "GPU/Vulkan",
@@ -1100,6 +1107,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     creation_thread_count = std::min(creation_thread_count, pipeline_creations.size());
 
     std::atomic<size_t> next_creation_index(0);
+    const uint64_t shared_before =
+        fh1_pipeline_lookahead::stats.shared.load(std::memory_order_relaxed);
     warmup.Progress(0, pipeline_creations.size());
     // 0422 (FH1 #609): about 32 progress lines a warm-up (every 16 pipelines at most), not one per
     // 16 of thousands; the launcher's bar needs no more.
@@ -1141,8 +1150,11 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       }
     }
 
-    REXGPU_INFO("Created {} graphics pipelines from Vulkan storage ({} requested)",
-                created_pipeline_count.load(), pipeline_creations.size());
+    REXGPU_INFO(
+        "Created {} graphics pipelines from Vulkan storage ({} requested; {} of them "
+        "the identical pipeline of another description)",
+        created_pipeline_count.load(), pipeline_creations.size(),
+        fh1_pipeline_lookahead::stats.shared.load(std::memory_order_relaxed) - shared_before);
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       startup_loading_ = false;
@@ -1434,15 +1446,21 @@ void VulkanPipelineCache::Shutdown() {
 
   ProcessDeferredPipelineDestructions(true);
 
-  // Destroy all pipelines.
+  // Destroy all pipelines (once each: descriptions may share one, 0520).
   last_pipeline_ = nullptr;
+  std::unordered_set<VkPipeline> destroyed_pipelines;
+  destroyed_pipelines.reserve(pipelines_.size());
   for (const auto& pipeline_pair : pipelines_) {
     VkPipeline pipeline = pipeline_pair.second.pipeline.load(std::memory_order_acquire);
-    if (pipeline != VK_NULL_HANDLE) {
+    if (pipeline != VK_NULL_HANDLE && destroyed_pipelines.insert(pipeline).second) {
       dfn.vkDestroyPipeline(device, pipeline, nullptr);
     }
   }
   pipelines_.clear();
+  {
+    std::lock_guard<std::mutex> lock(fh1_share_mutex_);
+    fh1_shared_pipelines_.clear();
+  }
   fh1_frame_cost::GetSizes().pipelines.store(int64_t(pipelines_.size()), std::memory_order_relaxed);
 
   // Destroy all internal shaders.
@@ -3846,6 +3864,45 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   return true;
 }
 
+void VulkanPipelineCache::Fh1CanonicalizeIgnoredState(
+    const PipelineCreationArguments& creation_arguments,
+    VkPipelineRasterizationStateCreateInfo& rasterization,
+    VkPipelineDepthStencilStateCreateInfo& depth_stencil,
+    VkPipelineColorBlendAttachmentState* color_blend_attachments, uint32_t attachment_count,
+    bool fragment_shader_interlock) {
+  // The translator reads gl_FrontFacing only for the parameter generation (of polygons; that
+  // of points is counted too, to be safe).
+  const VulkanShader::VulkanTranslation* pixel_shader = creation_arguments.pixel_shader;
+  const bool reads_facing =
+      pixel_shader &&
+      SpirvShaderTranslator::Modification(pixel_shader->modification()).pixel.param_gen_enable;
+  pipeline_share::CanonicalizeIgnoredState(rasterization, depth_stencil, color_blend_attachments,
+                                           attachment_count, reads_facing,
+                                           fragment_shader_interlock);
+}
+
+std::string VulkanPipelineCache::Fh1PipelineShareKey(
+    const PipelineCreationArguments& creation_arguments, const VkGraphicsPipelineCreateInfo& info) {
+  // A guest stage by its SPIR-V (each translation has a module of its own); the cache's own
+  // modules (tessellation, geometry, depth-only) by handle, one per key in their caches.
+  return pipeline_share::Key(info, [&creation_arguments](VkShaderModule module) {
+    const VulkanShader::VulkanTranslation* translation = nullptr;
+    if (module == creation_arguments.vertex_shader->shader_module()) {
+      translation = creation_arguments.vertex_shader;
+    } else if (creation_arguments.pixel_shader &&
+               module == creation_arguments.pixel_shader->shader_module()) {
+      translation = creation_arguments.pixel_shader;
+    }
+    pipeline_share::StageCode code;
+    if (translation) {
+      code.by_code = true;
+      code.low = translation->spirv_hash().low64;
+      code.high = translation->spirv_hash().high64;
+    }
+    return code;
+  });
+}
+
 bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                                                 VkShaderModule fragment_shader_override) {
   VkPipeline existing_pipeline =
@@ -4334,7 +4391,51 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
   VkResult create_result;
-  if (creating_placeholder) {
+  // 0520 (FH1 #607): the pipeline of another description with the same creation info, or wait
+  // for it if it is being created (placeholders are never shared).
+  std::string share_key;
+  Fh1SharedPipeline* share_slot = nullptr;
+  bool shared = false;
+  if (!creating_placeholder && REXCVAR_GET(vulkan_pipeline_share_identical)) {
+    // The ignored state is written one way in a copy used only for the key. The driver is still
+    // given the description's own state: the descriptions that share differ only in state Vulkan
+    // ignores, and the driver cache entries stored before 0520 (by description) stay valid.
+    VkPipelineRasterizationStateCreateInfo key_rasterization_state = rasterization_state;
+    VkPipelineDepthStencilStateCreateInfo key_depth_stencil_state = depth_stencil_state;
+    VkPipelineColorBlendAttachmentState key_color_blend_attachments[xenos::kMaxColorRenderTargets];
+    std::memcpy(key_color_blend_attachments, color_blend_attachments,
+                sizeof(key_color_blend_attachments));
+    VkPipelineColorBlendStateCreateInfo key_color_blend_state = color_blend_state;
+    if (key_color_blend_state.pAttachments) {
+      key_color_blend_state.pAttachments = key_color_blend_attachments;
+    }
+    Fh1CanonicalizeIgnoredState(creation_arguments, key_rasterization_state,
+                                key_depth_stencil_state, key_color_blend_attachments,
+                                key_color_blend_state.attachmentCount,
+                                edram_fragment_shader_interlock);
+    VkGraphicsPipelineCreateInfo key_create_info = pipeline_create_info;
+    key_create_info.pRasterizationState = &key_rasterization_state;
+    key_create_info.pDepthStencilState = &key_depth_stencil_state;
+    key_create_info.pColorBlendState = &key_color_blend_state;
+    share_key = Fh1PipelineShareKey(creation_arguments, key_create_info);
+  }
+  if (!share_key.empty()) {
+    std::unique_lock<std::mutex> lock(fh1_share_mutex_);
+    auto [it, inserted] = fh1_shared_pipelines_.try_emplace(std::move(share_key));
+    // Elements stay where they are when the map grows.
+    Fh1SharedPipeline& slot = it->second;
+    if (inserted) {
+      share_slot = &slot;
+    } else {
+      fh1_share_cond_.wait(lock, [&slot] { return !slot.building; });
+      // If that creation failed, this one tries on its own.
+      shared = slot.pipeline != VK_NULL_HANDLE;
+      pipeline = slot.pipeline;
+    }
+  }
+  if (shared) {
+    create_result = VK_SUCCESS;
+  } else if (creating_placeholder) {
     // Placeholders are short-lived and never stored.
     create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info,
                                                   nullptr, &pipeline);
@@ -4346,6 +4447,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
                                                               create_start)
             .count()));
+  }
+  if (share_slot) {
+    {
+      std::lock_guard<std::mutex> lock(fh1_share_mutex_);
+      share_slot->pipeline = create_result == VK_SUCCESS ? pipeline : VK_NULL_HANDLE;
+      share_slot->building = false;
+    }
+    fh1_share_cond_.notify_all();
   }
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
@@ -4371,6 +4480,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   // FH1 (#378): the log's pipeline summary (fh1_pipeline_lookahead.h).
   if (creating_placeholder) {
     fh1_pipeline_lookahead::stats.placeholders.fetch_add(1, std::memory_order_relaxed);
+  } else if (shared) {
+    fh1_pipeline_lookahead::stats.shared.fetch_add(1, std::memory_order_relaxed);
   } else {
     fh1_pipeline_lookahead::stats.created.fetch_add(1, std::memory_order_relaxed);
     if (was_placeholder && old_pipeline == VK_NULL_HANDLE) {
@@ -4381,7 +4492,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     creation_arguments.pipeline->second.is_placeholder.store(true, std::memory_order_release);
   } else {
     creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
-    if (was_placeholder && old_pipeline != VK_NULL_HANDLE) {
+    // Not the pipeline just stored: a creation of the same description on another thread may
+    // have stored the one shared with it (0520).
+    if (was_placeholder && old_pipeline != VK_NULL_HANDLE && old_pipeline != pipeline) {
       deferred_destroy_pipelines_.Retire(old_pipeline);
     }
   }

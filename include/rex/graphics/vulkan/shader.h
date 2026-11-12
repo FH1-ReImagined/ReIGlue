@@ -14,6 +14,7 @@
 
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/xenos.h>
+#include <rex/hash.h>
 #include <rex/ui/vulkan/device.h>
 
 namespace rex::graphics::vulkan {
@@ -28,9 +29,13 @@ class VulkanShader : public SpirvShader {
 
     VkShaderModule GetOrCreateShaderModule();
     VkShaderModule shader_module() const { return shader_module_; }
+    // 0520 (FH1 #607): XXH3-128 of the SPIR-V the module was created from (set with the module),
+    // so that pipelines of translations with the same code can share one (pipeline_cache.cpp).
+    const XXH128_hash_t& spirv_hash() const { return spirv_hash_; }
 
    private:
     VkShaderModule shader_module_ = VK_NULL_HANDLE;
+    XXH128_hash_t spirv_hash_ = {};
   };
 
   explicit VulkanShader(const ui::vulkan::VulkanDevice* vulkan_device,

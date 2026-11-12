@@ -22,6 +22,7 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <string>
 #include <rex/graphics/vulkan/driver_cache_file.h>
 #include <rex/graphics/vulkan/pipeline_retirement_queue.h>
 #include <rex/graphics/pipeline_store_file.h>
@@ -419,6 +420,25 @@ class VulkanPipelineCache {
   // available.
   bool EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                              VkShaderModule fragment_shader_override = VK_NULL_HANDLE);
+  // 0520 (FH1 #607): descriptions that the driver is given the same creation info for (the same
+  // SPIR-V, state, layout and attachments, after Fh1CanonicalizeIgnoredState) share one
+  // pipeline. Fh1PipelineShareKey is that creation info as bytes (empty: not shared).
+  static void Fh1CanonicalizeIgnoredState(
+      const PipelineCreationArguments& creation_arguments,
+      VkPipelineRasterizationStateCreateInfo& rasterization,
+      VkPipelineDepthStencilStateCreateInfo& depth_stencil,
+      VkPipelineColorBlendAttachmentState* color_blend_attachments, uint32_t attachment_count,
+      bool fragment_shader_interlock);
+  static std::string Fh1PipelineShareKey(const PipelineCreationArguments& creation_arguments,
+                                         const VkGraphicsPipelineCreateInfo& create_info);
+  struct Fh1SharedPipeline {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    // Until the first description with this creation info has its pipeline (or failed).
+    bool building = true;
+  };
+  std::mutex fh1_share_mutex_;
+  std::condition_variable fh1_share_cond_;
+  std::unordered_map<std::string, Fh1SharedPipeline> fh1_shared_pipelines_;
   // Driver pipeline data, one entry per description (driver_cache_file.h): each real
   // pipeline is created with a VkPipelineCache of its own, seeded with its stored entry.
   void InitializeDriverPipelineCache(const std::filesystem::path& cache_root, uint32_t title_id);

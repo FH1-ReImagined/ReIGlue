@@ -584,21 +584,23 @@ namespace fh1_pipeline_lookahead {
 
 void LogSummary() {
   static auto last_log = std::chrono::steady_clock::time_point{};
-  static uint64_t last_created = 0, last_skipped_draws = 0, last_placeholders = 0;
+  static uint64_t last_created = 0, last_skipped_draws = 0, last_placeholders = 0, last_shared = 0;
   const auto now = std::chrono::steady_clock::now();
   if (now - last_log < std::chrono::seconds(10)) {
     return;
   }
   uint64_t created = stats.created.load(std::memory_order_relaxed);
   uint64_t placeholders = stats.placeholders.load(std::memory_order_relaxed);
+  uint64_t shared = stats.shared.load(std::memory_order_relaxed);
   if (created == last_created && stats.skipped_draws == last_skipped_draws &&
-      placeholders == last_placeholders) {
+      placeholders == last_placeholders && shared == last_shared) {
     return;
   }
   last_log = now;
   last_created = created;
   last_skipped_draws = stats.skipped_draws;
   last_placeholders = placeholders;
+  last_shared = shared;
   std::string ends;
   for (uint32_t i = 0; i < uint32_t(End::kCount); ++i) {
     if (stats.ends[i]) {
@@ -607,20 +609,19 @@ void LogSummary() {
   }
   REXGPU_INFO(
       "Pipelines: {} built, {} of them ahead of their draws ({} drawn with so far, {} failed), "
-      "{} placeholders; {} draws skipped and {} of {} frames not shown while pipelines were "
-      "built ({} of them past the hold for a draw that must not be missing: skipped depth only "
-      "{}, screen passes {}, front buffer or HUD {}, VR stereo {}; {} shown without draws; {} "
+      "{} placeholders, {} descriptions given another's identical pipeline; {} draws skipped and "
+      "{} of {} frames not shown while pipelines were built ({} of them past the hold for a "
+      "draw that must not be missing: skipped depth only {}, screen passes {}, front buffer or "
+      "HUD {}, VR stereo {}; {} shown without draws; {} "
       "copied back for the CPU without draws); lookahead: {} walks ({}), {} packets, {} draws, "
       "{} queued, {} unmet waits, {:.1f} ms; {} waits {:.1f} ms",
       created, stats.created_ahead.load(std::memory_order_relaxed), stats.drawn_ahead,
-      stats.failed_ahead.load(std::memory_order_relaxed), placeholders, stats.skipped_draws,
+      stats.failed_ahead.load(std::memory_order_relaxed), placeholders, shared, stats.skipped_draws,
       stats.skipped_frames, stats.frames, stats.held_for_stale_contents, stats.skipped_depth,
       stats.skipped_screen_passes, stats.skipped_front_buffer, stats.skipped_stereo,
       stats.incomplete_frames_shown, stats.incomplete_readbacks, stats.walks,
-      ends.empty() ? "none" : ends,
-      stats.walk_packets, stats.walk_draws, stats.queued_ahead, stats.walk_unmet_waits,
-      stats.walk_ms, stats.waits,
-      stats.wait_ms);
+      ends.empty() ? "none" : ends, stats.walk_packets, stats.walk_draws, stats.queued_ahead,
+      stats.walk_unmet_waits, stats.walk_ms, stats.waits, stats.wait_ms);
 }
 
 }  // namespace fh1_pipeline_lookahead

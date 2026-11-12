@@ -17,6 +17,12 @@ target_include_directories(pipeline_retirement_test PRIVATE ${PROJECT_SOURCE_DIR
 target_link_libraries(pipeline_retirement_test PRIVATE Threads::Threads)
 add_test(NAME vulkan.pipeline_retirement COMMAND pipeline_retirement_test)
 
+# 0520: pipeline_share.h needs only Vulkan's headers.
+add_executable(pipeline_share_test pipeline_share_test.cpp)
+target_include_directories(pipeline_share_test PRIVATE ${PROJECT_SOURCE_DIR}/include
+                           ${PROJECT_SOURCE_DIR}/thirdparty/vulkan-headers/include)
+add_test(NAME vulkan.pipeline_share COMMAND pipeline_share_test)
+
 # PPC instruction tests (requires PPC toolchain)
 add_subdirectory(ppc)
 

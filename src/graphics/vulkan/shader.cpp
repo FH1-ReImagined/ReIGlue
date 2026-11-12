@@ -52,6 +52,7 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
     MakeInvalid();
     return VK_NULL_HANDLE;
   }
+  spirv_hash_ = XXH3_128bits(translated_binary().data(), translated_binary().size());
   // FH1 (#640): the module holds the code now (the driver keeps its own copy), and it is never
   // created again from the binary: 40 KB a translation, 18 MB at the title screen and 35 MB or
   // more in a long session.

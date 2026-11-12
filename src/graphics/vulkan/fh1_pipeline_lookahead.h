@@ -52,6 +52,7 @@ struct Stats {
   std::atomic<uint64_t> created_ahead{0};  // of those, started by a lookahead
   std::atomic<uint64_t> failed_ahead{0};   // started by a lookahead, creation failed
   std::atomic<uint64_t> placeholders{0};   // placeholders built on the command processor thread
+  std::atomic<uint64_t> shared{0};         // 0520: descriptions given another's identical pipeline
   // The command processor thread.
   uint64_t walks = 0, walk_packets = 0, walk_draws = 0, queued_ahead = 0, drawn_ahead = 0;
   uint64_t walk_unmet_waits = 0;
