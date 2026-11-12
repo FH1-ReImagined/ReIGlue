@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <set>
 #include <chrono>
 #include <unordered_set>
@@ -57,6 +58,10 @@
 #include <rex/types.h>
 #include <rex/ui/vulkan/util.h>
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
 REXCVAR_DEFINE_INT32(
     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
     "Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto)")
@@ -79,12 +84,26 @@ REXCVAR_DEFINE_UINT32(vulkan_store_pipeline_cache_memory_mb, 0, "GPU/Vulkan",
 
 // FH1 (#378): fh1_pipeline_lookahead.cpp.
 REXCVAR_DECLARE(bool, vulkan_pipeline_lookahead);
+// The launcher's Prebuild shaders run (command_processor.cpp).
+REXCVAR_DECLARE(bool, shader_prebuild_only);
+
 // FH1 (patch 0590): the start's translations on several threads.
 REXCVAR_DEFINE_INT32(vulkan_shader_translation_threads, -1, "GPU/Vulkan",
                      "Threads that translate the stored and prebuild shaders at start (-1: 3/4 of "
                      "the logical processors; 1: one)")
     .range(-1, 64)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// FH1 (patch 0600): the shader pack (shader_pack_file.h).
+REXCVAR_DEFINE_BOOL(vulkan_shader_pack, true, "GPU/Vulkan",
+                    "Take the start's translated shaders from the shader pack that the launcher's "
+                    "Prebuild shaders writes (<cache>/shaders/translated), and write it then; "
+                    "off: translate them at every start, as before")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_shader_pack_write, false, "GPU/Vulkan",
+                    "Testing: write the shader pack at every start from that start's "
+                    "translations (normally only the Prebuild shaders run does)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
+    .debug_only();
 
 namespace rex::graphics::vulkan {
 
@@ -1023,8 +1042,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   ImportShaderPrebuild(title_id, pipeline_storage_magic_api, pipeline_storage_versions,
                        pipeline_stored_descriptions, shader_translations_needed);
 
-  // Translate shader modifications needed for stored pipelines (on several threads: patch 0590).
-  TranslateStoredShaders(shader_translations_needed);
+  // Translate shader modifications needed for stored pipelines (on several threads, from the
+  // shader pack where it has them: patches 0590, 0600).
+  TranslateStoredShaders(shader_translations_needed, cache_root, title_id);
 
   // Create the pipelines.
   std::vector<PipelineCreationArguments> pipeline_creations;
@@ -1308,6 +1328,13 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
     shader_storage_file_ = nullptr;
     shader_storage_file_flush_needed_ = false;
   }
+
+  if (shader_pack_.is_open() && shader_pack_play_hits_) {
+    REXGPU_INFO("Vulkan shader pack: {} translations in play taken from {}", shader_pack_play_hits_,
+                rex::path_to_utf8(shader_pack_.path().filename()));
+  }
+  shader_pack_.Close();
+  shader_pack_play_hits_ = 0;
 
   shader_storage_cache_root_.clear();
   shader_storage_title_id_ = 0;
@@ -1676,7 +1703,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
     fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().shader_ms);
     ++fh1_frame_cost::Current().shaders;
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
-    if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader)) {
+    if (!TranslateOrTakeFromPack(*vertex_shader)) {
       REXGPU_ERROR("Failed to translate the vertex shader!");
       return false;
     }
@@ -1690,7 +1717,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
       fh1_frame_cost::Timer cost_timer(fh1_frame_cost::Current().shader_ms);
       ++fh1_frame_cost::Current().shaders;
       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
-      if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
+      if (!TranslateOrTakeFromPack(*pixel_shader)) {
         REXGPU_ERROR("Failed to translate the pixel shader!");
         return false;
       }
@@ -2153,15 +2180,115 @@ std::unique_ptr<SpirvShaderTranslator> VulkanPipelineCache::CreateShaderTranslat
       a.raster_scale_x, a.raster_scale_y);
 }
 
+namespace {
+// The file this code was loaded from: the GPU plugin.
+std::filesystem::path GpuPluginPath() {
+#ifdef _WIN32
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCWSTR>(&GpuPluginPath), &module)) {
+    return {};
+  }
+  std::wstring name(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(module, name.data(), DWORD(name.size()));
+  if (!length || length >= name.size()) {
+    return {};
+  }
+  name.resize(length);
+  return std::filesystem::path(name);
+#else
+  Dl_info info{};
+  if (!dladdr(reinterpret_cast<void*>(&GpuPluginPath), &info) || !info.dli_fname) {
+    return {};
+  }
+  return std::filesystem::path(info.dli_fname);
+#endif
+}
+}  // namespace
+
+std::string VulkanPipelineCache::ShaderPackIdentity() const {
+  // Read once a process (a few ms for the plugin's file).
+  static const std::string plugin_id = shader_pack_file::FileId(GpuPluginPath());
+  if (plugin_id.empty()) {
+    return {};
+  }
+  return shader_pack_file::MakeIdentity(ShaderPackBuild(plugin_id),
+                                        shader_translator_->DescribeConfiguration());
+}
+
+bool VulkanPipelineCache::TakeTranslationFromPack(VulkanShader::VulkanTranslation& translation,
+                                                  std::vector<uint8_t>& spirv,
+                                                  std::vector<uint8_t>& scratch) {
+  VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
+  const shader_pack_file::Reader::Pair* pair =
+      shader_pack_.Find(shader.ucode_data_hash(), translation.modification());
+  if (!pair) {
+    return false;
+  }
+  if (!shader_pack_.Decode(*pair, spirv, scratch)) {
+    if (shader_pack_damaged_.fetch_add(1, std::memory_order_relaxed) == 0) {
+      REXGPU_WARN("Vulkan shader pack {}: the module of shader {:016X} modification {:016X} is "
+                  "damaged; translating it",
+                  rex::path_to_utf8(shader_pack_.path().filename()), shader.ucode_data_hash(),
+                  translation.modification());
+    }
+    return false;
+  }
+  std::vector<SpirvShader::TextureBinding> textures(pair->textures);
+  const uint8_t* encoded_textures = shader_pack_.textures(*pair);
+  for (size_t i = 0; i < textures.size(); ++i) {
+    // For a stable hash, as PostTranslation.
+    std::memset(&textures[i], 0, sizeof(textures[i]));
+    const uint32_t e = encoded_textures[i];
+    textures[i].fetch_constant = e & 31;
+    textures[i].dimension = xenos::FetchOpDimension((e >> 5) & 3);
+    textures[i].is_signed = (e >> 7) & 1;
+  }
+  std::vector<SpirvShader::SamplerBinding> samplers(pair->samplers);
+  for (size_t i = 0; i < samplers.size(); ++i) {
+    std::memset(&samplers[i], 0, sizeof(samplers[i]));
+    const uint32_t e = shader_pack_.sampler(*pair, i);
+    samplers[i].fetch_constant = e & 31;
+    samplers[i].mag_filter = xenos::TextureFilter((e >> 5) & 3);
+    samplers[i].min_filter = xenos::TextureFilter((e >> 7) & 3);
+    samplers[i].mip_filter = xenos::TextureFilter((e >> 9) & 3);
+    samplers[i].aniso_filter = xenos::AnisoFilter((e >> 11) & 7);
+  }
+  shader.SetBindingsAfterTranslation(textures, samplers);
+  translation.SetTranslatedBinary(std::move(spirv));
+  return true;
+}
+
+bool VulkanPipelineCache::TranslateOrTakeFromPack(VulkanShader::VulkanTranslation& translation) {
+  if (shader_pack_.is_open()) {
+    std::vector<uint8_t> spirv, scratch;
+    if (TakeTranslationFromPack(translation, spirv, scratch)) {
+      ++shader_pack_play_hits_;
+      if (!FinishTranslation(translation)) {
+        return false;
+      }
+      SetUpShaderBindingLayouts(static_cast<VulkanShader&>(translation.shader()));
+      return true;
+    }
+  }
+  return TranslateAnalyzedShader(*shader_translator_, translation);
+}
+
 void VulkanPipelineCache::TranslateStoredShaders(
-    const std::set<std::pair<uint64_t, uint64_t>>& translations_needed) {
+    const std::set<std::pair<uint64_t, uint64_t>>& translations_needed,
+    const std::filesystem::path& cache_root, uint32_t title_id) {
+  namespace pack = shader_pack_file;
   const auto start = std::chrono::steady_clock::now();
   struct Job {
     VulkanShader::VulkanTranslation* translation;
     bool is_new;
     bool valid = false;
+    bool from_pack = false;
+    // The translator's SPIR-V, kept for the pack being written (the module frees it, 0430).
+    std::vector<uint8_t> spirv;
   };
-  // The analysis and the translation objects on this thread. Shader::AnalyzeUcode shares
+  // 0590: the analysis and the translation objects on this thread. Shader::AnalyzeUcode shares
   // ucode_disasm_buffer_, and GetOrCreateTranslation the shader's map and its 0362 memo.
   std::vector<Job> jobs;
   for (const auto& [hash, modification] : translations_needed) {
@@ -2181,9 +2308,108 @@ void VulkanPipelineCache::TranslateStoredShaders(
     }
   }
 
-  // The translations on several threads, each with its own translator. A translation writes
-  // only its own object, and the bindings of its shader once (an atomic flag); the binding layout
-  // map is filled below, on this thread.
+  // 0600: the shader pack of this configuration. The Prebuild shaders run writes it from fresh
+  // translations instead of reading it, so a pack is always a translator's output.
+  const std::string identity = REXCVAR_GET(vulkan_shader_pack) ? ShaderPackIdentity() : "";
+  if (REXCVAR_GET(vulkan_shader_pack) && identity.empty()) {
+    REXGPU_WARN("Vulkan shader pack: the GPU plugin's file cannot be read; no shader pack");
+  }
+  const bool pack_enabled = !identity.empty();
+  const bool write_pack =
+      pack_enabled && (REXCVAR_GET(shader_prebuild_only) || REXCVAR_GET(vulkan_shader_pack_write));
+  const std::filesystem::path pack_path =
+      cache_root / "shaders" / "translated" / pack::FileName(title_id, identity);
+  shader_pack_.Close();
+  shader_pack_damaged_.store(0, std::memory_order_relaxed);
+  shader_pack_play_hits_ = 0;
+  const auto pack_start = std::chrono::steady_clock::now();
+  if (pack_enabled && !write_pack) {
+    const std::string name = rex::path_to_utf8(pack_path.filename());
+    switch (shader_pack_.Open(pack_path, identity, SpirvShaderTranslator::Modification::kVersion)) {
+      case pack::Reader::Status::kNone:
+        REXGPU_INFO("Vulkan shader pack: none for this configuration ({}); the launcher's "
+                    "Prebuild shaders writes it",
+                    name);
+        break;
+      case pack::Reader::Status::kOther:
+        REXGPU_INFO("Vulkan shader pack {}: written by another build or for another "
+                    "configuration; not used",
+                    name);
+        break;
+      case pack::Reader::Status::kDamaged:
+        REXGPU_WARN("Vulkan shader pack {}: damaged; not used", name);
+        break;
+      case pack::Reader::Status::kOk:
+        break;
+    }
+    if (shader_pack_.is_open() && !jobs.empty() && !shader_pack_.Load()) {
+      REXGPU_WARN("Vulkan shader pack {}: could not be read; not used", name);
+      shader_pack_.Close();
+    }
+    if (shader_pack_.is_open()) {
+      // The identity names the plugin binary and the configuration, so the pack is what this
+      // translator makes, if it is deterministic. A few translations, other ones at each start,
+      // are made again and compared byte for byte (about 0.5 ms each).
+      std::vector<const Job*> in_pack;
+      for (const Job& job : jobs) {
+        if (shader_pack_.Find(job.translation->shader().ucode_data_hash(),
+                              job.translation->modification())) {
+          in_pack.push_back(&job);
+        }
+      }
+      constexpr size_t kChecked = 4;
+      std::minstd_rand random(uint32_t(std::chrono::steady_clock::now().time_since_epoch().count()));
+      for (size_t c = 0; c < std::min(kChecked, in_pack.size()); ++c) {
+        std::swap(in_pack[c], in_pack[c + random() % (in_pack.size() - c)]);
+      }
+      std::unique_ptr<SpirvShaderTranslator> checker;
+      string::StringBuffer disassembly;
+      std::vector<uint8_t> packed, scratch;
+      for (size_t c = 0; c < std::min(kChecked, in_pack.size()) && shader_pack_.is_open(); ++c) {
+        const Job& job = *in_pack[c];
+        const Shader& original = job.translation->shader();
+        SpirvShader fresh(original.type(), original.ucode_data_hash(), original.ucode_data().data(),
+                          original.ucode_data().size(), std::endian::native);
+        fresh.AnalyzeUcode(disassembly);
+        Shader::Translation* fresh_translation =
+            fresh.GetOrCreateTranslation(job.translation->modification());
+        if (!checker) {
+          checker = CreateShaderTranslator();
+        }
+        const bool fresh_valid = checker->TranslateAnalyzedShader(*fresh_translation);
+        const pack::Reader::Pair* pair =
+            shader_pack_.Find(original.ucode_data_hash(), job.translation->modification());
+        bool same = fresh_valid && shader_pack_.Decode(*pair, packed, scratch) &&
+                    packed == fresh_translation->translated_binary() &&
+                    pair->textures == fresh.GetTextureBindingsAfterTranslation().size() &&
+                    pair->samplers == fresh.GetSamplerBindingsAfterTranslation().size();
+        for (size_t i = 0; same && i < pair->textures; ++i) {
+          same = shader_pack_.textures(*pair)[i] ==
+                 EncodeShaderPackTextureBinding(fresh.GetTextureBindingsAfterTranslation()[i]);
+        }
+        for (size_t i = 0; same && i < pair->samplers; ++i) {
+          same = shader_pack_.sampler(*pair, i) ==
+                 EncodeShaderPackSamplerBinding(fresh.GetSamplerBindingsAfterTranslation()[i]);
+        }
+        if (!same) {
+          REXGPU_WARN("Vulkan shader pack {}: shader {:016X} modification {:016X} differs from "
+                      "this build's translation; not used. Prebuild the shaders again in the "
+                      "launcher.",
+                      rex::path_to_utf8(pack_path.filename()), original.ucode_data_hash(),
+                      job.translation->modification());
+          shader_pack_.Close();
+        }
+      }
+    }
+  }
+
+  const auto pack_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - pack_start)
+                           .count();
+
+  // 0590: the translations on several threads, each with its own translator. A translation
+  // writes only its own object, and the bindings of its shader once (an atomic flag); the binding
+  // layout map is filled below, on this thread.
   size_t thread_count = 1;
   if (jobs.size() >= 16) {
     uint32_t logical_processor_count = rex::thread::logical_processor_count();
@@ -2196,8 +2422,9 @@ void VulkanPipelineCache::TranslateStoredShaders(
     thread_count = std::min(thread_count, jobs.size() / 8);
   }
   std::atomic<size_t> next_job(0);
-  auto worker = [this, &jobs, &next_job]() {
+  auto worker = [this, &jobs, &next_job, write_pack]() {
     std::unique_ptr<SpirvShaderTranslator> translator;
+    std::vector<uint8_t> spirv, scratch;
     for (;;) {
       const size_t index = next_job.fetch_add(1, std::memory_order_relaxed);
       if (index >= jobs.size()) {
@@ -2205,13 +2432,20 @@ void VulkanPipelineCache::TranslateStoredShaders(
       }
       Job& job = jobs[index];
       VulkanShader::VulkanTranslation& translation = *job.translation;
-      if (!translator) {
-        translator = CreateShaderTranslator();
+      if (shader_pack_.is_open() && TakeTranslationFromPack(translation, spirv, scratch)) {
+        job.from_pack = true;
+      } else {
+        if (!translator) {
+          translator = CreateShaderTranslator();
+        }
+        if (!translator->TranslateAnalyzedShader(translation)) {
+          REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored",
+                       translation.shader().ucode_data_hash());
+          continue;
+        }
       }
-      if (!translator->TranslateAnalyzedShader(translation)) {
-        REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored",
-                     translation.shader().ucode_data_hash());
-        continue;
+      if (write_pack) {
+        job.spirv = translation.translated_binary();
       }
       job.valid = FinishTranslation(translation);
     }
@@ -2230,8 +2464,10 @@ void VulkanPipelineCache::TranslateStoredShaders(
       rex::thread::Wait(thread.get(), false);
     }
   }
+  shader_pack_.Unload();
 
-  size_t translated = 0;
+  size_t from_pack = 0, translated = 0;
+  std::vector<pack::Translation> to_write;
   for (Job& job : jobs) {
     VulkanShader& shader = static_cast<VulkanShader&>(job.translation->shader());
     if (!job.valid) {
@@ -2241,14 +2477,48 @@ void VulkanPipelineCache::TranslateStoredShaders(
       continue;
     }
     SetUpShaderBindingLayouts(shader);
-    ++translated;
+    ++(job.from_pack ? from_pack : translated);
+    if (write_pack && !job.spirv.empty()) {
+      pack::Translation& t = to_write.emplace_back();
+      t.hash = shader.ucode_data_hash();
+      t.modification = job.translation->modification();
+      t.spirv = std::move(job.spirv);
+      for (const auto& binding : shader.GetTextureBindingsAfterTranslation()) {
+        t.textures.push_back(EncodeShaderPackTextureBinding(binding));
+      }
+      for (const auto& binding : shader.GetSamplerBindingsAfterTranslation()) {
+        t.samplers.push_back(EncodeShaderPackSamplerBinding(binding));
+      }
+    }
   }
-  REXGPU_INFO("Vulkan shader warm-up: {} translations in {} ms, {} translated on {} thread{}",
+  const auto translated_at = std::chrono::steady_clock::now();
+  REXGPU_INFO("Vulkan shader warm-up: {} translations in {} ms, {} from the shader pack, {} "
+              "translated on {} thread{}{}",
               jobs.size(),
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - start)
-                  .count(),
-              translated, thread_count, thread_count == 1 ? "" : "s");
+              std::chrono::duration_cast<std::chrono::milliseconds>(translated_at - start).count(),
+              from_pack, translated, thread_count, thread_count == 1 ? "" : "s",
+              from_pack ? fmt::format(" (the pack read and checked in {} ms)", pack_ms)
+                        : std::string());
+
+  if (write_pack && !to_write.empty()) {
+    const pack::WriteResult result = pack::Write(
+        pack_path, identity, SpirvShaderTranslator::Modification::kVersion, std::move(to_write));
+    if (result.written) {
+      const size_t removed = pack::RemoveStale(pack_path, identity);
+      REXGPU_INFO("Vulkan shader pack: wrote {} ({} translations, {} distinct modules, {:.1f} MB "
+                  "of SPIR-V in {:.1f} MB) in {} ms{}",
+                  rex::path_to_utf8(pack_path.filename()), result.pairs, result.blobs,
+                  result.spirv_bytes / 1048576.0, result.bytes / 1048576.0,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - translated_at)
+                      .count(),
+                  removed ? fmt::format("; removed {} older pack file{}", removed,
+                                        removed == 1 ? "" : "s")
+                          : std::string());
+    } else {
+      REXGPU_WARN("Vulkan shader pack: could not write {}", rex::path_to_utf8(pack_path));
+    }
+  }
 }
 
 void VulkanPipelineCache::WritePipelineRenderTargetDescription(

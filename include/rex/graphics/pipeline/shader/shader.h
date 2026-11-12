@@ -795,6 +795,15 @@ class Shader {
       host_disassembly_ = std::move(disassembly);
     }
 
+    // FH1 (patch 0600): a translation taken from the shader pack instead of the translator: the
+    // binary a successful translation of this modification made (valid, without errors).
+    void SetTranslatedBinary(std::vector<uint8_t> binary) {
+      translated_binary_ = std::move(binary);
+      errors_.clear();
+      is_translated_ = true;
+      is_valid_ = true;
+    }
+
     // For dumping after translation. Dumps the shader's translated code, and,
     // if available, translated disassembly, to files in the given directory
     // based on ucode hash. Returns {binary path, disassembly path if written}.

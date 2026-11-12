@@ -79,3 +79,8 @@ add_test(NAME gpu.shader_disasm COMMAND shader_disasm_test)
 add_executable(driver_cache_file_test driver_cache_file_test.cpp)
 target_include_directories(driver_cache_file_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME vulkan.driver_cache_file COMMAND driver_cache_file_test)
+
+# The shader pack's file format (0600, FH1 native renderer M1), header only.
+add_executable(shader_pack_file_test shader_pack_file_test.cpp)
+target_include_directories(shader_pack_file_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME vulkan.shader_pack_file COMMAND shader_pack_file_test)
