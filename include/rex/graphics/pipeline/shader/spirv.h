@@ -58,6 +58,21 @@ class SpirvShader : public Shader {
     return sampler_bindings_;
   }
 
+  // FH1 (patch 0600): the bindings of a translation taken from the shader pack, which
+  // SpirvShaderTranslator::PostTranslation sets after a translation; as there, the first
+  // translation's are kept. Thread-safe against translations of other modifications.
+  void SetBindingsAfterTranslation(const std::vector<TextureBinding>& texture_bindings,
+                                   const std::vector<SamplerBinding>& sampler_bindings) {
+    if (bindings_setup_entered_.test_and_set(std::memory_order_relaxed)) {
+      return;
+    }
+    texture_bindings_ = texture_bindings;
+    sampler_bindings_ = sampler_bindings;
+    for (const TextureBinding& binding : texture_bindings_) {
+      used_texture_mask_ |= UINT32_C(1) << binding.fetch_constant;
+    }
+  }
+
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 

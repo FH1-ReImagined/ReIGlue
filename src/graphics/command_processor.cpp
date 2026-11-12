@@ -11,6 +11,7 @@
 
 #include "fh1_command_cursor.h"
 #include "fh1_frame_cost.h"
+#include "fh1_pm4_trace.h"
 #include "fh1_vr_stereo.h"
 #include <algorithm>
 #include <bit>
@@ -1476,6 +1477,12 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+#if REX_FH1_PM4_TRACE
+  fh1_pm4_trace::Scope fh1_trace_scope;  // patch 0570
+  if (fh1_pm4_trace::Enabled(memory_->TranslatePhysical(0))) {
+    fh1_pm4_trace::BeginPrimary(primary_buffer_ptr_, primary_buffer_size_);
+  }
+#endif
   {
     // FH1 (#378): the pipeline lookahead's view of the ring (fh1_command_cursor.h).
     fh1_command_cursor::cursor.ring_start = read_index;
@@ -1511,6 +1518,17 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   fh1_command_cursor::Scope cursor_scope(&reader);  // FH1 (#378)
+#if REX_FH1_PM4_TRACE
+  // Patch 0570: the buffer's class and parent; its packets are counted against its tags.
+  fh1_pm4_trace::Scope fh1_trace_scope;
+  struct Fh1TraceDepth {
+    bool on;
+    ~Fh1TraceDepth() {
+      if (on) fh1_pm4_trace::EndIndirect();
+    }
+  } fh1_trace_depth{fh1_pm4_trace::Enabled(memory_->TranslatePhysical(0))};
+  if (fh1_trace_depth.on) fh1_pm4_trace::BeginIndirect(ptr, count);
+#endif
   do {
     if (!ExecutePacket(&reader)) {
       // Return up a level if we encounter a bad packet.
@@ -1526,6 +1544,10 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   fh1_command_cursor::Scope cursor_scope(&reader);  // FH1 (#378)
+#if REX_FH1_PM4_TRACE
+  fh1_pm4_trace::Scope fh1_trace_scope;  // patch 0570
+  if (fh1_pm4_trace::Enabled(memory_->TranslatePhysical(0))) fh1_pm4_trace::BeginHost(ptr, count);
+#endif
   do {
     if (!ExecutePacket(&reader)) {
       REXGPU_ERROR("**** ExecutePacket: Failed to execute packet.");
@@ -1578,17 +1600,38 @@ inline void OnSwap() {
 }  // namespace fh1_frame_trace
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+#if REX_FH1_PM4_TRACE
+  // Patch 0570: the padding and the packet counted against the tag of their first dword.
+  const bool fh1_trace = fh1_pm4_trace::Active(reader->capacity());
+  const uint32_t fh1_pad_start = reader->read_offset();
+  uint32_t fh1_pads = 0;
+#endif
   uint32_t packet = reader->ReadAndSwap<uint32_t>();
   // Zero words and type-2 packets do nothing. The D3D library pads its command
   // buffers with type-2 packets (about two million a second in a race, more than
   // the draws and constant writes together): skip a whole run of them here
   // instead of returning to the caller's loop for each one.
   while (packet == 0 || (packet >> 30) == 0x02) {
+#if REX_FH1_PM4_TRACE
+    ++fh1_pads;
+#endif
     if (!reader->read_count()) {
+#if REX_FH1_PM4_TRACE
+      if (fh1_trace) fh1_pm4_trace::Padding(fh1_pad_start, fh1_pads);
+#endif
       return true;
     }
     packet = reader->ReadAndSwap<uint32_t>();
   }
+#if REX_FH1_PM4_TRACE
+  uint32_t fh1_packet_start = 0;
+  if (fh1_trace) {
+    if (fh1_pads) fh1_pm4_trace::Padding(fh1_pad_start, fh1_pads);
+    fh1_packet_start = uint32_t((reader->read_offset() + reader->capacity() - sizeof(uint32_t)) %
+                                reader->capacity());
+    fh1_pm4_trace::t_packet_start = fh1_packet_start;  // the parent of an indirect buffer
+  }
+#endif
 
   if (packet == 0xCDCDCDCD) [[unlikely]] {
     WarnUninitializedPacket();
@@ -1610,6 +1653,9 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
       result = ExecutePacketType1(reader, packet);
       break;
   }
+#if REX_FH1_PM4_TRACE
+  if (fh1_trace) fh1_pm4_trace::Packet(fh1_packet_start, reader->read_offset(), packet);
+#endif
   if ((fh1_stereo_state_ == Fh1StereoState::kSpeculative ||
        fh1_stereo_state_ == Fh1StereoState::kRecording) &&
       result) [[unlikely]] {
@@ -2125,6 +2171,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     });
     PublishRecordBatch();
     LogRecordSplit();
+#if REX_FH1_PM4_TRACE
+    fh1_pm4_trace::OnSwap();  // patch 0570
+#endif
     ++counter_;
     return true;
   }
@@ -2132,6 +2181,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   rexui_SetNextGuestOutputTag(0);
   fh1_frame_trace::OnSwap();  // patch 0396
+#if REX_FH1_PM4_TRACE
+  fh1_pm4_trace::OnSwap();  // patch 0570
+#endif
   Fh1StereoOnSwap();
 
   ++counter_;

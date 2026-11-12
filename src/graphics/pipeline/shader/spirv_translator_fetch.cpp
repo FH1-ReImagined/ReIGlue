@@ -2378,18 +2378,13 @@ bool SpirvShaderTranslator::Fh1Fm4ShadowFetch(const ParsedTextureFetchInstructio
                                               false, false, texture_parameters,
                                               spv::ImageOperandsLodMask);
   // FH1_FM4_SHADOW_COMPONENT=0-3 (a dev test) picks another component of the mask.
-  static const unsigned component = [] {
-    const char* v = std::getenv("FH1_FM4_SHADOW_COMPONENT");
-    return v && *v >= '0' && *v <= '3' ? unsigned(*v - '0') : 0u;
-  }();
-  spv::Id shadow = builder_->createCompositeExtract(texel, type_float_, component);
+  spv::Id shadow =
+      builder_->createCompositeExtract(texel, type_float_, Fh1Fm4ShadowComponent());
   // The converter makes FM4's shadow colour (shad_color) 0, which takes the lightmap's light
   // too: a shadow drew black. The mask's 0 becomes FH1_FM4_SHADOW_FLOOR (default 0.45, about
   // FM4's own TrackSettings ShadowColor, 0.39 0.46 0.57) instead: floor + (1 - floor) * mask.
-  static const float floor_value = [] {
-    const char* v = std::getenv("FH1_FM4_SHADOW_FLOOR");
-    return v ? float(std::atof(v)) : 0.45f;
-  }();
+  // Both are in DescribeConfiguration when set (Fh1Fm4ShadowConfiguration).
+  const float floor_value = Fh1Fm4ShadowFloor();
   shadow = builder_->createNoContractionBinOp(
       spv::OpFAdd, type_float_, builder_->makeFloatConstant(floor_value),
       builder_->createNoContractionBinOp(spv::OpFMul, type_float_,

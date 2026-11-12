@@ -441,6 +441,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
         draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1),
         raster_scale_x_(raster_scale_x), raster_scale_y_(raster_scale_y) {}
 
+  // FH1 (patch 0580): everything besides the microcode and the modification that the SPIR-V
+  // depends on, as "key=value" words: logged when the Vulkan pipeline cache starts, and read by
+  // the offline translator (rexglue-shaders translate --config) to translate exactly as it.
+  std::string DescribeConfiguration() const;
+  // FH1 (#648, patch 0440): the FM4 shadow fetch's dev-test variables FH1_FM4_SHADOW_COMPONENT
+  // and FH1_FM4_SHADOW_FLOOR (read once a process), which change its SPIR-V. As configuration
+  // words (" fh1_fm4_shadow_component=N fh1_fm4_shadow_floor=F") only when one of them is set, so
+  // that the usual configuration stays as it was; "" otherwise (patch 0600: the shader pack's
+  // identity must not match a start with other values).
+  static unsigned Fh1Fm4ShadowComponent();
+  static float Fh1Fm4ShadowFloor();
+  static const std::string& Fh1Fm4ShadowConfiguration();
+
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
       Shader::HostVertexShaderType host_vertex_shader_type =

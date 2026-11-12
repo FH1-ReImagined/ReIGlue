@@ -24,6 +24,7 @@
 #include <set>
 #include <rex/graphics/vulkan/driver_cache_file.h>
 #include <rex/graphics/vulkan/pipeline_retirement_queue.h>
+#include <rex/graphics/vulkan/shader_pack_file.h>
 #include <rex/graphics/pipeline_store_file.h>
 #include <thread>
 #include <unordered_map>
@@ -41,6 +42,7 @@
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/vulkan/api.h>
+#include <rex/version.h>
 
 namespace rex::graphics::vulkan {
 
@@ -271,6 +273,36 @@ class VulkanPipelineCache {
     PipelineDescription description;
   });
 
+ public:
+  // FH1 (patch 0580): the stores' layouts, for the offline tools that read them (rexglue-shaders).
+  // <title>.xsh: 'XESH', kShaderStoreVersion (big-endian), then per shader a
+  // kShaderStoreRecordHeaderSize header (XXH3 of the microcode, dword count : 31, type : 1) and
+  // the microcode. <title>.<fbo|fsi>.vk.xpso: pipeline_store_file with kPipelineStoreVersions and
+  // kPipelineStoreRecordSize records; a record holds the vertex shader hash and modification and
+  // the pixel shader hash and modification at kPipelineStoreShadersOffset.
+  static constexpr uint32_t kShaderStoreVersion = ShaderStoredHeader::kVersion;
+  static constexpr size_t kShaderStoreRecordHeaderSize = sizeof(ShaderStoredHeader);
+  static constexpr pipeline_store_file::Versions kPipelineStoreVersions{
+      PipelineDescription::kVersion, SpirvShaderTranslator::Modification::kVersion};
+  static constexpr size_t kPipelineStoreRecordSize = sizeof(PipelineStoredDescription);
+  static constexpr size_t kPipelineStoreShadersOffset = sizeof(uint64_t);
+  // FH1 (patch 0600): the shader pack (shader_pack_file.h). Its identity's build: the SDK
+  // version and the identity of the GPU plugin's file (shader_pack_file::FileId), which the
+  // translator is compiled into, so a pack is only taken by the plugin binary that wrote it.
+  // Its bindings: a byte per texture binding, 16 bits per sampler.
+  static std::string ShaderPackBuild(std::string_view plugin_id) {
+    return std::string(REXGLUE_VERSION_STRING) + "+" + std::string(plugin_id);
+  }
+  static uint8_t EncodeShaderPackTextureBinding(const SpirvShader::TextureBinding& b) {
+    return uint8_t(b.fetch_constant | uint32_t(b.dimension) << 5 | uint32_t(b.is_signed) << 7);
+  }
+  static uint16_t EncodeShaderPackSamplerBinding(const SpirvShader::SamplerBinding& b) {
+    return uint16_t(b.fetch_constant | uint32_t(b.mag_filter) << 5 | uint32_t(b.min_filter) << 7 |
+                    uint32_t(b.mip_filter) << 9 | uint32_t(b.aniso_filter) << 11);
+  }
+
+ private:
+
   // Adds the shader prebuild's pipelines for this device and partition to `descriptions`, and
   // their shader modifications to `translations_needed`.
   void ImportShaderPrebuild(uint32_t title_id, uint32_t api,
@@ -384,6 +416,29 @@ class VulkanPipelineCache {
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                VulkanShader::VulkanTranslation& translation);
 
+  // FH1 (patches 0590, 0600): the parts of TranslateAnalyzedShader after the translator, and a
+  // translator like shader_translator_ for other threads.
+  // FinishTranslation: the dump_shaders files and the shader module; per translation, so any
+  // thread. SetUpShaderBindingLayouts: the texture binding layout map; one thread at a time.
+  bool FinishTranslation(VulkanShader::VulkanTranslation& translation);
+  void SetUpShaderBindingLayouts(VulkanShader& shader);
+  std::unique_ptr<SpirvShaderTranslator> CreateShaderTranslator() const;
+  // The stored and prebuild pipelines' shaders at start: the analysis serially, then the
+  // translations on several threads (vulkan_shader_translation_threads), each taken from the
+  // shader pack when it has it (vulkan_shader_pack); writes the pack in the launcher's Prebuild
+  // shaders step (shader_prebuild_only) or with vulkan_shader_pack_write.
+  void TranslateStoredShaders(const std::set<std::pair<uint64_t, uint64_t>>& translations_needed,
+                              const std::filesystem::path& cache_root, uint32_t title_id);
+  // The shader pack's identity for this cache: the SDK build and the translator configuration
+  // ("" when the plugin's file cannot be read: no pack then).
+  std::string ShaderPackIdentity() const;
+  // A translation from the open pack (its SPIR-V and the shader's bindings); false when the pack
+  // does not have it or its module is damaged. Any thread.
+  bool TakeTranslationFromPack(VulkanShader::VulkanTranslation& translation,
+                               std::vector<uint8_t>& spirv, std::vector<uint8_t>& scratch);
+  // In play: from the pack if it has the translation, else the translator.
+  bool TranslateOrTakeFromPack(VulkanShader::VulkanTranslation& translation);
+
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
   bool GetCurrentStateDescription(
@@ -466,6 +521,20 @@ class VulkanPipelineCache {
   string::StringBuffer ucode_disasm_buffer_;
   // Reusable shader translator on the command processor thread.
   std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  // What shader_translator_ was made with, for the warm-up's translators (patch 0590).
+  struct ShaderTranslatorArguments {
+    SpirvShaderTranslator::Features features{true};
+    bool native_2x_msaa_with_attachments = false;
+    bool native_2x_msaa_no_attachments = false;
+    bool edram_fragment_shader_interlock = false;
+    uint32_t draw_resolution_scale_x = 1, draw_resolution_scale_y = 1;
+    float raster_scale_x = 1.0f, raster_scale_y = 1.0f;
+  } shader_translator_arguments_;
+  // FH1 (patch 0600): the shader pack of this cache's configuration, open from the warm-up to
+  // ShutdownShaderStorage (only its index is held after the warm-up).
+  shader_pack_file::Reader shader_pack_;
+  std::atomic<uint32_t> shader_pack_damaged_{0};
+  uint32_t shader_pack_play_hits_ = 0;
 
   struct LayoutUID {
     size_t uid;

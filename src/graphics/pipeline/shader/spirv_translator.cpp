@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -128,6 +129,59 @@ std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
   TranslateAnalyzedShader(translation);
   is_depth_only_fragment_shader_ = false;
   return translation.translated_binary();
+}
+
+std::string SpirvShaderTranslator::DescribeConfiguration() const {
+  const Features& f = features_;
+  return fmt::format(
+      "spirv_version={:#x} max_storage_buffer_range={} full_draw_index_uint32={} "
+      "vertex_pipeline_stores_and_atomics={} fragment_stores_and_atomics={} clip_distance={} "
+      "cull_distance={} image_view_format_swizzle={} signed_zero_inf_nan_preserve_float32={} "
+      "denorm_flush_to_zero_float32={} rounding_mode_rte_float32={} "
+      "fragment_shader_sample_interlock={} demote_to_helper_invocation={} sample_rate_shading={} "
+      "implicit_cube_lod={} fh1_native_viewport={} pixel_shader_contraction={} "
+      "native_2x_msaa_with_attachments={} native_2x_msaa_no_attachments={} "
+      "edram_fragment_shader_interlock={} draw_resolution_scale_x={} draw_resolution_scale_y={} "
+      "raster_scale_x={} raster_scale_y={} fh1_dirt_seam_fix={} modification_version={:#x}",
+      f.spirv_version, f.max_storage_buffer_range, int(f.full_draw_index_uint32),
+      int(f.vertex_pipeline_stores_and_atomics), int(f.fragment_stores_and_atomics),
+      int(f.clip_distance), int(f.cull_distance), int(f.image_view_format_swizzle),
+      int(f.signed_zero_inf_nan_preserve_float32), int(f.denorm_flush_to_zero_float32),
+      int(f.rounding_mode_rte_float32), int(f.fragment_shader_sample_interlock),
+      int(f.demote_to_helper_invocation), int(f.sample_rate_shading), int(f.implicit_cube_lod),
+      int(f.fh1_native_viewport), int(f.pixel_shader_contraction),
+      int(native_2x_msaa_with_attachments_), int(native_2x_msaa_no_attachments_),
+      int(edram_fragment_shader_interlock_), draw_resolution_scale_x_, draw_resolution_scale_y_,
+      raster_scale_x_, raster_scale_y_, int(REXCVAR_GET(fh1_dirt_seam_fix)),
+      Modification::kVersion) + Fh1Fm4ShadowConfiguration();
+}
+
+unsigned SpirvShaderTranslator::Fh1Fm4ShadowComponent() {
+  // FH1_FM4_SHADOW_COMPONENT=0-3 (a dev test) picks another component of the mask.
+  static const unsigned component = [] {
+    const char* v = std::getenv("FH1_FM4_SHADOW_COMPONENT");
+    return v && *v >= '0' && *v <= '3' ? unsigned(*v - '0') : 0u;
+  }();
+  return component;
+}
+
+float SpirvShaderTranslator::Fh1Fm4ShadowFloor() {
+  static const float floor_value = [] {
+    const char* v = std::getenv("FH1_FM4_SHADOW_FLOOR");
+    return v ? float(std::atof(v)) : 0.45f;
+  }();
+  return floor_value;
+}
+
+const std::string& SpirvShaderTranslator::Fh1Fm4ShadowConfiguration() {
+  static const std::string words = [] {
+    if (!std::getenv("FH1_FM4_SHADOW_COMPONENT") && !std::getenv("FH1_FM4_SHADOW_FLOOR")) {
+      return std::string();
+    }
+    return fmt::format(" fh1_fm4_shadow_component={} fh1_fm4_shadow_floor={}",
+                       Fh1Fm4ShadowComponent(), Fh1Fm4ShadowFloor());
+  }();
+  return words;
 }
 
 bool SpirvShaderTranslator::IsFh1DirtSeamPixelShader(uint64_t ucode_data_hash) {
