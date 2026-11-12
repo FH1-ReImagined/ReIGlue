@@ -154,15 +154,7 @@ class TextureCache {
     if (Fh1RasterPageBit(fh1_hud_raster_pages_, page)) return Fh1ResolveRaster::kHud;
     return Fh1ResolveRaster::kFull;
   }
-  Fh1ResolveRaster GetActiveFh1ResolveRaster(uint32_t index) const {
-    const auto* binding = GetValidTextureBinding(index);
-    if (binding) {
-      const auto* texture = binding->texture ? binding->texture : binding->texture_signed;
-      if (texture && texture->key().scaled_resolve)
-        return Fh1GetResolveRaster(texture->key().base_page);
-    }
-    return Fh1ResolveRaster::kFull;
-  }
+  Fh1ResolveRaster GetActiveFh1ResolveRaster(uint32_t index) const;
   void Fh1MarkFullRasterResolve(uint32_t address, uint32_t length, bool full) {
     if (!length || address >= SharedMemory::kBufferSize) return;
     auto lock = global_critical_region_.AcquireDeferred();
@@ -570,6 +562,7 @@ class TextureCache {
 
   const RegisterFile& register_file() const { return register_file_; }
   SharedMemory& shared_memory() const { return shared_memory_; }
+  Fh1ResolveRaster GetFh1ResolveRasterForTexture(const Texture& texture) const;
 
   // May be called for purposes like clearing the cache, as well as in the
   // destructor of the implementation if textures, for instance, have references

@@ -1147,8 +1147,7 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   format_out = key.format;
   if (swap_source_page_out) *swap_source_page_out = key.base_page;
   if (resolve_raster_out) {
-    *resolve_raster_out = key.scaled_resolve ? Fh1GetResolveRaster(key.base_page)
-                                            : Fh1ResolveRaster::kFull;
+    *resolve_raster_out = GetFh1ResolveRasterForTexture(*texture);
   }
   return texture_view;
 }
