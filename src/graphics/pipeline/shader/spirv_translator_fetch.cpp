@@ -830,7 +830,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           break;
       }
     }
-    if ((raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f) &&
+    if (!fh1_resolve_producers_ && (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f) &&
         instr.dimension == xenos::FetchOpDimension::k2D) size_needed_components |= 0b11;
     if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked && size_needed_components) {
       // Stacked and 3D textures have different size packing - need to get
@@ -1012,6 +1012,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     spv::Id texture_resolution_scaled = spv::NoResult;
     uint32_t revert_resolution_scale_axes =
         uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+    const bool resolve_producers = fh1_resolve_producers_ && revert_resolution_scale_axes &&
+                                   instr.dimension == xenos::FetchOpDimension::k2D;
+    if (resolve_producers)
+      revert_resolution_scale_axes = 0b11;
     spv::Id const_texture_resolution_scale[] = {spv::NoResult, spv::NoResult};
     spv::Id const_texture_resolution_scale_reciprocal[] = {spv::NoResult, spv::NoResult};
     if (revert_resolution_scale_axes) {
@@ -1041,8 +1045,40 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     }
 
     spv::Id fractional_texture = spv::NoResult;
-    if (texture_resolution_scaled != spv::NoResult && instr.dimension == xenos::FetchOpDimension::k2D &&
-        (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f)) {
+    spv::Id producer_ratio[2] = {spv::NoResult, spv::NoResult};
+    if (resolve_producers) {
+      auto producer_mask = [&](uint32_t constant) {
+        id_vector_temp_ = {builder_->makeIntConstant(constant)};
+        const spv::Id mask = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                        id_vector_temp_), spv::NoPrecision);
+        return builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, mask,
+                                  builder_->makeUintConstant(UINT32_C(1) << fetch_constant_index)),
+            const_uint_0_);
+      };
+      const spv::Id scene = producer_mask(kSystemConstantFh1SceneResolveTextures);
+      const spv::Id hud = producer_mask(kSystemConstantFh1HudResolveTextures);
+      auto ratio_component = [&](unsigned component) {
+        id_vector_temp_ = {builder_->makeIntConstant(kSystemConstantFh1ResolveRaster),
+                           builder_->makeIntConstant(component)};
+        return builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                        id_vector_temp_), spv::NoPrecision);
+      };
+      for (unsigned i = 0; i < 2; ++i) {
+        const spv::Id hud_or_full = builder_->createTriOp(
+            spv::OpSelect, type_float_, hud, ratio_component(i + 2), const_float_1_);
+        producer_ratio[i] = builder_->createTriOp(
+            spv::OpSelect, type_float_, scene, ratio_component(i), hud_or_full);
+        const_texture_resolution_scale[i] = builder_->createBinOp(
+            spv::OpFMul, type_float_, const_texture_resolution_scale[i], producer_ratio[i]);
+        const_texture_resolution_scale_reciprocal[i] = builder_->createBinOp(
+            spv::OpFDiv, type_float_, const_float_1_, const_texture_resolution_scale[i]);
+      }
+    } else if (texture_resolution_scaled != spv::NoResult && instr.dimension == xenos::FetchOpDimension::k2D &&
+               (raster_scale_x_ != 1.0f || raster_scale_y_ != 1.0f)) {
       // Match the screen resolve pitches, including height padding (for
       // example 1280x736). Testing aspect ratio would miss those textures.
       spv::Id screen_width = builder_->makeBoolConstant(false);
@@ -1168,7 +1204,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
       }
-      if (fractional_texture != spv::NoResult) {
+      if (resolve_producers) {
+        for (unsigned i = 0; i < 2; ++i) {
+          coordinates[i] = builder_->createBinOp(
+              spv::OpFMul, type_float_, coordinates[i], producer_ratio[i]);
+        }
+      } else if (fractional_texture != spv::NoResult) {
         for (unsigned i = 0; i < 2; ++i) {
           const float scale = i ? raster_scale_y_ : raster_scale_x_;
           if (scale != 1.0f) coordinates[i] = builder_->createTriOp(spv::OpSelect,

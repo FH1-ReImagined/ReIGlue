@@ -373,6 +373,102 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
+namespace {
+template <typename Word>
+bool Fh1PageBitsCover(const Word* bits, uint32_t first, uint32_t last) {
+  constexpr uint32_t kBits = sizeof(Word) * 8;
+  constexpr Word kAll = Word(~Word(0));
+  for (uint32_t word = first / kBits; word <= last / kBits; ++word) {
+    Word mask = kAll;
+    if (word == first / kBits) mask = Word(mask << (first % kBits));
+    if (word == last / kBits) mask &= Word(kAll >> (kBits - 1 - last % kBits));
+    if ((bits[word] & mask) != mask) return false;
+  }
+  return true;
+}
+}  // namespace
+
+TextureCache::Fh1ResolveRaster TextureCache::GetFh1ResolveRasterForTexture(
+    const Texture& texture) const {
+  const auto& key = texture.key();
+  if (!fh1_track_fractional_resolves_ || !scaled_resolve_pages_ || !key.scaled_resolve || !key.base_page ||
+      !texture.GetGuestBaseSize()) return Fh1ResolveRaster::kFull;
+
+  auto lock = thread::global_critical_region::AcquireDirect();
+  const auto* raster_bits = fh1_raster_pages_;
+  auto raster = Fh1ResolveRaster::kScene;
+  if (!Fh1RasterPageBit(raster_bits, key.base_page)) {
+    raster_bits = fh1_hud_raster_pages_;
+    raster = Fh1ResolveRaster::kHud;
+    if (!Fh1RasterPageBit(raster_bits, key.base_page)) return Fh1ResolveRaster::kFull;
+  }
+
+  // The shader has one coordinate transform for the entire bound view. The
+  // legacy scaled allocation heuristic can accept partial coverage, so that
+  // allocation and its first page alone cannot authorize a fractional UV map.
+  // Use the layout bounds unless the sampled pages can be identified exactly.
+  // Agreement of these legacy page tags does not prove exact texel writes and
+  // must not be used to authorize sparse resolve publication.
+  const auto span_matches = [&](uint32_t page, uint32_t length) {
+    const uint32_t address = page << 12;
+    if (!page || !length || length > SharedMemory::kBufferSize - address) return false;
+    const uint32_t last = (address + length - 1) >> 12;
+    return Fh1PageBitsCover(raster_bits, page, last) &&
+           Fh1PageBitsCover(scaled_resolve_pages_.get(), page, last) &&
+           shared_memory().IsRangeAllGpuWritten(address, length);
+  };
+  const auto base_matches = [&] {
+    // Both Vulkan loaders use the same 32-bit tiled address path for the
+    // normalized RGBA8 and packed 10-bit formats. Other loader variants keep
+    // the conservative whole-storage proof.
+    const bool supported_format = key.format == xenos::TextureFormat::k_8_8_8_8 ||
+                                  key.format == xenos::TextureFormat::k_2_10_10_10;
+    if (key.tiled && key.dimension == xenos::DataDimension::k2DOrStacked &&
+        key.GetDepthOrArraySize() == 1 && !key.packed_mips && !key.mip_max_level &&
+        !texture.GetGuestMipsSize() && !texture.force_load_3d_tiling() && supported_format) {
+      // At 32 bpp a 32x32 macrotile is exactly one 4 KiB page. A partial
+      // edge macrotile is required, but full padding macrotiles between
+      // successive logical rows are never sampled by this view. The generic
+      // loader's 8-texel groups cannot cross a scaled 32-texel tile boundary.
+      constexpr uint32_t kTile = xenos::kTextureTileWidthHeight;
+      const uint32_t columns = (key.GetWidth() + kTile - 1) / kTile;
+      const uint32_t rows = (key.GetHeight() + kTile - 1) / kTile;
+      const uint32_t pitch = texture.guest_layout().base.row_pitch_bytes;
+      const uint32_t stride_pages = pitch / (kTile * 4);
+      const uint32_t byte_size = texture.GetGuestBaseSize();
+      if (!(pitch % (kTile * 4)) && rows > 1 && columns < stride_pages &&
+          (uint64_t(rows - 1) * stride_pages + columns) * 4096 == byte_size &&
+          byte_size <= SharedMemory::kBufferSize - (key.base_page << 12)) {
+        for (uint32_t row = 0; row < rows; ++row) {
+          if (!span_matches(key.base_page + row * stride_pages, columns * 4096)) return false;
+        }
+        return true;
+      }
+    }
+    return span_matches(key.base_page, texture.GetGuestBaseSize());
+  };
+  if (!base_matches() ||
+      (texture.GetGuestMipsSize() && !span_matches(key.mip_page, texture.GetGuestMipsSize()))) {
+    return Fh1ResolveRaster::kFull;
+  }
+  return raster;
+}
+
+TextureCache::Fh1ResolveRaster TextureCache::GetActiveFh1ResolveRaster(uint32_t index) const {
+  const auto* binding = GetValidTextureBinding(index);
+  if (!binding) return Fh1ResolveRaster::kFull;
+  if (!binding->texture) {
+    return binding->texture_signed ? GetFh1ResolveRasterForTexture(*binding->texture_signed)
+                                   : Fh1ResolveRaster::kFull;
+  }
+  const auto raster = GetFh1ResolveRasterForTexture(*binding->texture);
+  if (raster != Fh1ResolveRaster::kFull && binding->texture_signed &&
+      GetFh1ResolveRasterForTexture(*binding->texture_signed) != raster) {
+    return Fh1ResolveRaster::kFull;
+  }
+  return raster;
+}
+
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
   uint32_t host_swizzle = 0;
   for (uint32_t i = 0; i < 4; ++i) {

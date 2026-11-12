@@ -2640,7 +2640,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
     DrawRecord draw;
     draw.initiator = vgt_draw_initiator.value;
     draw.flags = (is_indexed ? kDrawIndexed : 0) |
-                 (std::strcmp(opcode_name, "PM4_DRAW_INDX_2") == 0 ? kDrawIndx2 : 0);
+                 (std::strcmp(opcode_name, "PM4_DRAW_INDX_2") == 0 ? kDrawIndx2 : 0) |
+                 ((packet & 1) ? kDrawPredicated : 0);
     draw.index_format = uint32_t(index_buffer_info.format);
     draw.index_endianness = uint32_t(index_buffer_info.endianness);
     draw.index_count = index_buffer_info.count;
@@ -2723,8 +2724,11 @@ bool CommandProcessor::ExecuteDraw(const DrawRecord& draw) {
     }
     bool major_mode_explicit =
         xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+    const bool previous_predicated = current_draw_predicated_;
+    current_draw_predicated_ = (draw.flags & kDrawPredicated) != 0;
     draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+    current_draw_predicated_ = previous_predicated;
     if (!draw_succeeded) {
       auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
       auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();

@@ -22,6 +22,8 @@ REXCVAR_DECLARE(bool, sync_pipeline_creation);
 
 // GPU Resolution / Readback / Queries
 REXCVAR_DECLARE(int32_t, resolution_scale);
+REXCVAR_DECLARE(uint32_t, fh1_native_scene_width);
+REXCVAR_DECLARE(uint32_t, fh1_native_scene_height);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DECLARE(bool, resolve_resolution_scale_fill_half_pixel_offset);

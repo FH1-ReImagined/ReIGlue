@@ -1,3 +1,4 @@
+#include <rex/graphics/vulkan/fh1_native_scene_host_modes.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -57,6 +58,7 @@
 #include "fh1_readback_history.h"
 REXCVAR_DECLARE(bool, vulkan_render_target_update_reuse_verify);
 REXCVAR_DECLARE(bool, gpu_device_lost_breadcrumbs);
+REXCVAR_DECLARE(std::string, render_target_path_vulkan);
 REXCVAR_DECLARE(int32_t, forza_native_width);
 REXCVAR_DECLARE(int32_t, forza_native_height);
 REXCVAR_DECLARE(bool, forza_present_16_9);
@@ -292,6 +294,29 @@ bool Fh1NativeEnabled() {
 
 // FH1 reuses screen-pitched EDRAM for reflection faces and bloom intermediates.
 // A pitch match alone does not make a draw part of the native display.
+fh1::NativeSceneRaster Fh1GetNativeSceneRaster(
+    const ui::vulkan::VulkanDevice::Properties& props, uint32_t output_width,
+    uint32_t output_height, bool native_aa) {
+  const fh1::RasterExtent scene{REXCVAR_GET(fh1_native_scene_width),
+                                REXCVAR_GET(fh1_native_scene_height)};
+  if (!scene.IsSpecified())
+    return {};
+  // Host-only modes can be set directly on the CLI, bypassing the launcher.
+  // Reject incompatible combinations in the effective raster, without
+  // rewriting the requested cvars or the host's saved configuration. Do not
+  // use fh1_scene_720p_native_hud here: live reconfiguration sets it itself.
+  const bool host_modes_compatible = fh1::CompatibleNativeSceneHostModes({
+      rex::cvar::GetFlagByName("scene_resolution"), rex::cvar::GetFlagByName("vr_mode"),
+      rex::cvar::GetFlagByName("forza_ultrawide"), rex::cvar::GetFlagByName("present_effect"),
+      REXCVAR_GET(forza_native_width), REXCVAR_GET(forza_native_height)});
+  if (!native_aa || !host_modes_compatible || REXCVAR_GET(render_target_path_vulkan) == "fsi") return {};
+  const fh1::RasterExtent limits{
+      std::min({props.maxFramebufferWidth, props.maxImageDimension2D, props.maxViewportDimensions[0]}),
+      std::min({props.maxFramebufferHeight, props.maxImageDimension2D, props.maxViewportDimensions[1]})};
+  return fh1::GetNativeSceneRaster(scene, {output_width, output_height}, limits,
+                                  TextureCache::kMaxDrawResolutionScaleAlongAxis);
+}
+
 bool Fh1ScreenViewport(const RegisterFile& regs) {
   const auto pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
   const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
@@ -411,6 +436,23 @@ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
         /* .generalConstantMatrixVectorIndexing = */ 1,
     },
 };
+
+constexpr char kSwapResampleComputeSource[] = R"(#version 450
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D source_image;
+layout(set = 1, binding = 0, rgb10_a2) writeonly uniform image2D destination_image;
+layout(push_constant) uniform SwapConstants {
+  uvec2 output_size;
+  vec2 inverse_output_size;
+};
+
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(pixel, output_size))) return;
+  vec2 uv = (vec2(pixel) + 0.5) * inverse_output_size;
+  imageStore(destination_image, ivec2(pixel), vec4(textureLod(source_image, uv, 0.0).rgb, 1.0));
+}
+)";
 
 const char* GetSwapFxaaComputeSource(bool extreme_quality) {
   return extreme_quality ? R"(#version 450
@@ -1376,7 +1418,9 @@ void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
   if (shared_memory_) {
+    auto lock = rex::thread::global_critical_region::AcquireDirect();
     shared_memory_->InvalidateAllPages();
+    if (texture_cache_) texture_cache_->Fh1InvalidateResolveProvenance();
   }
 }
 
@@ -1418,7 +1462,10 @@ void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path
   const auto storage_root = fh1_split_enabled_ ? cache_root / ("fh1-live-v1-" +
       std::to_string(REXCVAR_GET(fh1_output_width)) + "x" + std::to_string(REXCVAR_GET(fh1_output_height)) +
       "-" + std::to_string(fh1_other_render_targets_->draw_resolution_scale_x()) + "x" +
-      std::to_string(fh1_other_render_targets_->draw_resolution_scale_y())) : cache_root;
+      std::to_string(fh1_other_render_targets_->draw_resolution_scale_y()) +
+      (texture_cache_->Fh1TracksFractionalResolves() ?
+        "-native-scene-" + std::to_string(REXCVAR_GET(fh1_native_scene_width)) + "x" +
+            std::to_string(REXCVAR_GET(fh1_native_scene_height)) : "")) : cache_root;
   namespace prebuild = pipeline_prebuild_file;
   pipeline_cache_->SetShaderPrebuildSource(
       cache_root, fh1_split_enabled_ ? prebuild::kPartitionUi : prebuild::kPartitionMain);
@@ -1830,6 +1877,18 @@ bool VulkanCommandProcessor::SetupContext() {
         "emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
+  const uint32_t default_scale_x = draw_resolution_scale_x;
+  const uint32_t default_scale_y = draw_resolution_scale_y;
+  auto native_scene_raster = Fh1GetNativeSceneRaster(
+      device_properties, REXCVAR_GET(fh1_output_width), REXCVAR_GET(fh1_output_height),
+      REXCVAR_GET(fh1_upscaler) == "off");
+  if (native_scene_raster.IsEnabled()) {
+    draw_resolution_scale_x = native_scene_raster.backing_scale.width;
+    draw_resolution_scale_y = native_scene_raster.backing_scale.height;
+  } else if (REXCVAR_GET(fh1_native_scene_width) || REXCVAR_GET(fh1_native_scene_height)) {
+    REXGPU_WARN("FH1 scene raster {}x{} is incompatible with the output, device, or render path; using default scene sizing",
+                REXCVAR_GET(fh1_native_scene_width), REXCVAR_GET(fh1_native_scene_height));
+  }
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
     REXGPU_WARN(
         "Vulkan draw resolution scaling is experimental and may not affect all "
@@ -1876,8 +1935,18 @@ bool VulkanCommandProcessor::SetupContext() {
   render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
       *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this);
   if (!render_target_cache_->Initialize(shared_memory_binding_count)) {
-    REXGPU_ERROR("Failed to initialize the render target cache");
-    return false;
+    if (!native_scene_raster.IsEnabled()) {
+      REXGPU_ERROR("Failed to initialize the render target cache");
+      return false;
+    }
+    REXGPU_WARN("FH1 scene render-target allocation failed; restoring the default backing");
+    render_target_cache_.reset();
+    native_scene_raster = {};
+    draw_resolution_scale_x = default_scale_x;
+    draw_resolution_scale_y = default_scale_y;
+    render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
+        *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this);
+    if (!render_target_cache_->Initialize(shared_memory_binding_count)) return false;
   }
   if (Fh1NativeEnabled() &&
       (render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets ||
@@ -1928,7 +1997,19 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
 
-  if (!Fh1CreateRenderCaches(draw_resolution_scale_x, draw_resolution_scale_y)) return false;
+  if (!Fh1CreateRenderCaches(draw_resolution_scale_x, draw_resolution_scale_y,
+                             native_scene_raster)) {
+    if (!native_scene_raster.IsEnabled()) return false;
+    REXGPU_WARN("FH1 scene raster allocation failed; restoring default render caches");
+    fh1_split_enabled_ = false;
+    fh1_other_pipelines_.reset();
+    pipeline_cache_.reset();
+    fh1_other_textures_.reset();
+    texture_cache_.reset();
+    fh1_other_render_targets_.reset();
+    render_target_cache_.reset();
+    if (!Fh1CreateRenderCaches(default_scale_x, default_scale_y, {})) return false;
+  }
 
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
@@ -2767,6 +2848,24 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
 
+  // Keep the startup pipeline available when initially incompatible settings
+  // later change to a validated live native scene mode.
+  if (REXCVAR_GET(fh1_native_scene_width) && REXCVAR_GET(fh1_native_scene_height)) {
+    VkFormatProperties properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), VK_FORMAT_R16G16B16A16_SFLOAT, &properties);
+    if (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) {
+      std::vector<uint32_t> spirv;
+      std::string error;
+      if (CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kSwapResampleComputeSource, spirv, error)) {
+        swap_resample_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+            vulkan_device, swap_fxaa_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
+      } else {
+        REXGPU_WARN("Failed to compile FH1 swap resampling shader: {}", error);
+      }
+    }
+  }
+
   VkPipelineLayoutCreateInfo resolve_downscale_layout_create_info = {};
   resolve_downscale_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   VkDescriptorSetLayout resolve_downscale_set_layout =
@@ -3185,6 +3284,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_fxaa_extreme_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_resample_pipeline_);
   for (auto& scene : hdr_scenes_)
     DestroyHdrScene(scene);
   Fh1VrDestroy();
@@ -5118,6 +5218,10 @@ void VulkanCommandProcessor::CaptureHdrScene() {
     return;
   uint32_t width = 1280 * render_target_cache_->draw_resolution_scale_x();
   uint32_t height = 720 * render_target_cache_->draw_resolution_scale_y();
+  if (texture_cache_->Fh1TracksFractionalResolves()) {
+    width = render_target_cache_->Fh1RasterWidth();
+    height = render_target_cache_->Fh1RasterHeight();
+  }
   if (REXCVAR_GET(forza_native_width) > 0)
     width = std::min(width, uint32_t(REXCVAR_GET(forza_native_width)));
   if (REXCVAR_GET(forza_native_height) > 0)
@@ -5282,9 +5386,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
+  auto swap_raster = TextureCache::Fh1ResolveRaster::kFull;
+  uint32_t swap_source_page = 0;
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
-      &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+      &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap,
+      &swap_raster, &swap_source_page);
   if (swap_texture_view == VK_NULL_HANDLE) {
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
@@ -5335,9 +5442,50 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   // has the picture in its whole swap source: it keeps the active size above, and the
   // presenter letterboxes it into the window as without the split. With the output size the
   // legal screen filled only the top-left 1280x720 of a 1080p window.
-  if (fh1_split_enabled_ && fh1_native_hud_active_) {
+  if (texture_cache_->Fh1TracksFractionalResolves()) {
+    if (swap_raster == TextureCache::Fh1ResolveRaster::kScene) {
+      guest_output_width = std::min(guest_output_width, REXCVAR_GET(fh1_native_scene_width));
+      guest_output_height = std::min(guest_output_height, REXCVAR_GET(fh1_native_scene_height));
+    } else if (swap_raster == TextureCache::Fh1ResolveRaster::kHud) {
+      guest_output_width = std::min(guest_output_width, REXCVAR_GET(fh1_output_width));
+      guest_output_height = std::min(guest_output_height, REXCVAR_GET(fh1_output_height));
+    }
+  } else if (fh1_split_enabled_ && fh1_native_hud_active_) {
     guest_output_width = REXCVAR_GET(fh1_output_width);
     guest_output_height = REXCVAR_GET(fh1_output_height);
+  }
+  const uint32_t gamma_width = guest_output_width, gamma_height = guest_output_height;
+  const fh1::RasterExtent output_extent{REXCVAR_GET(fh1_output_width), REXCVAR_GET(fh1_output_height)};
+  bool resample_swap = false;
+  const auto swap_trace = texture_cache_->Fh1GetResolveTrace(swap_source_page);
+  if (swap_resample_pipeline_ && swap_sampler_linear_clamp_ &&
+      texture_cache_->Fh1TracksFractionalResolves() &&
+      swap_raster == TextureCache::Fh1ResolveRaster::kFull &&
+      frontbuffer_width == frontbuffer_width_unscaled && frontbuffer_height == frontbuffer_height_unscaled &&
+      frontbuffer_width_scaled == gamma_width && frontbuffer_height_scaled == gamma_height &&
+      !ui::vulkan::GetHdrOutputState().active && !Fh1VrLayersWanted() &&
+      fh1::CanResampleIntegerSwap(swap_trace ? &*swap_trace : nullptr,
+          swap_source_page << 12, frontbuffer_ptr, {frontbuffer_width, frontbuffer_height},
+          {gamma_width, gamma_height}, output_extent)) {
+    const bool use_pwl = frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
+        frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
+    const bool swap_rb = !GetVulkanDevice()->properties().imageViewFormatSwizzle &&
+                         swap_source_needs_rb_swap;
+    if (SelectSwapGammaComputePipeline(use_pwl, swap_rb, true) &&
+        EnsureSwapFxaaSourceImage(gamma_width, gamma_height)) {
+      resample_swap = true;
+      guest_output_width = output_extent.width;
+      guest_output_height = output_extent.height;
+    }
+  }
+  if (texture_cache_->Fh1TracksFractionalResolves()) {
+    static bool previous_resample = false;
+    static unsigned resample_runs_logged = 0;
+    if (resample_swap && !previous_resample && resample_runs_logged++ < 16) {
+      REXGPU_INFO("FH1 swap raster: frame {} resamples full integer source {}x{} to {}x{}",
+                  frame_current_, gamma_width, gamma_height, guest_output_width, guest_output_height);
+    }
+    previous_resample = resample_swap;
   }
   if (fh1_split_enabled_) {
     // Each change of size makes the presenter replace its output image. Log the first 16
@@ -5350,6 +5498,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                     guest_output_width, guest_output_height,
                     fh1_native_hud_active_ ? "HUD layer" : "no HUD layer: scene or unscaled source",
                     size_changes);
+        if (texture_cache_->Fh1TracksFractionalResolves()) {
+          const bool scaled = frontbuffer_width_scaled != frontbuffer_width_unscaled ||
+                              frontbuffer_height_scaled != frontbuffer_height_unscaled;
+          const auto* trace = scaled && swap_trace ? &*swap_trace : nullptr;
+          const char* tag = swap_raster == TextureCache::Fh1ResolveRaster::kScene ? "scene" :
+              swap_raster == TextureCache::Fh1ResolveRaster::kHud ? "hud" : "full-or-unknown";
+          REXGPU_INFO(
+              "FH1 swap raster: frame {} fetch0=0x{:08X} packet=0x{:08X} source={}x{} "
+              "tag={} evidence={} match={} resolve=0x{:08X}+{} dest=0x{:08X} edram=0x{:03X} "
+              "expected_hud_edram=0x{:03X} copy={}x{} final_hud={}",
+              frame_current_, swap_source_page << 12, frontbuffer_ptr,
+              frontbuffer_width_scaled, frontbuffer_height_scaled, tag,
+              !scaled ? "unscaled" : trace ? fh1::ResolveEvidenceName(trace->evidence) : "no-recent-resolve",
+              !trace ? "none" : trace->MatchesBase(swap_source_page) ? "base" : "overlapping-range",
+              trace ? trace->written_address : 0, trace ? trace->written_length : 0,
+              trace ? trace->destination_base : 0, trace ? trace->edram_base : 0,
+              trace ? trace->expected_hud_base : UINT32_MAX,
+              trace ? trace->copy_extent.width : 0, trace ? trace->copy_extent.height : 0,
+              trace && trace->final_hud);
+        }
       }
       presented_width = guest_output_width;
       presented_height = guest_output_height;
@@ -5432,8 +5600,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   AwaitPresentSteps();
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
-       swap_post_effect, swap_source_needs_rb_swap, hud_snapshot_view,
+      [this, guest_output_width, guest_output_height, gamma_width, gamma_height, resample_swap,
+       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap, hud_snapshot_view,
        vr_snapshot_view](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
@@ -5463,29 +5631,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
         bool swap_source_requires_compute_rb_swap =
             !vulkan_device->properties().imageViewFormatSwizzle && swap_source_needs_rb_swap;
-        auto select_swap_apply_gamma_compute_pipeline = [&](bool use_pwl,
-                                                            bool use_fxaa_luma) -> VkPipeline {
-          if (use_pwl) {
-            if (use_fxaa_luma) {
-              return swap_source_requires_compute_rb_swap
-                         ? swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_
-                         : swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_;
-            }
-            return swap_source_requires_compute_rb_swap
-                       ? swap_apply_gamma_compute_pwl_rb_swap_pipeline_
-                       : swap_apply_gamma_compute_pwl_pipeline_;
-          }
-          if (use_fxaa_luma) {
-            return swap_source_requires_compute_rb_swap
-                       ? swap_apply_gamma_compute_256_entry_table_fxaa_luma_rb_swap_pipeline_
-                       : swap_apply_gamma_compute_256_entry_table_fxaa_luma_pipeline_;
-          }
-          return swap_source_requires_compute_rb_swap
-                     ? swap_apply_gamma_compute_256_entry_table_rb_swap_pipeline_
-                     : swap_apply_gamma_compute_256_entry_table_pipeline_;
-        };
-        VkPipeline swap_apply_gamma_compute_pipeline =
-            select_swap_apply_gamma_compute_pipeline(use_pwl_gamma_ramp, use_fxaa);
+        VkPipeline swap_apply_gamma_compute_pipeline = SelectSwapGammaComputePipeline(
+            use_pwl_gamma_ramp, swap_source_requires_compute_rb_swap, use_fxaa || resample_swap);
 
         if (use_fxaa) {
           if (swap_apply_gamma_compute_pipeline == VK_NULL_HANDLE ||
@@ -5506,7 +5653,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               fxaa_pipelines_unavailable_logged = true;
             }
             use_fxaa = false;
-          } else if (!EnsureSwapFxaaSourceImage(guest_output_width, guest_output_height)) {
+          } else if (!resample_swap && !EnsureSwapFxaaSourceImage(guest_output_width, guest_output_height)) {
             static bool fxaa_source_image_failed_logged = false;
             if (!fxaa_source_image_failed_logged) {
               REXGPU_WARN(
@@ -5517,10 +5664,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             use_fxaa = false;
           }
         }
-        if (!use_fxaa) {
-          swap_apply_gamma_compute_pipeline =
-              select_swap_apply_gamma_compute_pipeline(use_pwl_gamma_ramp, false);
+        if (!use_fxaa && !resample_swap) {
+          swap_apply_gamma_compute_pipeline = SelectSwapGammaComputePipeline(
+              use_pwl_gamma_ramp, swap_source_requires_compute_rb_swap, false);
         }
+        const bool postprocess_swap = use_fxaa || resample_swap;
         if (swap_source_requires_compute_rb_swap &&
             swap_apply_gamma_compute_pipeline == VK_NULL_HANDLE) {
           static bool compute_rb_swap_fallback_missing_logged = false;
@@ -5540,7 +5688,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         }
 
         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
-        context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+        context.SetIs8bpc(!use_pwl_gamma_ramp && !postprocess_swap);
 
         // Update the gamma ramp if it's out of date.
         uint32_t& gamma_ramp_frame_index_ref = use_pwl_gamma_ramp
@@ -5643,7 +5791,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                      : 0,
                                  VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                                  VK_IMAGE_LAYOUT_GENERAL);
-          if (use_fxaa) {
+          if (postprocess_swap) {
             PushImageMemoryBarrier(swap_fxaa_source_image_, guest_output_subresource_range,
                                    swap_fxaa_source_stage_mask_ ? swap_fxaa_source_stage_mask_
                                                                 : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -5653,7 +5801,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           }
           SubmitBarriers(true);
 
-          if (use_fxaa) {
+          if (postprocess_swap) {
             swap_fxaa_source_stage_mask_ = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             swap_fxaa_source_access_mask_ = VK_ACCESS_SHADER_WRITE_BIT;
             swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_GENERAL;
@@ -5665,7 +5813,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           VkDescriptorImageInfo swap_descriptor_destination_storage_image_info;
           swap_descriptor_destination_storage_image_info.sampler = VK_NULL_HANDLE;
           swap_descriptor_destination_storage_image_info.imageView =
-              use_fxaa ? swap_fxaa_source_image_view_ : vulkan_context.image_view();
+              postprocess_swap ? swap_fxaa_source_image_view_ : vulkan_context.image_view();
           swap_descriptor_destination_storage_image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
           VkWriteDescriptorSet swap_descriptor_destination_storage_write;
           swap_descriptor_destination_storage_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -5697,16 +5845,14 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               uint32_t(swap_apply_gamma_compute_descriptor_sets.size()),
               swap_apply_gamma_compute_descriptor_sets.data(), 0, nullptr);
           SwapApplyGammaConstants swap_apply_gamma_constants = {
-              {guest_output_width, guest_output_height}};
+              {gamma_width, gamma_height}};
           deferred_command_buffer_.CmdVkPushConstants(
               swap_apply_gamma_compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
               sizeof(swap_apply_gamma_constants), &swap_apply_gamma_constants);
           BindExternalComputePipeline(swap_apply_gamma_compute_pipeline);
-          uint32_t group_count_x = (guest_output_width + 15) / 16;
-          uint32_t group_count_y = (guest_output_height + 7) / 8;
-          deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          deferred_command_buffer_.CmdVkDispatch((gamma_width + 15) / 16, (gamma_height + 7) / 8, 1);
 
-          if (use_fxaa) {
+          if (postprocess_swap) {
             // Make the FXAA source image readable and bind a separate
             // destination storage descriptor targeting the guest output image.
             PushImageMemoryBarrier(swap_fxaa_source_image_, guest_output_subresource_range,
@@ -5772,10 +5918,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             deferred_command_buffer_.CmdVkPushConstants(
                 swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(swap_fxaa_constants), &swap_fxaa_constants);
-            BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
-                                            ? swap_fxaa_extreme_pipeline_
-                                            : swap_fxaa_pipeline_);
-            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            const VkPipeline postprocess_pipeline = !use_fxaa ? swap_resample_pipeline_ :
+                swap_post_effect == SwapPostEffect::kFxaaExtreme ? swap_fxaa_extreme_pipeline_
+                                                                 : swap_fxaa_pipeline_;
+            BindExternalComputePipeline(postprocess_pipeline);
+            deferred_command_buffer_.CmdVkDispatch((guest_output_width + 15) / 16,
+                                                    (guest_output_height + 7) / 8, 1);
           }
 
           if (hud_snapshot_view != VK_NULL_HANDLE && EnsureSwapHudMask()) {
@@ -5810,13 +5958,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                                         sizeof(hud_mask_size), hud_mask_size);
             BindExternalComputePipeline(swap_hud_mask_pipeline_);
-            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            deferred_command_buffer_.CmdVkDispatch((guest_output_width + 15) / 16,
+                                                    (guest_output_height + 7) / 8, 1);
           }
 
           if (vr_snapshot_view != VK_NULL_HANDLE) {
             Fh1VrLayers(vulkan_context.image(), vulkan_context.image_view(), guest_output_width,
                         guest_output_height, vr_snapshot_view,
-                        select_swap_apply_gamma_compute_pipeline(use_pwl_gamma_ramp, false),
+                        SelectSwapGammaComputePipeline(use_pwl_gamma_ramp,
+                                                       swap_source_requires_compute_rb_swap, false),
                         swap_descriptors_gamma_ramp_[2 * gamma_ramp_frame_index_ref +
                                                      uint32_t(use_pwl_gamma_ramp)],
                         swap_frame_index);
@@ -6736,7 +6886,8 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
 }
 
 bool VulkanCommandProcessor::Fh1CreateRenderCaches(uint32_t draw_resolution_scale_x,
-                                                       uint32_t draw_resolution_scale_y) {
+                                                     uint32_t draw_resolution_scale_y,
+                                                     const fh1::NativeSceneRaster& native_scene) {
   const auto& props = GetVulkanDevice()->properties();
   const uint32_t shared_memory_binding_count = UINT32_C(1) <<
       SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(props.maxStorageBufferRange);
@@ -6754,7 +6905,9 @@ bool VulkanCommandProcessor::Fh1CreateRenderCaches(uint32_t draw_resolution_scal
     return false;
   }
 
-  if (REXCVAR_GET(fh1_scene_720p_native_hud) || REXCVAR_GET(fh1_upscaler) != "off") {
+  const bool explicit_scene = native_scene.IsEnabled();
+  if (explicit_scene || REXCVAR_GET(fh1_scene_720p_native_hud) ||
+      REXCVAR_GET(fh1_upscaler) != "off") {
     const bool fh1_fsr3 = REXCVAR_GET(fh1_upscaler).rfind("fsr3_", 0) == 0;
     const bool fh1_metalfx = REXCVAR_GET(fh1_upscaler).rfind("metalfx", 0) == 0;
     const std::string fh1_backend = fh1_metalfx ? "Apple MetalFX" : (fh1_fsr3 ? "AMD FSR 3" : "NVIDIA DLSS");
@@ -6767,10 +6920,11 @@ bool VulkanCommandProcessor::Fh1CreateRenderCaches(uint32_t draw_resolution_scal
 #endif
         (output_width == 1920 && output_height == 1080) ||
         (output_width == 2560 && output_height == 1440) || (output_width == 3840 && output_height == 2160);
-    const bool compatible = supported_output && (!fh1_metalfx || output_height % 720 == 0) &&
-        draw_resolution_scale_x == output_scale &&
-        draw_resolution_scale_y == output_scale &&
+    const bool compatible = (explicit_scene ||
+        (supported_output && (!fh1_metalfx || output_height % 720 == 0) &&
+         draw_resolution_scale_x == output_scale && draw_resolution_scale_y == output_scale)) &&
         render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+    if (explicit_scene && !compatible) return false;
     if (!compatible) {
       Fh1Dlss::ReportStatus("error: " + fh1_backend + " output/scale or render-target path is incompatible; continuing with native rendering.");
       REXGPU_WARN("FH1 reconstruction disabled: incompatible output, scale or render-target path; using native rendering");
@@ -6784,20 +6938,31 @@ bool VulkanCommandProcessor::Fh1CreateRenderCaches(uint32_t draw_resolution_scal
         ready = fh1_dlss_->Initialize();
         if (ready) { scene_width = fh1_dlss_->width(); scene_height = fh1_dlss_->height(); }
       }
-      // Guest EDRAM resolves require an integer scene scale. Use a ceiling
-      // raster and resample into NGX's exact recommended input dimensions.
-      // Do not claim that fractional modes shade only the NGX input pixels.
+      if (explicit_scene) {
+        scene_width = native_scene.scene.width;
+        scene_height = native_scene.scene.height;
+      }
+      // EDRAM resolves retain integer backing. Reconstruction shades the whole
+      // backing and resamples it to the exact input dimensions.
       const uint32_t scene_scale = std::max((scene_width + 1279) / 1280, (scene_height + 719) / 720);
+      const uint32_t scene_raster_width = explicit_scene ? scene_width : 1280 * scene_scale;
+      const uint32_t scene_raster_height = explicit_scene ? scene_height : 720 * scene_scale;
       if (ready) {
         fh1_split_enabled_ = true;
         render_target_cache_->SetRasterSize(output_width, output_height);
         fh1_other_render_targets_ = std::make_unique<VulkanRenderTargetCache>(
-            *register_file_, *memory_, scene_scale, scene_scale, *this);
-        fh1_other_render_targets_->SetRasterSize(1280 * scene_scale, 720 * scene_scale);
+            *register_file_, *memory_, explicit_scene ? draw_resolution_scale_x : scene_scale,
+            explicit_scene ? draw_resolution_scale_y : scene_scale, *this);
+        fh1_other_render_targets_->SetRasterSize(scene_raster_width, scene_raster_height);
+        if (explicit_scene) {
+          render_target_cache_->Fh1TrackResolveProducers(TextureCache::Fh1ResolveRaster::kHud);
+          fh1_other_render_targets_->Fh1TrackResolveProducers(TextureCache::Fh1ResolveRaster::kScene);
+          texture_cache_->Fh1TrackFractionalResolves();
+        }
         ready = fh1_other_render_targets_->Initialize(shared_memory_binding_count);
         if (fh1_dlss_) fh1_dlss_->SetSceneBacking(scene_scale);
       }
-      if (ready && scene_scale != output_scale) {
+      if (ready && !explicit_scene && scene_scale != output_scale) {
         fh1_other_textures_ = VulkanTextureCache::Create(*register_file_, *shared_memory_,
             scene_scale, scene_scale, *this, guest_shader_pipeline_stages_);
         ready = bool(fh1_other_textures_);
@@ -6808,6 +6973,7 @@ bool VulkanCommandProcessor::Fh1CreateRenderCaches(uint32_t draw_resolution_scal
         ready = fh1_other_pipelines_->Initialize();
       }
       if (!ready) {
+        if (explicit_scene) return false;
         Fh1Dlss::ReportStatus("error: " + fh1_backend + " initialization failed; continuing with native rendering. See the game log.");
         REXGPU_WARN("{} unavailable: retaining native rendering", fh1_backend);
         fh1_dlss_.reset();
@@ -6817,8 +6983,12 @@ bool VulkanCommandProcessor::Fh1CreateRenderCaches(uint32_t draw_resolution_scal
         fh1_split_enabled_ = false;
         render_target_cache_->SetRasterSize(1280 * draw_resolution_scale_x, 720 * draw_resolution_scale_y);
       } else {
-        REXGPU_INFO("FH1 split rendering initialized: scene={}x{}, UI={}x{}; independent pipeline caches/translators", 1280 * scene_scale, 720 * scene_scale, output_width, output_height);
-        REXGPU_INFO("FH1 reconstruction input={}x{}; raster={}x{}", scene_width, scene_height, 1280 * scene_scale, 720 * scene_scale);
+        REXGPU_INFO("FH1 split rendering initialized: scene={}x{}, UI={}x{}; independent pipeline caches/translators",
+                    scene_raster_width, scene_raster_height, output_width, output_height);
+        if (fh1_dlss_) {
+          REXGPU_INFO("FH1 reconstruction input={}x{}; raster={}x{}", scene_width, scene_height,
+                      scene_raster_width, scene_raster_height);
+        }
       }
     }
   }
@@ -6911,7 +7081,11 @@ void VulkanCommandProcessor::Fh1ApplyGraphicsRequest() {
   rex::cvar::SetFlagByName("resolution_scale", std::to_string(output_scale));
   rex::cvar::SetFlagByName("draw_resolution_scale_x", "1");
   rex::cvar::SetFlagByName("draw_resolution_scale_y", "1");
-  const bool ready = Fh1CreateRenderCaches(output_scale, output_scale) &&
+  const auto native_scene = Fh1GetNativeSceneRaster(GetVulkanDevice()->properties(),
+                                                    width, height, mode == "off");
+  const bool ready = Fh1CreateRenderCaches(
+      native_scene.IsEnabled() ? native_scene.backing_scale.width : output_scale,
+      native_scene.IsEnabled() ? native_scene.backing_scale.height : output_scale, native_scene) &&
       fh1_split_enabled_ && (mode == "off" || fh1_dlss_);
   if (!ready) {
     fh1_dlss_.reset();
@@ -7163,6 +7337,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                  (!fh1_scene_composited_ || color.color_base == fh1_scene_base_)) {
         fh1_seed_pending_ = fh1_scene_composited_;
         Fh1SelectNativeHud(true);
+        render_target_cache_->Fh1SetHudFrontbuffer(color.color_base);
       }
     }
 
@@ -7208,6 +7383,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
 
     // Shader modifications.
+    render_target_cache_->Fh1BeginDraw(current_draw_predicated_, memexport_used_pixel);
     vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
         *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
         ps_param_gen_pos != UINT32_MAX);
@@ -7393,8 +7569,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return draw_fail("native_hud_seed");
     // 0422 (FH1 #609): when the sizes change, not every 120 frames (a line every two seconds).
     const std::array<uint32_t, 4> sizes = {
-        1280 * fh1_other_render_targets_->draw_resolution_scale_x(),
-        720 * fh1_other_render_targets_->draw_resolution_scale_y(),
+        fh1_other_render_targets_->Fh1RasterWidth(),
+        fh1_other_render_targets_->Fh1RasterHeight(),
         uint32_t(REXCVAR_GET(fh1_output_width)), uint32_t(REXCVAR_GET(fh1_output_height))};
     static std::array<uint32_t, 4> logged_sizes{};
     if (sizes != logged_sizes) {
@@ -7834,6 +8010,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  if (is_rasterization_done) {
+    render_target_cache_->Fh1RecordResolveProducer(
+        normalized_color_mask, normalized_depth_control.stencil_enable ||
+            (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable));
+  }
   // FH1 (#551): the draw's number, written by the GPU once issued and once finished.
   if (fh1_breadcrumbs_on) {
     deferred_command_buffer_.CmdFh1Breadcrumb(fh1_trail.Record(
@@ -8136,7 +8317,7 @@ bool VulkanCommandProcessor::IssueCopy() {
 // part, which the HUD's shaders assume for every screen texture. Recorded in the texture cache
 // the HUD samples from (the scene's copy at another scale is mirrored there in full, too).
 void VulkanCommandProcessor::Fh1NoteResolve(uint32_t address, uint32_t length) {
-  if (!fh1_split_enabled_ || !length) return;
+  if (!fh1_split_enabled_ || !length || texture_cache_->Fh1TracksFractionalResolves()) return;
   VulkanTextureCache* hud_textures =
       fh1_native_hud_active_ || !fh1_other_textures_ ? texture_cache_.get() : fh1_other_textures_.get();
   hud_textures->Fh1MarkFullRasterResolve(address, length, !fh1_native_hud_active_);
@@ -9604,7 +9785,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // FH1 (#192, patches 0443/0444).
     binding_request_reuse_enabled = BindingReuseEnvOverride(REXCVAR_GET(vulkan_binding_request_reuse));
     fh1_texture_set_reuse_ = Fh1TextureSetReuseEnvOverride(REXCVAR_GET(vulkan_texture_descriptor_reuse));
-    if (fh1_other_render_targets_) Fh1SelectNativeHud(false);
+    if (fh1_other_render_targets_) {
+      Fh1SelectNativeHud(false);
+      fh1_other_render_targets_->Fh1SetHudFrontbuffer(UINT32_MAX);
+    }
     if (fh1_dlss_) fh1_dlss_->BeginFrame(frame_current_);
     fh1_scene_composited_ = false;
     fh1_seed_pending_ = false;
@@ -10139,6 +10323,20 @@ void VulkanCommandProcessor::DestroyScratchBuffer() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, scratch_buffer_memory_);
 }
 
+VkPipeline VulkanCommandProcessor::SelectSwapGammaComputePipeline(
+    bool use_pwl, bool swap_rb, bool luma) const {
+  if (use_pwl) {
+    if (luma) return swap_rb ? swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_
+                            : swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_;
+    return swap_rb ? swap_apply_gamma_compute_pwl_rb_swap_pipeline_
+                   : swap_apply_gamma_compute_pwl_pipeline_;
+  }
+  if (luma) return swap_rb ? swap_apply_gamma_compute_256_entry_table_fxaa_luma_rb_swap_pipeline_
+                          : swap_apply_gamma_compute_256_entry_table_fxaa_luma_pipeline_;
+  return swap_rb ? swap_apply_gamma_compute_256_entry_table_rb_swap_pipeline_
+                 : swap_apply_gamma_compute_256_entry_table_pipeline_;
+}
+
 bool VulkanCommandProcessor::EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height) {
   assert_true(submission_open_);
   if (!width || !height) {
@@ -10324,10 +10522,17 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
   if (render_target_cache_->UsesFractionalRaster()) {
-  scissor.offset[0] = uint32_t(float(scissor.offset[0]) * render_target_cache_->raster_scale_x());
-  scissor.offset[1] = uint32_t(float(scissor.offset[1]) * render_target_cache_->raster_scale_y());
-  scissor.extent[0] = uint32_t(std::ceil(float(scissor.extent[0]) * render_target_cache_->raster_scale_x()));
-  scissor.extent[1] = uint32_t(std::ceil(float(scissor.extent[1]) * render_target_cache_->raster_scale_y()));
+    if (texture_cache_->Fh1TracksFractionalResolves()) {
+      fh1::ScaleRasterScissor(scissor.offset[0], scissor.extent[0],
+                              render_target_cache_->Fh1RasterWidth(), 1280 * draw_resolution_scale_x);
+      fh1::ScaleRasterScissor(scissor.offset[1], scissor.extent[1],
+                              render_target_cache_->Fh1RasterHeight(), 720 * draw_resolution_scale_y);
+    } else {
+      scissor.offset[0] = uint32_t(float(scissor.offset[0]) * render_target_cache_->raster_scale_x());
+      scissor.offset[1] = uint32_t(float(scissor.offset[1]) * render_target_cache_->raster_scale_y());
+      scissor.extent[0] = uint32_t(std::ceil(float(scissor.extent[0]) * render_target_cache_->raster_scale_x()));
+      scissor.extent[1] = uint32_t(std::ceil(float(scissor.extent[1]) * render_target_cache_->raster_scale_y()));
+    }
   }
   VkRect2D scissor_rect;
   scissor_rect.offset.x = int32_t(scissor.offset[0]);
@@ -10820,12 +11025,38 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         native_textures |= 1u << i;
   dirty |= system_constants_.fh1_native_textures != native_textures;
   system_constants_.fh1_native_textures = native_textures;
-  // 0409: only the HUD target's shaders scale screen texture coordinates (fractional raster).
+  // 0409 uses the HUD's producer mask. The fractional scene shares the
+  // texture cache and tracks resolved producers in both render partitions.
   uint32_t full_raster_textures = 0;
-  if (fh1_split_enabled_ && fh1_native_hud_active_)
+  uint32_t scene_resolve_textures = 0, hud_resolve_textures = 0;
+  if (texture_cache_->Fh1TracksFractionalResolves()) {
+    for (unsigned i = 0; i < 32; ++i) {
+      const uint32_t mask = 1u << i;
+      if (!(used_texture_mask & mask)) continue;
+      const auto raster = texture_cache_->GetActiveFh1ResolveRaster(i);
+      if (raster == TextureCache::Fh1ResolveRaster::kScene)
+        scene_resolve_textures |= mask;
+      else if (raster == TextureCache::Fh1ResolveRaster::kHud)
+        hud_resolve_textures |= mask;
+    }
+    const float resolve_raster[] = {
+        float(REXCVAR_GET(fh1_native_scene_width)) / (1280 * draw_resolution_scale_x),
+        float(REXCVAR_GET(fh1_native_scene_height)) / (720 * draw_resolution_scale_y),
+        float(REXCVAR_GET(fh1_output_width)) / (1280 * draw_resolution_scale_x),
+        float(REXCVAR_GET(fh1_output_height)) / (720 * draw_resolution_scale_y)};
+    for (unsigned i = 0; i < 4; ++i) {
+      dirty |= system_constants_.fh1_resolve_raster[i] != resolve_raster[i];
+      system_constants_.fh1_resolve_raster[i] = resolve_raster[i];
+    }
+  } else if (fh1_split_enabled_ && fh1_native_hud_active_) {
     for (unsigned i = 0; i < 32; ++i)
       if ((used_texture_mask & (1u << i)) && texture_cache_->IsActiveFh1FullRasterTexture(i))
         full_raster_textures |= 1u << i;
+  }
+  dirty |= system_constants_.fh1_scene_resolve_textures != scene_resolve_textures;
+  system_constants_.fh1_scene_resolve_textures = scene_resolve_textures;
+  dirty |= system_constants_.fh1_hud_resolve_textures != hud_resolve_textures;
+  system_constants_.fh1_hud_resolve_textures = hud_resolve_textures;
   dirty |= system_constants_.fh1_full_raster_textures != full_raster_textures;
   system_constants_.fh1_full_raster_textures = full_raster_textures;
   // Patch 0396: VR true stereo's eye offset (Fh1StereoDrawOffset).

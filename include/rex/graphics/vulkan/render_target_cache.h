@@ -111,25 +111,71 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void CompletedSubmissionUpdated();
   void EndSubmission();
   bool UsesFractionalRaster() const {
+    if (fh1_force_integer_raster_) return false;
     const auto pitch = register_file().Get<reg::RB_SURFACE_INFO>().surface_pitch;
     if (!(pitch == 1280 || pitch == 640 || pitch == 320 || pitch == 160 || pitch == 80) ||
         (raster_scale_x_ == 1.0f && raster_scale_y_ == 1.0f)) return false;
+    if (Fh1IsNative720pHudTarget()) return true;
     const auto& regs = register_file();
     const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
     const auto tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
     const auto br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
-    return fh1::IsDisplayViewport(vte.vport_x_scale_ena, vte.vport_y_scale_ena,
-        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
-        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
-        br.br_x - tl.tl_x, br.br_y - tl.tl_y);
+    const float x = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+    const float y = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+    return Fh1TracksResolveProducers()
+        ? fh1::IsFractionalSceneViewport(pitch, vte.vport_x_scale_ena, vte.vport_y_scale_ena,
+                                         x, y, br.br_x - tl.tl_x, br.br_y - tl.tl_y)
+        : fh1::IsDisplayViewport(vte.vport_x_scale_ena, vte.vport_y_scale_ena,
+                                 x, y, br.br_x - tl.tl_x, br.br_y - tl.tl_y);
   }
   void SetRasterSize(uint32_t width, uint32_t height) {
+    fh1_raster_extent_ = {width, height};
     raster_scale_x_ = float(width) / float(1280 * draw_resolution_scale_x());
     raster_scale_y_ = float(height) / float(720 * draw_resolution_scale_y());
+  }
+  bool Fh1TracksResolveProducers() const {
+    return fh1_resolve_raster_ != TextureCache::Fh1ResolveRaster::kFull;
+  }
+  void Fh1TrackResolveProducers(TextureCache::Fh1ResolveRaster raster) {
+    fh1_resolve_raster_ = raster;
+  }
+  void Fh1SetHudFrontbuffer(uint32_t base) {
+    fh1_hud_frontbuffer_base_ = base;
+    fh1_hud_frontbuffer_producers_ = {};
+  }
+  bool Fh1IsNative720pHudTarget() const {
+    if (fh1_resolve_raster_ != TextureCache::Fh1ResolveRaster::kHud ||
+        fh1_hud_frontbuffer_base_ == UINT32_MAX ||
+        (raster_scale_x_ == 1.0f && raster_scale_y_ == 1.0f))
+      return false;
+    const auto& regs = register_file();
+    const auto color = regs.Get<reg::RB_COLOR_INFO>();
+    const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+    const auto window = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    const bool offset_window = regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable &&
+        (window.window_x_offset || window.window_y_offset);
+    return fh1::IsNative720pHudTarget(fh1_raster_extent_, fh1_hud_frontbuffer_base_,
+        color.color_base, surface.surface_pitch, surface.msaa_samples == xenos::MsaaSamples::k1X,
+        color.color_format, offset_window);
+  }
+  void Fh1BeginDraw(bool predicated, bool pixel_memexport) {
+    fh1_force_integer_raster_ = Fh1TracksResolveProducers() &&
+        fh1::KeepIntegerRaster(fh1_raster_extent_,
+            {1280 * draw_resolution_scale_x(), 720 * draw_resolution_scale_y()},
+            predicated, pixel_memexport, Fh1IsNative720pHudTarget(),
+            fh1_resolve_raster_ == TextureCache::Fh1ResolveRaster::kScene);
+  }
+  void Fh1RecordResolveProducer(uint32_t color_mask, bool writes_depth);
+  uint32_t Fh1RasterWidth() const {
+    return fh1_raster_extent_.width ? fh1_raster_extent_.width : 1280 * draw_resolution_scale_x();
+  }
+  uint32_t Fh1RasterHeight() const {
+    return fh1_raster_extent_.height ? fh1_raster_extent_.height : 720 * draw_resolution_scale_y();
   }
   float raster_scale_x() const { return raster_scale_x_; }
   float raster_scale_y() const { return raster_scale_y_; }
   float raster_scale_x_ = 1.0f, raster_scale_y_ = 1.0f;
+  fh1::RasterExtent fh1_raster_extent_;
   // #785: the last draw's fractional raster and window offset, for the tile resolve after it.
   void Fh1NoteDraw(bool fractional, int window_x, int window_y) {
     fh1_last_draw_fractional_ = fractional;
@@ -137,8 +183,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     fh1_last_draw_window_y_ = window_y;
   }
   bool fh1_last_draw_fractional_ = false;
+  bool fh1_force_integer_raster_ = false;
+  uint32_t fh1_hud_frontbuffer_base_ = UINT32_MAX;
+  fh1::ResolveProducerRaster fh1_hud_frontbuffer_producers_;
+  TextureCache::Fh1ResolveRaster fh1_resolve_raster_ = TextureCache::Fh1ResolveRaster::kFull;
   int fh1_last_draw_window_x_ = 0, fh1_last_draw_window_y_ = 0;
   uint64_t fh1_fractional_tile_resolves_ = 0;
+  uint64_t fh1_mixed_resolve_count_ = 0;
   bool SeedNativeHud(VulkanRenderTargetCache& scene, uint32_t width, uint32_t height);
   bool CopyHdrScene(VkImage destination, uint32_t width, uint32_t height);
   bool HasNativeHudColorTarget() const {
@@ -390,6 +441,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     ~VulkanRenderTarget();
 
     VkImage image() const { return image_; }
+    bool fh1_fractional_producer = false;
+    bool fh1_producer_known = false;
 
     VkImageView view_depth_color() const { return view_depth_color_; }
     VkImageView view_depth_stencil() const { return view_depth_stencil_; }

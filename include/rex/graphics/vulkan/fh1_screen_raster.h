@@ -1,6 +1,55 @@
 #pragma once
 
+#include <array>
+#include <cstdint>
+
 namespace rex::graphics::vulkan::fh1 {
+struct RasterExtent {
+  unsigned width = 0;
+  unsigned height = 0;
+
+  constexpr bool IsSpecified() const { return width || height; }
+  constexpr bool IsComplete() const { return width && height; }
+};
+
+struct NativeSceneRaster {
+  RasterExtent scene;
+  RasterExtent hud;
+  RasterExtent backing_scale;
+
+  constexpr bool IsEnabled() const { return backing_scale.IsComplete(); }
+};
+
+constexpr unsigned RasterCeiling(unsigned value, unsigned divisor) {
+  return value / divisor + unsigned(value % divisor != 0);
+}
+
+// Scaled resolves use private storage only when at least one axis is scaled.
+// Keep at least one backing axis at 2 for subnative rasters; prefer the smaller
+// height axis to fit devices with a tighter width limit.
+constexpr NativeSceneRaster GetNativeSceneRaster(RasterExtent scene, RasterExtent hud,
+                                                  RasterExtent max_backing_pixels,
+                                                  unsigned max_backing_scale) {
+  if (!scene.IsComplete() || !hud.IsComplete())
+    return {};
+  const RasterExtent max_extent{scene.width > hud.width ? scene.width : hud.width,
+                                scene.height > hud.height ? scene.height : hud.height};
+  RasterExtent scale{RasterCeiling(max_extent.width, 1280),
+                     RasterCeiling(max_extent.height, 720)};
+  if (scale.width == 1 && scale.height == 1 &&
+      (scene.width != 1280 || scene.height != 720 || hud.width != 1280 || hud.height != 720)) {
+    if (max_backing_pixels.height >= 1440)
+      scale.height = 2;
+    else
+      scale.width = 2;
+  }
+  if (scale.width > max_backing_scale || scale.height > max_backing_scale ||
+      scale.width > max_backing_pixels.width / 1280 ||
+      scale.height > max_backing_pixels.height / 720)
+    return {};
+  return {scene, hud, scale};
+}
+
 // Screen-pitched EDRAM is reused for square reflection and shadow views.
 // Their pixel coordinates must retain the integer resolve storage scale.
 constexpr bool IsDisplayViewport(bool x_enabled, bool y_enabled, float x_scale, float y_scale,
@@ -40,6 +89,173 @@ constexpr bool IsNativeScreenViewport(unsigned pitch, bool x_enabled, bool y_ena
                                scissor_height) &&
          IsDisplayViewport(x_enabled, y_enabled, x_scale, y_scale, scissor_width, scissor_height);
 }
+
+// The smallest bloom pass also uses a screen pitch. Cockpit textures and
+// square reflection and shadow views keep the integer raster.
+constexpr bool IsFractionalSceneViewport(unsigned pitch, bool x_enabled, bool y_enabled,
+                                         float x_scale, float y_scale, unsigned width,
+                                         unsigned height) {
+  if (pitch == 80)
+    return IsDisplayViewport(x_enabled, y_enabled, x_scale, y_scale, width, height);
+  return IsNativeScreenViewport(pitch, x_enabled, y_enabled, x_scale, y_scale, width, height);
+}
+
+// Raster scissor coverage is rounded at the edges. Scaling offset and size
+// independently loses a pixel when both have a fractional remainder.
+constexpr void ScaleRasterScissor(unsigned& offset, unsigned& extent,
+                                 unsigned active_pixels, unsigned backing_pixels) {
+  const uint64_t high = (uint64_t(offset) + extent) * active_pixels;
+  const unsigned end = unsigned((high + backing_pixels - 1) / backing_pixels);
+  offset = unsigned(uint64_t(offset) * active_pixels / backing_pixels);
+  if (extent) extent = end - offset;
+}
+
+// FH1's known tiled raster is the 0.75 path fixed by 0490. Its tile offsets
+// have been checked against the resolve's eight-guest-pixel alignment.
+constexpr bool SupportsFractionalPredicatedTiles(RasterExtent active, RasterExtent backing) {
+  const auto supported_axis = [](unsigned raster, unsigned storage) {
+    return raster == storage || uint64_t(raster) * 4 == uint64_t(storage) * 3;
+  };
+  return supported_axis(active.width, backing.width) &&
+         supported_axis(active.height, backing.height);
+}
+
+// The split has already identified this frame's final HUD color target.
+template <typename ColorFormat>
+constexpr bool IsNative720pHudTarget(RasterExtent raster, unsigned expected_base,
+                                     unsigned color_base, unsigned pitch, bool one_sample,
+                                     ColorFormat color_format, bool offset_window) {
+  const bool packed_color = color_format == ColorFormat::k_2_10_10_10 ||
+      color_format == ColorFormat::k_2_10_10_10_AS_10_10_10_10;
+  return raster.width == 1280 && raster.height == 720 && expected_base != UINT32_MAX &&
+         color_base == expected_base && pitch == 1280 && one_sample && packed_color &&
+         !offset_window;
+}
+
+constexpr bool KeepIntegerRaster(RasterExtent active, RasterExtent backing, bool predicated,
+                                 bool pixel_memexport, bool native_hud_target,
+                                 bool explicit_scene) {
+  if (pixel_memexport) return true;
+  if (!predicated || native_hud_target) return false;
+  // Explicit scene tiles require a phase-aware resolve, even when their ratio is 0.75.
+  if (explicit_scene) return active.width != backing.width || active.height != backing.height;
+  return !SupportsFractionalPredicatedTiles(active, backing);
+}
+
+constexpr bool IsNative720pHudResolve(bool hud_target, bool color_zero, RasterExtent extent,
+                                      bool source_offset) {
+  return hud_target && color_zero && !source_offset && extent.width == 1280 &&
+         extent.height == 720;
+}
+
+// A single coordinate transform is valid only when all owners in the EDRAM
+// copy rectangle wrote with the same raster. Unknown owners use integer UVs.
+enum class ResolveEvidence : uint8_t { kAbsent, kUnknown, kMixed, kInteger, kFractional };
+
+constexpr const char* ResolveEvidenceName(ResolveEvidence evidence) {
+  switch (evidence) {
+    case ResolveEvidence::kAbsent: return "absent";
+    case ResolveEvidence::kUnknown: return "unknown-owner";
+    case ResolveEvidence::kMixed: return "mixed";
+    case ResolveEvidence::kInteger: return "recorded-integer";
+    case ResolveEvidence::kFractional: return "recorded-fractional";
+  }
+  return "invalid";
+}
+
+struct ResolveProducerRaster {
+  bool has_fractional = false;
+  bool has_full_or_unknown = false;
+  bool has_integer = false;
+  bool has_unknown = false;
+
+  constexpr void Add(bool fractional, bool known = true) {
+    // A stale fractional bit is not evidence when ownership is unknown.
+    has_fractional |= known && fractional;
+    has_full_or_unknown |= !known || !fractional;
+    has_integer |= known && !fractional;
+    has_unknown |= !known;
+  }
+  constexpr bool IsFractional() const { return has_fractional && !has_full_or_unknown; }
+  constexpr bool IsMixed() const { return has_fractional && has_full_or_unknown; }
+  constexpr ResolveEvidence Evidence() const {
+    if (IsMixed()) return ResolveEvidence::kMixed;
+    if (has_unknown) return ResolveEvidence::kUnknown;
+    if (has_integer) return ResolveEvidence::kInteger;
+    if (has_fractional) return ResolveEvidence::kFractional;
+    return ResolveEvidence::kAbsent;
+  }
+};
+
+// For bounded size-change logs only. Presentation still uses the existing
+// raster map. The latest write covering the sampled base wins, even if that
+// write is another resolve whose byte range overlaps this texture.
+struct ResolveTrace {
+  uint32_t destination_base = 0;
+  uint32_t written_address = 0;
+  uint32_t written_length = 0;
+  uint32_t edram_base = 0;
+  ResolveEvidence evidence = ResolveEvidence::kAbsent;
+  bool final_hud = false;
+  uint32_t expected_hud_base = UINT32_MAX;
+  RasterExtent copy_extent{};
+  bool color = false;
+
+  constexpr bool CoversPage(uint32_t page) const {
+    return written_length && page >= written_address >> 12 &&
+           page <= (uint64_t(written_address) + written_length - 1) >> 12;
+  }
+  constexpr bool MatchesBase(uint32_t page) const { return page == destination_base >> 12; }
+};
+
+constexpr bool CanResampleIntegerSwap(const ResolveTrace* trace, uint32_t source_address,
+                                      uint32_t packet_address, RasterExtent guest_extent,
+                                      RasterExtent source, RasterExtent output) {
+  return trace && trace->color && trace->evidence == ResolveEvidence::kInteger &&
+         trace->destination_base == source_address && trace->written_address == source_address &&
+         trace->written_length >= 1280 * 720 * 4 && packet_address == source_address &&
+         guest_extent.width == 1280 && guest_extent.height == 720 &&
+         trace->copy_extent.width == guest_extent.width &&
+         trace->copy_extent.height == guest_extent.height &&
+         source.width >= guest_extent.width && source.height >= guest_extent.height &&
+         output.IsComplete() && output.width <= source.width && output.height <= source.height &&
+         (source.width != output.width || source.height != output.height) &&
+         uint64_t(source.width) * guest_extent.height !=
+             uint64_t(source.height) * guest_extent.width;
+}
+
+class ResolveTraceHistory {
+ public:
+  constexpr void Record(ResolveTrace trace) {
+    entries_[next_] = trace;
+    next_ = (next_ + 1) % entries_.size();
+  }
+  constexpr const ResolveTrace* Find(uint32_t page) const {
+    for (unsigned i = 0; i < entries_.size(); ++i) {
+      const auto& entry = entries_[(next_ + entries_.size() - 1 - i) % entries_.size()];
+      if (entry.CoversPage(page)) return &entry;
+    }
+    return nullptr;
+  }
+  constexpr void Invalidate(uint32_t first_page, uint32_t last_page) {
+    for (auto& entry : entries_) {
+      if (!entry.written_length) continue;
+      const uint32_t base_page = entry.destination_base >> 12;
+      const uint32_t written_first = entry.written_address >> 12;
+      const uint64_t written_last = (uint64_t(entry.written_address) + entry.written_length - 1) >> 12;
+      if ((base_page >= first_page && base_page <= last_page) ||
+          (written_first <= last_page && written_last >= first_page)) {
+        // A later partial write invalidates the full-texture proof. Clear every
+        // overlapping entry, so lookup cannot resurrect an older proof.
+        entry = {};
+      }
+    }
+  }
+
+ private:
+  std::array<ResolveTrace, 64> entries_{};
+  unsigned next_ = 0;
+};
 
 // Predicated tiling on the fractional raster (#785). FH1 draws some scenes (the street race
 // intro's crowd shot) in three 1280x256 EDRAM tiles with 4x MSAA, each moved into place by a

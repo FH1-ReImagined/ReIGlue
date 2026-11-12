@@ -65,9 +65,23 @@ inline bool IsShadowPass(uint64_t hash) {
 struct Grid {
   uint32_t downsample, width, height;
 };
-inline Grid GridFor(uint32_t width, uint32_t height) {
+inline constexpr Grid GridFor(uint32_t width, uint32_t height) {
   const uint32_t d = width >= 1920 ? 2 : 1;
   return {d, (width + d - 1) / d, (height + d - 1) / d};
+}
+
+// Physical capacity and active GridFor dimensions are separate: GridFor is
+// discontinuous at 1920, so GridFor(max full width) is not a capacity bound.
+struct ImageCapacity {
+  uint32_t full_width = 0, full_height = 0, ao_width = 0, ao_height = 0;
+  constexpr bool operator==(const ImageCapacity&) const = default;
+};
+inline constexpr ImageCapacity CapacityFor(ImageCapacity old, uint32_t width, uint32_t height,
+                                            bool retain_capacity) {
+  const auto grid = GridFor(width, height);
+  if (!retain_capacity) return {width, height, grid.width, grid.height};
+  return {std::max(old.full_width, width), std::max(old.full_height, height),
+          std::max(old.ao_width, grid.width), std::max(old.ao_height, grid.height)};
 }
 
 // The shadow passes rebuild a pixel's view position from the depth with their pixel constants:
