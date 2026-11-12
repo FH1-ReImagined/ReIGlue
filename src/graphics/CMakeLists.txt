@@ -108,6 +108,15 @@ endif()
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
 
+# Build-tree marker is release-only and independent of DLSS. When a build is
+# reconfigured without Vulkan, remove any stale marker in the output folder.
+add_custom_command(TARGET rexgpu-xenos POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        "-DFH1_GPU_PLUGIN=$<TARGET_FILE:rexgpu-xenos>"
+        "-DFH1_CAPABILITIES=$<TARGET_FILE_DIR:rexgpu-xenos>/fh1-native-scene.json"
+        "-DFH1_ENABLED=$<AND:$<CONFIG:Release>,$<BOOL:${REXGLUE_USE_VULKAN}>>"
+        -P "${REXGLUE_ROOT}/cmake/Fh1NativeSceneCapabilities.cmake")
+
 if(REXGLUE_USE_VULKAN)
     include(${REXGLUE_ROOT}/cmake/ForzaSmaa.cmake)
 endif()

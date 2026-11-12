@@ -11,6 +11,14 @@ add_executable(fh1_screen_raster_test fh1_screen_raster_test.cpp)
 target_include_directories(fh1_screen_raster_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME fh1.screen_raster COMMAND fh1_screen_raster_test)
 
+# Validate the marker's hash and install ordering in the normal CTest suite.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME fh1.native_scene_capability
+        COMMAND ${CMAKE_COMMAND} -E env "CMAKE=${CMAKE_COMMAND}"
+                ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_fh1_native_scene_capabilities.py)
+endif()
+
 find_package(Threads REQUIRED)
 add_executable(pipeline_retirement_test pipeline_retirement_test.cpp)
 target_include_directories(pipeline_retirement_test PRIVATE ${PROJECT_SOURCE_DIR}/include)

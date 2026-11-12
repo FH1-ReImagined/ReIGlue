@@ -10,6 +10,20 @@ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
+# This must follow the target install: on ELF platforms installation may
+# rewrite the plugin's RPATH, changing its SHA-256 after the build step.
+if(WIN32)
+    set(_fh1_native_scene_install_dir "${CMAKE_INSTALL_BINDIR}")
+else()
+    set(_fh1_native_scene_install_dir "${CMAKE_INSTALL_LIBDIR}")
+endif()
+install(CODE "
+    set(FH1_GPU_PLUGIN \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${_fh1_native_scene_install_dir}/$<TARGET_FILE_NAME:rexgpu-xenos>\")
+    set(FH1_CAPABILITIES \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${_fh1_native_scene_install_dir}/fh1-native-scene.json\")
+    set(FH1_ENABLED \"${REXGLUE_USE_VULKAN}\")
+    include(\"${REXGLUE_ROOT}/cmake/Fh1NativeSceneCapabilities.cmake\")
+" CONFIGURATIONS Release)
+
 # A Debug codegen tool runs an order of magnitude slower, so only Release ships.
 install(TARGETS rexglue
     EXPORT rexglueTargets
