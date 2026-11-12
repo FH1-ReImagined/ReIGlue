@@ -176,7 +176,9 @@ void main() {
 constexpr char kCompose[] = R"glsl(
 void main() {
   ivec2 t = ivec2(gl_GlobalInvocationID.xy);
-  if (any(greaterThanEqual(t, imageSize(factorImage)))) return;
+  // factorImage may retain a larger allocation after a raster change.
+  if (t.x >= (pc.size.z + 3) / 4 || t.y >= pc.size.w ||
+      any(greaterThanEqual(t, imageSize(factorImage)))) return;
   vec4 result = vec4(1.0);
   for (int k = 0; k < 4; ++k) {
     ivec2 q = ivec2(t.x * 4 + k, t.y);
@@ -239,6 +241,7 @@ struct VulkanCommandProcessor::Fh1WorldAo {
     VkImageView view = VK_NULL_HANDLE;
   };
   uint32_t full_width = 0, full_height = 0, ao_width = 0, ao_height = 0, downsample = 1;
+  ao_policy::ImageCapacity capacity;  // Allocation extents, separate from active raster above.
   bool images_new = false;
   Image z, a, b, factor;
   VkSampler sampler = VK_NULL_HANDLE;
@@ -384,8 +387,18 @@ bool VulkanCommandProcessor::Fh1WorldAoResources(uint32_t width, uint32_t height
       if (!(stage ? ao.apply_fragment : ao.apply_vertex)) return false;
     }
   }
-  if (width == ao.full_width && height == ao.full_height) return true;
-  // A new size (the render scale changed): nothing may still use the old images.
+  const auto grid = ao_policy::GridFor(width, height);
+  const auto capacity = ao_policy::CapacityFor(
+      ao.capacity, width, height, texture_cache_->Fh1TracksFractionalResolves());
+  if (ao.z.image && capacity == ao.capacity) {
+    ao.full_width = width;
+    ao.full_height = height;
+    ao.ao_width = grid.width;
+    ao.ao_height = grid.height;
+    ao.downsample = grid.downsample;
+    return true;
+  }
+  // A new allocation size: nothing may still use the old images.
   if (ao.z.image && !AwaitAllQueueOperationsCompletion()) return false;
   for (auto* image : {&ao.z, &ao.a, &ao.b, &ao.factor}) {
     if (image->view) f.vkDestroyImageView(d, image->view, nullptr);
@@ -394,7 +407,7 @@ bool VulkanCommandProcessor::Fh1WorldAoResources(uint32_t width, uint32_t height
     *image = {};
   }
   ao.full_width = ao.full_height = 0;
-  const auto grid = ao_policy::GridFor(width, height);
+  ao.capacity = {};
   ao.downsample = grid.downsample;
   ao.ao_width = grid.width;
   ao.ao_height = grid.height;
@@ -418,12 +431,12 @@ bool VulkanCommandProcessor::Fh1WorldAoResources(uint32_t width, uint32_t height
     view.subresourceRange = kColorRange;
     return f.vkCreateImageView(d, &view, nullptr, &image.view) == VK_SUCCESS;
   };
-  if (!create(ao.z, ao.ao_width, ao.ao_height, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT) ||
-      !create(ao.a, ao.ao_width, ao.ao_height, VK_FORMAT_R16G16B16A16_SFLOAT,
+  if (!create(ao.z, capacity.ao_width, capacity.ao_height, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT) ||
+      !create(ao.a, capacity.ao_width, capacity.ao_height, VK_FORMAT_R16G16B16A16_SFLOAT,
               VK_IMAGE_USAGE_STORAGE_BIT) ||
-      !create(ao.b, ao.ao_width, ao.ao_height, VK_FORMAT_R16G16B16A16_SFLOAT,
+      !create(ao.b, capacity.ao_width, capacity.ao_height, VK_FORMAT_R16G16B16A16_SFLOAT,
               VK_IMAGE_USAGE_STORAGE_BIT) ||
-      !create(ao.factor, (width + 3) / 4, height, VK_FORMAT_R8G8B8A8_UNORM,
+      !create(ao.factor, (capacity.full_width + 3) / 4, capacity.full_height, VK_FORMAT_R8G8B8A8_UNORM,
               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
     return false;
   VkDescriptorImageInfo factor{ao.sampler, ao.factor.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -435,6 +448,7 @@ bool VulkanCommandProcessor::Fh1WorldAoResources(uint32_t width, uint32_t height
   f.vkUpdateDescriptorSets(d, 1, &write, 0, nullptr);
   ao.full_width = width;
   ao.full_height = height;
+  ao.capacity = capacity;
   ao.images_new = true;
   REXGPU_INFO("FH1 world AO: {}x{} scene, occlusion at {}x{}", width, height, ao.ao_width,
               ao.ao_height);

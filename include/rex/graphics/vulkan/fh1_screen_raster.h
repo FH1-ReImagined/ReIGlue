@@ -170,8 +170,9 @@ struct ResolveProducerRaster {
   bool has_unknown = false;
 
   constexpr void Add(bool fractional, bool known = true) {
-    has_fractional |= fractional;
-    has_full_or_unknown |= !fractional;
+    // A stale fractional bit is not evidence when ownership is unknown.
+    has_fractional |= known && fractional;
+    has_full_or_unknown |= !known || !fractional;
     has_integer |= known && !fractional;
     has_unknown |= !known;
   }

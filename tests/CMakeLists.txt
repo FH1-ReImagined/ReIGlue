@@ -11,6 +11,10 @@ add_executable(fh1_screen_raster_test fh1_screen_raster_test.cpp)
 target_include_directories(fh1_screen_raster_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME fh1.screen_raster COMMAND fh1_screen_raster_test)
 
+# Allocation-capacity policy is independent of a Vulkan device.
+add_executable(fh1_world_ao_capacity_test fh1_world_ao_capacity_test.cpp)
+add_test(NAME fh1.world_ao_capacity COMMAND fh1_world_ao_capacity_test)
+
 # Validate the marker's hash and install ordering in the normal CTest suite.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

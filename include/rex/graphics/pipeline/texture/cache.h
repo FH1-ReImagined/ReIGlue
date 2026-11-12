@@ -155,6 +155,9 @@ class TextureCache {
     return Fh1ResolveRaster::kFull;
   }
   Fh1ResolveRaster GetActiveFh1ResolveRaster(uint32_t index) const;
+  // The scene-raster tracker reuses fh1_raster_pages_ for kScene. This legacy
+  // full-raster writer is valid only when fractional resolve tracking is off;
+  // Fh1NoteResolve currently enforces that mutual exclusion at its call site.
   void Fh1MarkFullRasterResolve(uint32_t address, uint32_t length, bool full) {
     if (!length || address >= SharedMemory::kBufferSize) return;
     auto lock = global_critical_region_.AcquireDeferred();

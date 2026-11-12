@@ -11,7 +11,18 @@ constexpr bool CheckResolveEvidence() {
   ResolveProducerRaster producers;
   if (producers.Evidence() != ResolveEvidence::kAbsent) return false;
   producers.Add(false, false);
-  if (producers.Evidence() != ResolveEvidence::kUnknown) return false;
+  if (producers.Evidence() != ResolveEvidence::kUnknown || producers.IsFractional()) return false;
+  producers = {};
+  producers.Add(true, false);  // A stale fractional bit cannot certify an unknown owner.
+  if (producers.Evidence() != ResolveEvidence::kUnknown || producers.IsFractional()) return false;
+  producers.Add(true);
+  if (producers.Evidence() != ResolveEvidence::kMixed || producers.IsFractional()) return false;
+  producers = {};
+  producers.Add(true);
+  producers.Add(true, false);  // Unknown must poison a previously fractional owner as well.
+  if (producers.Evidence() != ResolveEvidence::kMixed || producers.IsFractional()) return false;
+  producers = {};
+  producers.Add(false, false);
   producers.Add(true);
   if (producers.Evidence() != ResolveEvidence::kMixed || producers.IsFractional()) return false;
   producers = {};
