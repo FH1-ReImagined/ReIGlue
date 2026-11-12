@@ -1,3 +1,4 @@
+#include <rex/graphics/vulkan/fh1_native_scene_host_modes.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -300,8 +301,15 @@ fh1::NativeSceneRaster Fh1GetNativeSceneRaster(
                                 REXCVAR_GET(fh1_native_scene_height)};
   if (!scene.IsSpecified())
     return {};
-  if (!native_aa || Fh1NativeEnabled() || REXCVAR_GET(render_target_path_vulkan) == "fsi")
-    return {};
+  // Host-only modes can be set directly on the CLI, bypassing the launcher.
+  // Reject incompatible combinations in the effective raster, without
+  // rewriting the requested cvars or the host's saved configuration. Do not
+  // use fh1_scene_720p_native_hud here: live reconfiguration sets it itself.
+  const bool host_modes_compatible = fh1::CompatibleNativeSceneHostModes({
+      rex::cvar::GetFlagByName("scene_resolution"), rex::cvar::GetFlagByName("vr_mode"),
+      rex::cvar::GetFlagByName("forza_ultrawide"), rex::cvar::GetFlagByName("present_effect"),
+      REXCVAR_GET(forza_native_width), REXCVAR_GET(forza_native_height)});
+  if (!native_aa || !host_modes_compatible || REXCVAR_GET(render_target_path_vulkan) == "fsi") return {};
   const fh1::RasterExtent limits{
       std::min({props.maxFramebufferWidth, props.maxImageDimension2D, props.maxViewportDimensions[0]}),
       std::min({props.maxFramebufferHeight, props.maxImageDimension2D, props.maxViewportDimensions[1]})};
@@ -2840,6 +2848,8 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
 
+  // Keep the startup pipeline available when initially incompatible settings
+  // later change to a validated live native scene mode.
   if (REXCVAR_GET(fh1_native_scene_width) && REXCVAR_GET(fh1_native_scene_height)) {
     VkFormatProperties properties;
     vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(

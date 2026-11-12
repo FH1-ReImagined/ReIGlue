@@ -1,4 +1,5 @@
 #include <rex/graphics/vulkan/fh1_screen_raster.h>
+#include <rex/graphics/vulkan/fh1_native_scene_host_modes.h>
 #include <rex/graphics/xenos.h>
 
 #include <cstdio>
@@ -82,6 +83,18 @@ constexpr bool CheckFullSwapNormalization() {
   return !CanResampleIntegerSwap(&other, address, address, guest, backing, guest);
 }
 
+constexpr bool CheckHostModes() {
+  NativeSceneHostModes m{"720", "off", "false", "bilinear", 0, 0};
+  if(!CompatibleNativeSceneHostModes(m))return false;
+  m.scene_resolution="540";if(CompatibleNativeSceneHostModes(m))return false;m.scene_resolution="720";
+  m.vr_mode="cockpit";if(CompatibleNativeSceneHostModes(m))return false;m.vr_mode="off";
+  m.ultrawide="true";if(CompatibleNativeSceneHostModes(m))return false;m.ultrawide="false";
+  m.present_effect="fsr3";if(CompatibleNativeSceneHostModes(m))return false;m.present_effect="bilinear";
+  m.native_width=1;if(CompatibleNativeSceneHostModes(m))return false;m.native_width=0;
+  m.native_height=1;if(CompatibleNativeSceneHostModes(m))return false;m.native_height=0;
+  return CompatibleNativeSceneHostModes(m) && CompatibleNativeSceneHostModes({});
+}
+static_assert(CheckHostModes());
 static_assert(CheckResolveEvidence());
 static_assert(CheckResolveTrace());
 static_assert(CheckFullSwapNormalization());
