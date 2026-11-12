@@ -694,23 +694,36 @@ bool VulkanCommandProcessor::Fh1WorldAoBeforeDraw(const Shader* pixel_shader,
   if (!view) return true;
   // The pre-pass stencil is in the same resolve (the game's velocity pass reads it as 8-bit
   // channels): the texture cache loads that view through a fetch constant the shadow passes do
-  // not use, set for this request and put back right after it.
+  // not use, set for this request and put back right after it. The draw's own textures are
+  // requested again after it (fh1_world_ao.h, RequestThroughBorrowedFetch, #823).
   VkImageView packed_view = VK_NULL_HANDLE;
   if (!(used_texture_mask & (1u << kScratchFetch))) {
     uint32_t* words =
         &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * kScratchFetch];
     uint32_t saved[6];
     std::memcpy(saved, words, sizeof(saved));
-    auto packed = fetch;
-    packed.format = xenos::TextureFormat::k_8_8_8_8;
-    packed.swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
-    std::memcpy(words, &packed, sizeof(saved));
-    texture_cache_->TextureFetchConstantWritten(kScratchFetch);
-    texture_cache_->RequestTextures(1u << kScratchFetch);
-    packed_view = texture_cache_->GetActiveBindingOrNullImageView(
-        kScratchFetch, xenos::FetchOpDimension::k2D, false);
-    std::memcpy(words, saved, sizeof(saved));
-    texture_cache_->TextureFetchConstantWritten(kScratchFetch);
+    packed_view = ao_policy::RequestThroughBorrowedFetch(
+        used_texture_mask, 1u << kScratchFetch,
+        [&] {
+          auto packed = fetch;
+          packed.format = xenos::TextureFormat::k_8_8_8_8;
+          packed.swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+          std::memcpy(words, &packed, sizeof(saved));
+          texture_cache_->TextureFetchConstantWritten(kScratchFetch);
+        },
+        [&](uint32_t mask) { texture_cache_->RequestTextures(mask); },
+        [&] {
+          return texture_cache_->GetActiveBindingOrNullImageView(
+              kScratchFetch, xenos::FetchOpDimension::k2D, false);
+        },
+        [&] {
+          std::memcpy(words, saved, sizeof(saved));
+          texture_cache_->TextureFetchConstantWritten(kScratchFetch);
+        });
+    // The depth's binding was resolved again too: its view is the one the draw will sample.
+    view = texture_cache_->GetActiveBindingOrNullImageView(ao->depth_slot,
+                                                          xenos::FetchOpDimension::k2D, false);
+    if (!view) return true;
   }
   Fh1WorldAoCompute(view, packed_view);
   ao->mask_base = regs.Get<reg::RB_COLOR_INFO>().color_base;
