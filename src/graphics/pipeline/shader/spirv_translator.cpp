@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -152,7 +153,35 @@ std::string SpirvShaderTranslator::DescribeConfiguration() const {
       int(native_2x_msaa_with_attachments_), int(native_2x_msaa_no_attachments_),
       int(edram_fragment_shader_interlock_), draw_resolution_scale_x_, draw_resolution_scale_y_,
       raster_scale_x_, raster_scale_y_, int(REXCVAR_GET(fh1_dirt_seam_fix)),
-      Modification::kVersion);
+      Modification::kVersion) + Fh1Fm4ShadowConfiguration();
+}
+
+unsigned SpirvShaderTranslator::Fh1Fm4ShadowComponent() {
+  // FH1_FM4_SHADOW_COMPONENT=0-3 (a dev test) picks another component of the mask.
+  static const unsigned component = [] {
+    const char* v = std::getenv("FH1_FM4_SHADOW_COMPONENT");
+    return v && *v >= '0' && *v <= '3' ? unsigned(*v - '0') : 0u;
+  }();
+  return component;
+}
+
+float SpirvShaderTranslator::Fh1Fm4ShadowFloor() {
+  static const float floor_value = [] {
+    const char* v = std::getenv("FH1_FM4_SHADOW_FLOOR");
+    return v ? float(std::atof(v)) : 0.45f;
+  }();
+  return floor_value;
+}
+
+const std::string& SpirvShaderTranslator::Fh1Fm4ShadowConfiguration() {
+  static const std::string words = [] {
+    if (!std::getenv("FH1_FM4_SHADOW_COMPONENT") && !std::getenv("FH1_FM4_SHADOW_FLOOR")) {
+      return std::string();
+    }
+    return fmt::format(" fh1_fm4_shadow_component={} fh1_fm4_shadow_floor={}",
+                       Fh1Fm4ShadowComponent(), Fh1Fm4ShadowFloor());
+  }();
+  return words;
 }
 
 bool SpirvShaderTranslator::IsFh1DirtSeamPixelShader(uint64_t ucode_data_hash) {

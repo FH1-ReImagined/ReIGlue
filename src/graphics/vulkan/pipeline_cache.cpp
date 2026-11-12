@@ -2357,6 +2357,14 @@ void VulkanPipelineCache::TranslateStoredShaders(
           in_pack.push_back(&job);
         }
       }
+      if (in_pack.empty()) {
+        // Nothing to check it against (a pack is a prebuild run's warm-up, so a start's pairs
+        // are in it): not used, not even in play.
+        REXGPU_INFO("Vulkan shader pack {}: none of this start's translations are in it; not "
+                    "used",
+                    name);
+        shader_pack_.Close();
+      }
       constexpr size_t kChecked = 4;
       std::minstd_rand random(uint32_t(std::chrono::steady_clock::now().time_since_epoch().count()));
       for (size_t c = 0; c < std::min(kChecked, in_pack.size()); ++c) {

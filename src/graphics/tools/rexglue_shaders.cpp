@@ -151,6 +151,16 @@ struct Configuration {
       return true;
     }
     if (key == "fh1_dirt_seam_fix") return flag(dirt_seam_fix);
+    // The FM4 shadow test variables come from the environment, here as in the game: their words
+    // are taken only when this process's environment gives the same.
+    if (key == "fh1_fm4_shadow_component" || key == "fh1_fm4_shadow_floor") {
+      const std::string own = SpirvShaderTranslator::Fh1Fm4ShadowConfiguration() + " ";
+      if (own.find(" " + std::string(word) + " ") != std::string::npos) return true;
+      std::fprintf(stderr,
+                   "configuration: run with FH1_FM4_SHADOW_COMPONENT and FH1_FM4_SHADOW_FLOOR "
+                   "set as the game had them\n");
+      return false;
+    }
     // A configuration from another translator version describes other SPIR-V.
     if (key == "modification_version") return integer && (modification_version = uint32_t(n), true);
     return false;
