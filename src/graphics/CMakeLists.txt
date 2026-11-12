@@ -108,6 +108,18 @@ endif()
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
 
+# FH1 (patch 0570): the PM4 trace, a study build of the command processor that counts every
+# executed packet by the guest D3D function that wrote it (fh1_pm4_trace.h). Off for players:
+# it costs every packet.
+option(REXGLUE_FH1_PM4_TRACE "Count executed PM4 by its writer (FH1 native renderer study, Linux)" OFF)
+if(REXGLUE_FH1_PM4_TRACE)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "REXGLUE_FH1_PM4_TRACE is Linux only (POSIX shared memory)")
+    endif()
+    target_sources(rexgpu-xenos PRIVATE fh1_pm4_trace.cpp)
+    target_compile_definitions(rexgpu-xenos PRIVATE REX_FH1_PM4_TRACE=1)
+endif()
+
 if(REXGLUE_USE_VULKAN)
     include(${REXGLUE_ROOT}/cmake/ForzaSmaa.cmake)
 endif()
