@@ -212,8 +212,8 @@ struct Params {
 // checks them against the literals the guest's draws load.
 constexpr float kWeights[fh::kBlurKindCount][4] = {
     {0.25f, 0.0f, 0.0f, 0.0f},                       // box (58CE51CE56247C16): c255.x
-    {0.25f, 0.25f, 0.0f, 0.0f},                      // HLQ (85C2871B0E0A740B): x +-1.5, y +-0.5
-    {0.25f, 0.25f, 0.0f, 0.0f},                      // VLQ (F6EE736B656E5942)
+    {0.2f, 0.3f, 0.0f, 0.0f},                        // HLQ (85C2871B0E0A740B): x +-1.5, y +-0.5
+    {0.2f, 0.3f, 0.0f, 0.0f},                        // VLQ (F6EE736B656E5942)
     {3.0f / 11.0f, 0.5f / 11.0f, 2.0f / 11.0f, 0.0f},  // H (DBD55E02669D5CB1)
     {3.0f / 11.0f, 0.5f / 11.0f, 2.0f / 11.0f, 0.0f},  // V (D9A1FFC33C029F54)
 };
