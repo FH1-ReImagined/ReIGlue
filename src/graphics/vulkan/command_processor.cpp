@@ -3101,6 +3101,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   fh1_device_lost_report::Set({});
   fh1_pending_readbacks_.clear();
   Fh1WorldAoShutdown();
+  Fh1ShadowCompareShutdown();
   ShutdownSubmissionThread();
   if (present_deferred_presenter_) {
     // The thread ran every queued step before it ended.

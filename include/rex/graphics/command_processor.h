@@ -95,6 +95,8 @@ class CommandProcessor {
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
+  // FH1 (0610): the native renderer's shadow mode statistics (fh1_native_shadow.cpp).
+  struct Fh1NativeShadow;
 
   virtual bool Initialize();
   virtual void Shutdown();
@@ -253,6 +255,11 @@ class CommandProcessor {
   // applies each eye's offset and keeps the left eye's picture.
   enum class Fh1StereoState : uint8_t { kOff, kSpeculative, kRecording, kReplaying };
   enum class Fh1StereoDraw : uint8_t { kOther, kClear, kSegmentStart, kSegmentEnd };
+  // FH1 (0610): a host packet (fh1_host_packet.h): a type-3 NOP whose first payload word is
+  // "FH1N", run in stream order (on the recorder when split) with its payload in host order.
+  // The base takes the native renderer's shadow mode ops (fh1_native_shadow.cpp); a backend
+  // that adds its own calls it too.
+  virtual void Fh1HostPacket(const uint32_t* words, uint32_t count);
   // Whether this frame should be drawn for both eyes (the client asks, the path supports it).
   virtual bool Fh1StereoWanted() { return false; }
   // Before a draw (registers set, not issued yet) while the segment may start or end.
@@ -357,6 +364,14 @@ class CommandProcessor {
   // FH1 (#45, patch 0360): a bitmap (RegisterFile::kRegisterCount bits) of the registers outside
   // the shader constant blocks whose write the backend only stores: its WriteRegistersFromMem
   // and WriteRegister store them and do nothing else. While set, the packet loop writes a range
+  // FH1 (0610): the native renderer's shadow mode (fh1_native_shadow.cpp): each draw record of
+  // the game's host device layer checked against the register file, the group's draws and
+  // resolves counted. Null until the first shadow packet.
+  Fh1NativeShadow* fh1_native_shadow_ = nullptr;
+  void Fh1NativeShadowPacket(const uint32_t* words, uint32_t count);
+  void Fh1NativeShadowDraw(uint32_t initiator, bool indexed, uint32_t index_base);
+  void Fh1NativeShadowShutdown();
+
   // (type-0 packet, SET_CONSTANT of registers, SET_CONSTANT2) made only of such registers from
   // the ring itself, without the two virtual calls and the backend's sorting of the range (most
   // of the render state writes, about 9 ranges a draw). Null: every write takes the backend.

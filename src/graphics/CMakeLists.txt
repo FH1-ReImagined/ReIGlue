@@ -18,6 +18,7 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+    fh1_native_shadow.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     packet_disassembler.cpp
@@ -53,6 +54,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/fh1_fsr3.cpp
     vulkan/fh1_smaa.cpp
     vulkan/fh1_world_ao.cpp
+    vulkan/fh1_native_shadow_compare.cpp
     vulkan/fh1_gpu_profile.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
