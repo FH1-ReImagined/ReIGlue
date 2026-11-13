@@ -177,6 +177,10 @@ struct CommandProcessor::Fh1NativeShadow {
   uint64_t islands = 0, islands_ended = 0, islands_agree = 0, islands_unwritten = 0,
            islands_missing = 0;
   std::map<uint64_t, uint64_t> island_counts;
+  // 0630: records of calls the game did not make (drawn natively by the backend), in all and in
+  // the current island (its draws and resolves, which the command processor never executes).
+  uint64_t native_records = 0, native_islands = 0;
+  uint32_t island_native_draws = 0, island_native_resolves = 0;
   uint64_t check_ns = 0, checks = 0;
   uint32_t detailed = 0;
 };
@@ -261,6 +265,7 @@ void CommandProcessor::Fh1NativeShadowPacket(const uint32_t* words, uint32_t cou
     s.alu_valid = false;
     s.seeding = false;
     s.constant_packets = 0;
+    s.island_native_draws = s.island_native_resolves = 0;
     ++s.islands;
     return;
   }
@@ -274,11 +279,15 @@ void CommandProcessor::Fh1NativeShadowPacket(const uint32_t* words, uint32_t cou
     s.in_island = false;
     ++s.islands_ended;
     const uint32_t* calls = words + 5;
-    const uint64_t game_draws = uint64_t(calls[fh::kKindDrawVertices]) +
+    uint64_t game_draws = uint64_t(calls[fh::kKindDrawVertices]) +
                                 calls[fh::kKindDrawIndexed] + calls[fh::kKindBeginVertices] +
                                 calls[fh::kKindDrawVerticesUp] + calls[fh::kKindDrawIndexedUp] +
                                 calls[fh::kKindClear];
-    const uint64_t game_resolves = calls[fh::kKindResolve];
+    // The calls the game skipped (0630) were not executed: the backend drew them.
+    const uint64_t game_resolves = calls[fh::kKindResolve] - s.island_native_resolves;
+    game_draws -= s.island_native_draws;
+    if (s.island_native_draws + s.island_native_resolves)
+      ++s.native_islands;
     const uint64_t draws = s.draws - s.island_draws, copies = s.copies - s.island_copies;
     if (words[4])
       ++s.islands_unwritten;
@@ -357,6 +366,21 @@ void CommandProcessor::Fh1NativeShadowPacket(const uint32_t* words, uint32_t cou
     s.seeding = false;
     if (s.alu_valid)
       ++s.seeds;
+  }
+
+  // 0630: a call the game did not make: nothing executed it, so there is no state to compare;
+  // the backend draws it from the record.
+  if (flags & fh::kRecordNative) {
+    ++s.native_records;
+    --s.records;  // "records" are the ones checked
+    --s.kind_records[kind];
+    if (kind == fh::kKindResolve)
+      ++s.island_native_resolves;
+    else
+      ++s.island_native_draws;
+    s.record_draws = s.draws;
+    s.record_copies = s.copies;
+    return;
   }
 
   const bool draw_call = IsDrawCall(kind);
@@ -579,12 +603,13 @@ void LogShadowSummary(const CommandProcessor::Fh1NativeShadow& s, const char* wh
       "the game could not write, {} never ended), {} records: agree on what is read {} "
       "({:.3f}%), on everything {} ({:.3f}%); {} seeds, {} outside a group, {} replayed, {} "
       "without constants (before a seed or after a lost packet: {}), {} literal loads, {} with an "
-      "unanalyzed shader, {} malformed; check {:.2f} us a record",
+      "unanalyzed shader, {} malformed; {} drawn natively (in {} groups); check {:.2f} us a "
+      "record",
       when, s.islands, s.islands_ended, s.islands_agree, pct(s.islands_agree, s.islands_ended),
       s.islands_unwritten, s.islands_missing, s.records, s.agree, pct(s.agree, s.records),
       s.agree_all, pct(s.agree_all, s.records), s.seeds, s.outside, s.replays, s.alu_unknown,
-      s.constants_lost, s.literal_loads, s.unanalyzed, s.malformed,
-      s.checks ? double(s.check_ns) * 1e-3 / double(s.checks) : 0.0);
+      s.constants_lost, s.literal_loads, s.unanalyzed, s.malformed, s.native_records,
+      s.native_islands, s.checks ? double(s.check_ns) * 1e-3 / double(s.checks) : 0.0);
   std::string kinds, fields;
   for (uint32_t k = 1; k < fh::kKindCount; ++k) {
     if (!s.kind_records[k])
