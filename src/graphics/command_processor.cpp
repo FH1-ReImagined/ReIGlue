@@ -22,6 +22,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -30,6 +31,7 @@
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/fh1_host_packet.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -234,6 +236,7 @@ void CommandProcessor::Shutdown() {
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
+  Fh1NativeShadowShutdown();
 }
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
@@ -2088,6 +2091,20 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, ui
 
 bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
                                               uint32_t count) {
+  // FH1 (0610): a host packet (Fh1HostPacket).
+  if (count >= 2 && count <= fh1_host::kMaxWords) {
+    memory::RingBuffer peek = *reader;
+    if (peek.ReadAndSwap<uint32_t>() == fh1_host::kMagic) {
+      std::vector<uint32_t> words(count);
+      words[0] = fh1_host::kMagic;
+      for (uint32_t i = 1; i < count; ++i) words[i] = peek.ReadAndSwap<uint32_t>();
+      reader->AdvanceRead(count * sizeof(uint32_t));
+      RecordCall([this, words = std::move(words)]() {
+        Fh1HostPacket(words.data(), uint32_t(words.size()));
+      });
+      return true;
+    }
+  }
   // skip N 32-bit words to get to the next packet
   // No-op, ignore some data.
   reader->AdvanceRead(count * sizeof(uint32_t));
@@ -2736,6 +2753,9 @@ bool CommandProcessor::ExecuteDraw(const DrawRecord& draw) {
   index_buffer_info.guest_base = draw.index_guest_base;
   index_buffer_info.length = draw.index_length;
   bool draw_succeeded = true;
+  if (fh1_native_shadow_) {
+    Fh1NativeShadowDraw(draw.initiator, is_indexed, draw.index_guest_base);
+  }
   auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
   if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
     // TODO(Triang3l): Don't drop the draw call completely if the vertex
