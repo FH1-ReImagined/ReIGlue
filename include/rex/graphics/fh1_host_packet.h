@@ -7,8 +7,10 @@
 // The FH1 native renderer's milestone M2 ("shadow mode", FH1 docs/native-renderer.md) uses them
 // to send the command processor the draw records its host device layer builds from the D3D
 // device's shadow state at the D3D flush points, for one group of passes at a time; the command
-// processor compares every record with its own register file (fh1_native_shadow.cpp). Nothing is
-// drawn from them. Header-only, shared with the game.
+// processor compares every record with its own register file (fh1_native_shadow.cpp). M3
+// ("hybrid", patch 0630) draws some of them natively: a record flagged kRecordNative stands for a
+// D3D call the game did not make, and the Vulkan backend draws it from the record
+// (fh1_native_shadow_compare.cpp). Header-only, shared with the game.
 #pragma once
 
 #include <cstdint>
@@ -20,7 +22,9 @@ constexpr uint32_t kMagic = 0x4648314Eu;  // "FH1N"
 constexpr uint32_t kMaxWords = 4096;
 
 enum Op : uint32_t {
-  // [2] island id, [3] the island's kind (kIslandShadowMask), [4] flags (kIslandCompareContents)
+  // [2] island id, [3] the island's kind (kIslandShadowMask), [4] flags (kIslandCompareContents,
+  // kIslandNative), [5] (0630, optional) the guest (virtual) address of the game's status word,
+  // where the backend writes kStatus* bits: what it can draw natively with the current settings.
   kOpIslandBegin = 0x10,
   // A draw record (below).
   kOpRecord = 0x11,
@@ -55,6 +59,13 @@ enum Island : uint32_t {
   kIslandShadowMask = 1,
 };
 constexpr uint32_t kIslandCompareContents = 1;  // compare the group's result with a native one
+// 0630: the game may skip some of the island's D3D calls (their records carry kRecordNative).
+constexpr uint32_t kIslandNative = 2;
+// 0630: the status word (big endian, in guest memory) the backend writes at each island begin.
+// The game draws a group natively only while its bit is set, so the decision to skip guest calls
+// is made before any is skipped; a backend that does not know the op (D3D12, ReGPU, an older
+// plugin) never sets it.
+constexpr uint32_t kStatusShadowMaskBlur = 1;  // the shadow mask's blurs and their resolves
 
 // The D3D flush point a record was made at.
 enum Kind : uint32_t {
@@ -97,6 +108,22 @@ enum RecordWord : uint32_t {
 };
 constexpr uint32_t kRecordSeed = 1;        // its constants packets held all 512 constants
 constexpr uint32_t kRecordVertexData = 2;  // the UP draw's vertex data follows
+// 0630: the game did not make this D3D call; the backend draws it from the record.
+constexpr uint32_t kRecordNative = 4;
+// 0630: the call is the shadow mask's blur draw, of kind (flags >> kRecordBlurKindShift) & 15
+// (the game's blur kinds: 0 the 2x2 box, 1/2 the 4-tap horizontal/vertical pair, 3/4 the 6-tap
+// pair), or one of the mask's resolves after the island's first blur.
+constexpr uint32_t kRecordBlur = 8;
+constexpr uint32_t kRecordMaskResolve = 16;
+constexpr uint32_t kRecordBlurKindShift = 8;
+enum BlurKind : uint32_t {
+  kBlurBox = 0,
+  kBlurHorizontal4 = 1,
+  kBlurVertical4 = 2,
+  kBlurHorizontal6 = 3,
+  kBlurVertical6 = 4,
+  kBlurKindCount = 5,
+};
 
 // The D3D device's shadow of the registers it flushes with its register-block writer: device
 // +10112 .. +10864, kRegisterShadowWords words. Each block is `count` consecutive registers
