@@ -827,6 +827,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   void Fh1WorldAoCompute(VkImageView depth_view, VkImageView packed_view);
   VkPipeline Fh1WorldAoApplyPipeline(VulkanRenderTargetCache::RenderPassKey key);
   bool Fh1WorldAoProjection(float* params);
+  // FH1 (0620): the native renderer's shadow mode content compare
+  // (fh1_native_shadow_compare.cpp).
+  struct Fh1ShadowCompare;
+  Fh1ShadowCompare* fh1_shadow_compare_ = nullptr;
+  void Fh1ShadowCompareShutdown();
+  bool Fh1ShadowCompareCompute(const uint32_t* words, uint32_t count);
+  bool Fh1ShadowCompareRun();
   void Fh1SelectNativeHud(bool native_hud);
   bool Fh1CreateRenderCaches(uint32_t scale_x, uint32_t scale_y);
   void Fh1ApplyGraphicsRequest();
@@ -918,6 +925,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // eye's offset for the main view's 3D draws, the left eye's picture (the pre-HUD composite
   // before the right eye's pass) and both eyes, side by side, for the VR client.
   bool Fh1StereoWanted() override;
+  void Fh1HostPacket(const uint32_t* words, uint32_t count) override;
   Fh1StereoDraw Fh1StereoClassify() override;
   void Fh1StereoBegin() override;
   bool Fh1StereoLeftDone() override;
