@@ -39,6 +39,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/util/fh1_hud.h>
 #include "fh1_device_memory.h"
+#include "fh1_upload_stats.h"
 #include "fh1_render_target_trim.h"
 #include "fh1_pipeline_lookahead.h"
 #include "fh1_submission_watch.h"
@@ -1682,12 +1683,17 @@ bool VulkanCommandProcessor::SetupContext() {
     guest_shader_vertex_stages_ |= VK_SHADER_STAGE_COMPUTE_BIT;
   }
 
+  // FH1 (#268): the memory layout, before the first allocation it places (and, #858, before
+  // the upload rings, which may go to host-visible device-local memory).
+  fh1_device_memory::Get().Initialize(vulkan_device);
+
   // 16384 is bigger than any single uniform buffer that Xenia needs, but is the
   // minimum maxUniformBufferRange, thus the safe minimum amount.
   uniform_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
       rex::align(std::max(ui::GraphicsUploadBufferPool::kDefaultPageSize, size_t(16384)),
-                 size_t(device_properties.minUniformBufferOffsetAlignment)));
+                 size_t(device_properties.minUniformBufferOffsetAlignment)),
+      fh1_device_memory::Get().upload_types());
 
   // Descriptor set layouts that don't depend on the setup of other subsystems.
   VkShaderStageFlags guest_shader_stages =
@@ -1792,9 +1798,6 @@ bool VulkanCommandProcessor::SetupContext() {
         "buffers bound to the compute shader");
     return false;
   }
-
-  // FH1 (#268): the memory layout, before the first allocation it places.
-  fh1_device_memory::Get().Initialize(vulkan_device);
 
   shared_memory_ =
       std::make_unique<VulkanSharedMemory>(*this, *memory_, guest_shader_pipeline_stages_);
@@ -11107,6 +11110,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = sizeof(SpirvShaderTranslator::SystemConstants);
       std::memcpy(mapping, &system_constants_, sizeof(SpirvShaderTranslator::SystemConstants));
+      fh1_upload_stats::Add(fh1_upload_stats::Kind::kSystemConstants,
+                            sizeof(SpirvShaderTranslator::SystemConstants));
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferSystem;
     }
@@ -11141,6 +11146,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           mapping += sizeof(float) * 4;
         }
       }
+      fh1_upload_stats::Add(fh1_upload_stats::Kind::kFloatConstantsVertex, float_constants_size);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
     }
@@ -11170,6 +11176,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           mapping += sizeof(float) * 4;
         }
       }
+      fh1_upload_stats::Add(fh1_upload_stats::Kind::kFloatConstantsPixel, float_constants_size);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
     }
@@ -11187,6 +11194,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kBoolLoopConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], kBoolLoopConstantsSize);
+      fh1_upload_stats::Add(fh1_upload_stats::Kind::kBoolLoopConstants, kBoolLoopConstantsSize);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferBoolLoop;
     }
@@ -11204,6 +11212,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kFetchConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+      fh1_upload_stats::Add(fh1_upload_stats::Kind::kFetchConstants, kFetchConstantsSize);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFetch;
     }
