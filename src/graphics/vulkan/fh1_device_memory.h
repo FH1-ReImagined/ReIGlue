@@ -6,6 +6,7 @@
 // which failures were reported. Discrete GPUs only get the reports (and the heap line at
 // start); their memory goes where it always went.
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -13,6 +14,7 @@
 #include <rex/ui/vulkan/device.h>
 
 #include "fh1_memory_placement.h"
+#include "fh1_upload_stats.h"
 
 namespace rex::graphics::vulkan::fh1_device_memory {
 
@@ -81,11 +83,22 @@ class State {
     return type < 32 && (layout_.device_local_types >> type & 1);
   }
 
+  // FH1 (#858): the memory types the upload rings try first (placement::DeviceLocalUploadTypes
+  // when vulkan_rebar_uploads is on, read at Initialize), 0 for system memory as before.
+  uint32_t upload_types() const { return upload_types_; }
+
  private:
   void LogSummary();
+  void LogUploads(bool log);
 
   const ui::vulkan::VulkanDevice* device_ = nullptr;
   placement::Layout layout_;
+  uint32_t upload_types_ = 0;
+  // FH1 (#858): the upload byte counts' last logged values (fh1_upload_stats.h).
+  uint64_t upload_frames_ = 0;
+  uint64_t upload_bytes_logged_[size_t(fh1_upload_stats::Kind::kCount)] = {};
+  uint64_t upload_writes_logged_[size_t(fh1_upload_stats::Kind::kCount)] = {};
+  std::chrono::steady_clock::time_point next_upload_log_ = {};
   uint32_t type_heap_[placement::kMaxTypes] = {};
   bool have_budget_ = false;
   uint32_t cap_mb_ = 0;  // vulkan_device_local_budget_mb

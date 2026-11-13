@@ -27,11 +27,29 @@ namespace vulkan {
 // try not to waste that padding.
 VulkanUploadBufferPool::VulkanUploadBufferPool(const VulkanDevice* const vulkan_device,
                                                const VkBufferUsageFlags usage,
-                                               const size_t page_size)
+                                               const size_t page_size,
+                                               const uint32_t preferred_memory_types)
     : GraphicsUploadBufferPool(size_t(
           rex::round_up(VkDeviceSize(page_size), vulkan_device->properties().nonCoherentAtomSize))),
       vulkan_device_(vulkan_device),
-      usage_(usage) {}
+      usage_(usage),
+      preferred_memory_types_(preferred_memory_types & vulkan_device->memory_types().host_coherent) {}
+
+// FH1 (#858): a preferred type the buffer accepts, else the usual host-visible one (fallback_out:
+// the usual one when a preferred one was chosen, else UINT32_MAX).
+static uint32_t ChooseUploadMemoryType(const VulkanDevice* vulkan_device, uint32_t preferred,
+                                       uint32_t supported, uint32_t& fallback_out) {
+  const uint32_t usual =
+      util::ChooseHostMemoryType(vulkan_device->memory_types(), supported, false);
+  const uint32_t chosen =
+      util::ChooseHostMemoryType(vulkan_device->memory_types(), supported & preferred, false);
+  if (chosen == UINT32_MAX || chosen == usual) {
+    fallback_out = UINT32_MAX;
+    return usual;
+  }
+  fallback_out = usual;
+  return chosen;
+}
 
 uint8_t* VulkanUploadBufferPool::Request(uint64_t submission_index, size_t size, size_t alignment,
                                          VkBuffer& buffer_out, VkDeviceSize& offset_out) {
@@ -88,8 +106,9 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
   if (memory_type_ == kMemoryTypeUnknown) {
     VkMemoryRequirements memory_requirements;
     dfn.vkGetBufferMemoryRequirements(device, buffer, &memory_requirements);
-    memory_type_ = util::ChooseHostMemoryType(vulkan_device_->memory_types(),
-                                              memory_requirements.memoryTypeBits, false);
+    memory_type_ = ChooseUploadMemoryType(vulkan_device_, preferred_memory_types_,
+                                          memory_requirements.memoryTypeBits,
+                                          fallback_memory_type_);
     if (memory_type_ == UINT32_MAX) {
       REXLOG_ERROR(
           "No host-visible memory types can store an Vulkan upload buffer with "
@@ -109,19 +128,27 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
           VK_SUCCESS) {
         VkMemoryRequirements memory_requirements_expanded;
         dfn.vkGetBufferMemoryRequirements(device, buffer_expanded, &memory_requirements_expanded);
-        uint32_t memory_type_expanded = util::ChooseHostMemoryType(
-            vulkan_device_->memory_types(), memory_requirements_expanded.memoryTypeBits, false);
+        uint32_t fallback_expanded;
+        uint32_t memory_type_expanded =
+            ChooseUploadMemoryType(vulkan_device_, preferred_memory_types_,
+                                   memory_requirements_expanded.memoryTypeBits, fallback_expanded);
         if (memory_requirements_expanded.size <= allocation_size_ &&
             memory_type_expanded != UINT32_MAX) {
           page_size_ = size_t(allocation_size_);
           allocation_size_ = memory_requirements_expanded.size;
           memory_type_ = memory_type_expanded;
+          fallback_memory_type_ = fallback_expanded;
           dfn.vkDestroyBuffer(device, buffer, nullptr);
           buffer = buffer_expanded;
         } else {
           dfn.vkDestroyBuffer(device, buffer_expanded, nullptr);
         }
       }
+    }
+    if (preferred_memory_types_) {
+      REXLOG_INFO("Vulkan upload buffer (usage {:#x}): {} KB pages in memory type {}{}",
+                  uint32_t(usage_), page_size_ >> 10, memory_type_,
+                  fallback_memory_type_ != UINT32_MAX ? " (device-local, host-visible)" : "");
     }
   }
 
@@ -142,7 +169,20 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
     memory_dedicated_allocate_info.buffer = buffer;
   }
   VkDeviceMemory memory;
-  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) != VK_SUCCESS) {
+  VkResult allocate_result = dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory);
+  if (allocate_result != VK_SUCCESS && fallback_memory_type_ != UINT32_MAX) {
+    // FH1 (#858): the preferred (video) memory is full; this and the later pages in the usual
+    // type. The pages already made stay where they are (both types are host-coherent).
+    REXLOG_WARN(
+        "Vulkan upload buffer: {} bytes could not be allocated in memory type {}, using type {} "
+        "from now on",
+        allocation_size_, memory_type_, fallback_memory_type_);
+    memory_type_ = fallback_memory_type_;
+    fallback_memory_type_ = UINT32_MAX;
+    memory_allocate_info.memoryTypeIndex = memory_type_;
+    allocate_result = dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory);
+  }
+  if (allocate_result != VK_SUCCESS) {
     REXLOG_ERROR("Failed to allocate {} bytes of Vulkan upload buffer memory", allocation_size_);
     dfn.vkDestroyBuffer(device, buffer, nullptr);
     return nullptr;

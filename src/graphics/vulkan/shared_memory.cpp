@@ -26,6 +26,7 @@
 #include <rex/ui/vulkan/util.h>
 
 #include "fh1_device_memory.h"
+#include "fh1_upload_stats.h"
 
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
@@ -167,8 +168,9 @@ bool VulkanSharedMemory::Initialize() {
 
   upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-      rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize, size_t(1)
-                                                                           << page_size_log2()));
+      rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize,
+                 size_t(1) << page_size_log2()),
+      fh1_device_memory::Get().upload_types());
 
   return true;
 }
@@ -334,6 +336,7 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      fh1_upload_stats::Add(fh1_upload_stats::Kind::kGuestMemory, upload_buffer_size);
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);

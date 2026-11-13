@@ -252,4 +252,35 @@ inline Order Choose(const Layout& l, uint32_t allowed, uint32_t fitting_heaps) {
   return o;
 }
 
+// FH1 (#858): the memory types the upload rings (the constant buffers, the converted index
+// buffers and the guest memory uploads' staging) may use in device-local memory the CPU writes
+// directly: on a discrete GPU, host-visible, host-coherent, not host-cached device-local types
+// on a heap of at least kLargeHostVisibleHeap. With Resizable BAR (Smart Access Memory) the
+// driver offers such a type on the whole video memory heap (RADV, NVIDIA, AMD's Windows driver).
+// Without it the CPU sees a 256 MB window of video memory, which the driver and other programs
+// share: then 0, and the rings stay in system memory. Coherent only: a ring that falls back to
+// system memory after a failed allocation keeps its earlier pages, which are never flushed.
+constexpr uint64_t kLargeHostVisibleHeap = uint64_t(1) << 30;
+
+inline uint32_t DeviceLocalUploadTypes(const MemoryInfo& m) {
+  if (m.device_type != kDeviceTypeDiscrete) return 0;
+  const uint32_t heap_count = m.heap_count < kMaxHeaps ? m.heap_count : kMaxHeaps;
+  const uint32_t type_count = m.type_count < kMaxTypes ? m.type_count : kMaxTypes;
+  constexpr uint32_t kWanted = kPropertyDeviceLocal | kPropertyHostVisible | kPropertyHostCoherent;
+  uint32_t types = 0;
+  for (uint32_t t = 0; t < type_count; ++t) {
+    const uint32_t flags = m.type_flags[t];
+    if ((flags & kWanted) != kWanted || (flags & (kPropertyHostCached | kPropertySpecial))) {
+      continue;
+    }
+    const uint32_t h = m.type_heap[t];
+    if (h >= heap_count || !(m.heap_flags[h] & kHeapDeviceLocal) ||
+        m.heap_size[h] < kLargeHostVisibleHeap) {
+      continue;
+    }
+    types |= uint32_t(1) << t;
+  }
+  return types;
+}
+
 }  // namespace rex::graphics::vulkan::fh1_memory_placement
