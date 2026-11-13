@@ -64,6 +64,12 @@ REXCVAR_DEFINE_BOOL(vulkan_transfer_stencil_bit_mask, true, "GPU/Vulkan",
                     "Without VK_EXT_shader_stencil_export (NVIDIA), render target transfers copy "
                     "the stencil in one full-size draw per bit: with conditional rendering, only "
                     "the draws of the bits set in the source run");
+REXCVAR_DEFINE_BOOL(vulkan_transfer_stencil_bit_per_pixel, true, "GPU/Vulkan",
+                    "Without VK_EXT_shader_stencil_export (NVIDIA), the stencil bit draws of "
+                    "render target transfers to multisampled targets run once per pixel and write "
+                    "the samples whose bit is set through the sample mask, instead of once per "
+                    "sample (sample-rate shading)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -411,6 +417,13 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   } else {
     msaa_2x_attachments_supported_ = false;
     msaa_2x_no_attachments_supported_ = false;
+  }
+  // FH1 (#640): the stencil bit transfer draws to multisampled targets once per
+  // pixel, through the sample mask (it replaces the sample-rate shading path).
+  fh1_stencil_bit_per_pixel_ =
+      REXCVAR_GET(vulkan_transfer_stencil_bit_per_pixel) && device_properties.sampleRateShading;
+  if (fh1_stencil_bit_per_pixel_) {
+    REXGPU_INFO("VulkanRenderTargetCache: stencil bit transfers to multisampled targets per pixel");
   }
   bool integer_transfer_sample_1x_supported =
       (device_properties.framebufferColorSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0 &&
@@ -2959,7 +2972,20 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   main_interface.push_back(input_fragment_coord);
   spv::Id input_sample_id = spv::NoResult;
   spv::Id spec_const_sample_id = spv::NoResult;
-  if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
+  // FH1 (#640): a stencil bit to a multisampled target, once per pixel: the
+  // samples are walked in a loop and those whose bit is set are written through
+  // the sample mask, instead of one invocation per sample.
+  bool stencil_bit_per_pixel = mode.output == TransferOutput::kStencilBit &&
+                               key.dest_msaa_samples != xenos::MsaaSamples::k1X &&
+                               fh1_stencil_bit_per_pixel_;
+  spv::Id output_sample_mask = spv::NoResult;
+  if (stencil_bit_per_pixel) {
+    output_sample_mask = builder.createVariable(
+        spv::NoPrecision, spv::StorageClassOutput,
+        builder.makeArrayType(type_int, builder.makeUintConstant(1), 0), "gl_SampleMask");
+    builder.addDecoration(output_sample_mask, spv::DecorationBuiltIn, spv::BuiltInSampleMask);
+    main_interface.push_back(output_sample_mask);
+  } else if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
     if (device_properties.sampleRateShading) {
       // One draw for all samples.
       builder.addCapability(spv::CapabilitySampleRateShading);
@@ -3041,7 +3067,37 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
 
   // Load the destination sample index.
   spv::Id dest_sample_id = spv::NoResult;
-  if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
+  spv::Id per_pixel_sample_index_var = spv::NoResult;
+  spv::Id per_pixel_sample_mask_var = spv::NoResult;
+  spv::Block* per_pixel_loop_header = nullptr;
+  spv::Block* per_pixel_loop_continue = nullptr;
+  spv::Block* per_pixel_loop_merge = nullptr;
+  if (stencil_bit_per_pixel) {
+    // for (index = 0; index < samples; ++index), the body being the rest of the
+    // shader up to the stencil bit test.
+    per_pixel_sample_index_var = builder.createVariable(spv::NoPrecision, spv::StorageClassFunction,
+                                                        type_uint, "xe_transfer_sample_index");
+    per_pixel_sample_mask_var = builder.createVariable(spv::NoPrecision, spv::StorageClassFunction,
+                                                       type_uint, "xe_transfer_sample_mask");
+    builder.createStore(builder.makeUintConstant(0), per_pixel_sample_index_var);
+    builder.createStore(builder.makeUintConstant(0), per_pixel_sample_mask_var);
+    per_pixel_loop_header = &builder.makeNewBlock();
+    spv::Block& per_pixel_loop_body = builder.makeNewBlock();
+    per_pixel_loop_continue = new spv::Block(builder.getUniqueId(), *main_function);
+    per_pixel_loop_merge = new spv::Block(builder.getUniqueId(), *main_function);
+    builder.createBranch(per_pixel_loop_header);
+    builder.setBuildPoint(per_pixel_loop_header);
+    builder.createLoopMerge(per_pixel_loop_merge, per_pixel_loop_continue,
+                            spv::LoopControlUnrollMask, std::vector<unsigned int>());
+    builder.createBranch(&per_pixel_loop_body);
+    builder.setBuildPoint(&per_pixel_loop_body);
+    dest_sample_id = builder.createLoad(per_pixel_sample_index_var, spv::NoPrecision);
+    if (key.dest_msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
+      // 2x as samples 0 and 3 of 4x.
+      dest_sample_id =
+          builder.createBinOp(spv::OpIMul, type_uint, dest_sample_id, builder.makeUintConstant(3));
+    }
+  } else if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
     if (device_properties.sampleRateShading) {
       assert_true(input_sample_id != spv::NoResult);
       dest_sample_id = builder.createUnaryOp(spv::OpBitcast, type_uint,
@@ -4627,7 +4683,64 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
         }
       } break;
       case TransferOutput::kStencilBit: {
-        if (packed) {
+        if (stencil_bit_per_pixel) {
+          // Add this sample to the mask if its bit is set, go to the next
+          // sample, and after the last one write the samples of the mask (none:
+          // kill the pixel).
+          assert_true(push_constants_member_stencil_mask != UINT32_MAX);
+          spv::Id bit_set = builder.makeBoolConstant(true);
+          if (packed) {
+            id_vector_temp.clear();
+            id_vector_temp.push_back(
+                builder.makeIntConstant(int32_t(push_constants_member_stencil_mask)));
+            spv::Id stencil_mask_constant =
+                builder.createLoad(builder.createAccessChain(spv::StorageClassPushConstant,
+                                                             push_constants, id_vector_temp),
+                                   spv::NoPrecision);
+            bit_set = builder.createBinOp(
+                spv::OpINotEqual, type_bool,
+                builder.createBinOp(spv::OpBitwiseAnd, type_uint, packed, stencil_mask_constant),
+                builder.makeUintConstant(0));
+          }
+          builder.createStore(
+              builder.createBinOp(
+                  spv::OpBitwiseOr, type_uint,
+                  builder.createLoad(per_pixel_sample_mask_var, spv::NoPrecision),
+                  builder.createTriOp(
+                      spv::OpSelect, type_uint, bit_set,
+                      builder.createBinOp(spv::OpShiftLeftLogical, type_uint,
+                                          builder.makeUintConstant(1), dest_sample_id),
+                      builder.makeUintConstant(0))),
+              per_pixel_sample_mask_var);
+          builder.createBranch(per_pixel_loop_continue);
+          main_function->addBlock(per_pixel_loop_continue);
+          builder.setBuildPoint(per_pixel_loop_continue);
+          spv::Id next_sample_index =
+              builder.createBinOp(spv::OpIAdd, type_uint,
+                                  builder.createLoad(per_pixel_sample_index_var, spv::NoPrecision),
+                                  builder.makeUintConstant(1));
+          builder.createStore(next_sample_index, per_pixel_sample_index_var);
+          builder.createConditionalBranch(
+              builder.createBinOp(
+                  spv::OpULessThan, type_bool, next_sample_index,
+                  builder.makeUintConstant(uint32_t(1) << uint32_t(key.dest_msaa_samples))),
+              per_pixel_loop_header, per_pixel_loop_merge);
+          main_function->addBlock(per_pixel_loop_merge);
+          builder.setBuildPoint(per_pixel_loop_merge);
+          spv::Id sample_mask = builder.createLoad(per_pixel_sample_mask_var, spv::NoPrecision);
+          SpirvBuilder::IfBuilder stencil_kill_if(
+              builder.createBinOp(spv::OpIEqual, type_bool, sample_mask,
+                                  builder.makeUintConstant(0)),
+              spv::SelectionControlMaskNone, builder);
+          builder.createNoResultOp(spv::OpKill);
+          // OpKill terminates the block.
+          stencil_kill_if.makeEndIf(false);
+          id_vector_temp.clear();
+          id_vector_temp.push_back(builder.makeIntConstant(0));
+          builder.createStore(builder.createUnaryOp(spv::OpBitcast, type_int, sample_mask),
+                              builder.createAccessChain(spv::StorageClassOutput, output_sample_mask,
+                                                        id_vector_temp));
+        } else if (packed) {
           // Kill the sample if the needed stencil bit is not set.
           assert_true(push_constants_member_stencil_mask != UINT32_MAX);
           id_vector_temp.clear();
@@ -4801,10 +4914,14 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
       (dest_sample_count == 2 && !msaa_2x_attachments_supported_)
           ? VK_SAMPLE_COUNT_4_BIT
           : VkSampleCountFlagBits(dest_sample_count);
+  // FH1 (#640): the per-pixel stencil bit shader writes its samples through the
+  // sample mask (GetTransferShader).
+  bool stencil_bit_per_pixel = mode.output == TransferOutput::kStencilBit &&
+                               dest_sample_count > 1 && fh1_stencil_bit_per_pixel_;
   if (dest_sample_count > 1) {
     if (device_properties.sampleRateShading) {
-      multisample_state.sampleShadingEnable = VK_TRUE;
-      multisample_state.minSampleShading = 1.0f;
+      multisample_state.sampleShadingEnable = stencil_bit_per_pixel ? VK_FALSE : VK_TRUE;
+      multisample_state.minSampleShading = stencil_bit_per_pixel ? 0.0f : 1.0f;
       if (dest_sample_count == 2 && !msaa_2x_attachments_supported_) {
         // Emulating 2x MSAA as samples 0 and 3 of 4x MSAA when 2x is not
         // supported.

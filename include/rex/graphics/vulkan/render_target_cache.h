@@ -895,6 +895,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool depth_float24_convert_in_pixel_shader_ = false;
 
   bool msaa_2x_attachments_supported_ = false;
+  // FH1 (#640): vulkan_transfer_stencil_bit_per_pixel, with sample-rate
+  // shading supported (the path it replaces).
+  bool fh1_stencil_bit_per_pixel_ = false;
   bool msaa_2x_no_attachments_supported_ = false;
   bool color_16bit_transfer_uint_formats_supported_ = true;
   bool color_32bit_transfer_uint_formats_supported_ = true;
