@@ -21,6 +21,9 @@
 #include <rex/logging.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "fh1_device_memory.h"
+#include "fh1_upload_stats.h"
+
 REXCVAR_DEFINE_BOOL(vulkan_force_expand_point_sprites_in_vs, false, "GPU/Vulkan",
                     "Force Vulkan point sprite expansion in the vertex shader, even when geometry "
                     "shaders are available")
@@ -72,7 +75,8 @@ bool VulkanPrimitiveProcessor::Initialize() {
   frame_index_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
       std::max(size_t(kMinRequiredConvertedIndexBufferSize),
-               ui::GraphicsUploadBufferPool::kDefaultPageSize));
+               ui::GraphicsUploadBufferPool::kDefaultPageSize),
+      fh1_device_memory::Get().upload_types());
   return true;
 }
 
@@ -221,6 +225,7 @@ void* VulkanPrimitiveProcessor::RequestHostConvertedIndexBufferForCurrentFrame(
   if (!mapping) {
     return nullptr;
   }
+  fh1_upload_stats::Add(fh1_upload_stats::Kind::kConvertedIndices, index_size * index_count);
   if (coalign_for_simd) {
     ptrdiff_t coalignment_offset = GetSimdCoalignmentOffset(mapping, coalignment_original_address);
     mapping += coalignment_offset;

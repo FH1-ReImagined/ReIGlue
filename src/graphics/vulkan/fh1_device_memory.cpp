@@ -2,9 +2,11 @@
 // See fh1_device_memory.h and fh1_memory_placement.h.
 
 #include "fh1_device_memory.h"
+#include "fh1_upload_stats.h"
 
 #include <algorithm>
 #include <chrono>
+#include <iterator>
 #include <string>
 
 #include <rex/cvar.h>
@@ -42,6 +44,13 @@ REXCVAR_DEFINE_UINT32(vulkan_device_local_budget_mb, 0, "GPU/Vulkan",
                       "driver's budget)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
     .debug_only();
+
+REXCVAR_DEFINE_BOOL(vulkan_rebar_uploads, false, "GPU/Vulkan",
+                    "Put the per-frame upload rings (constant buffers, converted index buffers, "
+                    "guest memory upload staging) in video memory the CPU writes directly when a "
+                    "discrete GPU offers a large heap of it (Resizable BAR / Smart Access Memory "
+                    "on); without one they stay in system memory. Readbacks never go there")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan::fh1_device_memory {
 
@@ -135,6 +144,8 @@ void State::Initialize(const ui::vulkan::VulkanDevice* device) {
   }
   layout_ = placement::Describe(info);
   cap_mb_ = REXCVAR_GET(vulkan_device_local_budget_mb);
+  const uint32_t rebar_types = placement::DeviceLocalUploadTypes(info);
+  upload_types_ = REXCVAR_GET(vulkan_rebar_uploads) ? rebar_types : 0;
 
   std::string heaps;
   for (uint32_t i = 0; i < info.heap_count; ++i) {
@@ -170,6 +181,25 @@ void State::Initialize(const ui::vulkan::VulkanDevice* device) {
   } else {
     REXGPU_INFO("Vulkan memory heaps: {}; {}: GPU memory stays device-local", heaps,
                 device_kind);
+  }
+  // FH1 (#858): where the upload rings go.
+  uint32_t rebar_type = placement::LowestType(rebar_types);
+  if (rebar_type == UINT32_MAX) {
+    REXGPU_INFO(
+        "Vulkan uploads: in system memory (no host-visible device-local heap of {} MB or more on "
+        "this {}: Resizable BAR off or not supported)",
+        Mb(placement::kLargeHostVisibleHeap), device_kind);
+  } else if (!upload_types_) {
+    REXGPU_INFO(
+        "Vulkan uploads: in system memory (vulkan_rebar_uploads off; memory type {} on heap {}, "
+        "{} MB, is host-visible device-local)",
+        rebar_type, info.type_heap[rebar_type], Mb(info.heap_size[info.type_heap[rebar_type]]));
+  } else {
+    REXGPU_INFO(
+        "Vulkan uploads: constants, converted indices and guest memory staging in host-visible "
+        "device-local memory (Resizable BAR): memory type {} on heap {}, {} MB "
+        "(vulkan_rebar_uploads)",
+        rebar_type, info.type_heap[rebar_type], Mb(info.heap_size[info.type_heap[rebar_type]]));
   }
   Refresh();
   next_summary_time = std::chrono::steady_clock::now() + kSummaryInterval;
@@ -237,7 +267,47 @@ State::Budget State::Estimate() {
   return b;
 }
 
+// FH1 (#858): the upload rings' bytes by kind, a frame on average since the last line (log:
+// false only takes the counts, at the first frame end).
+void State::LogUploads(bool log) {
+  namespace stats = fh1_upload_stats;
+  stats::Stats& u = stats::Get();
+  static const char* const kNames[] = {"system constants", "vertex float constants",
+                                       "pixel float constants", "bool/loop constants",
+                                       "fetch constants", "converted indices",
+                                       "guest memory"};
+  static_assert(std::size(kNames) == size_t(stats::Kind::kCount));
+  const double frames = double(std::max<uint64_t>(upload_frames_, 1));
+  uint64_t total = 0;
+  std::string kinds;
+  for (size_t i = 0; i < size_t(stats::Kind::kCount); ++i) {
+    const uint64_t bytes = u.bytes[i].load(std::memory_order_relaxed);
+    const uint64_t writes = u.writes[i].load(std::memory_order_relaxed);
+    const uint64_t new_bytes = bytes - upload_bytes_logged_[i];
+    const uint64_t new_writes = writes - upload_writes_logged_[i];
+    upload_bytes_logged_[i] = bytes;
+    upload_writes_logged_[i] = writes;
+    total += new_bytes;
+    kinds += fmt::format("{}{} {:.1f} KB in {:.0f}", kinds.empty() ? "" : ", ", kNames[i],
+                         double(new_bytes) / frames / 1024.0, double(new_writes) / frames);
+  }
+  if (log) {
+    REXGPU_INFO("Vulkan uploads a frame ({} frames, {}): {:.1f} KB: {}", upload_frames_,
+                upload_types_ ? "host-visible device-local memory" : "system memory",
+                double(total) / frames / 1024.0, kinds);
+  }
+  upload_frames_ = 0;
+}
+
 void State::EndFrame() {
+  ++upload_frames_;
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_upload_log_) {
+      LogUploads(upload_frames_ > 1);
+      next_upload_log_ = now + kSummaryInterval;
+    }
+  }
   const bool is_active = active();
   bool failures_pending = false;
   for (const Counter& counter : counters_) {

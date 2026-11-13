@@ -19,8 +19,12 @@ namespace vulkan {
 
 class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
  public:
+  // preferred_memory_types (FH1 #858): memory types tried before the usual host-visible
+  // choice (device-local ones the CPU writes directly, with Resizable BAR); 0 for the usual
+  // choice only. They must be host-coherent: when a page cannot be allocated in them, the pool
+  // goes on in the usual type, and its earlier pages are not flushed.
   VulkanUploadBufferPool(const VulkanDevice* vulkan_device, VkBufferUsageFlags usage,
-                         size_t page_size = kDefaultPageSize);
+                         size_t page_size = kDefaultPageSize, uint32_t preferred_memory_types = 0);
 
   uint8_t* Request(uint64_t submission_index, size_t size, size_t alignment, VkBuffer& buffer_out,
                    VkDeviceSize& offset_out);
@@ -51,8 +55,12 @@ class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
   static constexpr uint32_t kMemoryTypeUnknown = UINT32_MAX;
   static constexpr uint32_t kMemoryTypeUnavailable = kMemoryTypeUnknown - 1;
   uint32_t memory_type_ = UINT32_MAX;
+  // FH1 (#858): the usual host-visible type when memory_type_ is a preferred one (the fallback
+  // when a page cannot be allocated there), else UINT32_MAX.
+  uint32_t fallback_memory_type_ = UINT32_MAX;
 
   VkBufferUsageFlags usage_;
+  uint32_t preferred_memory_types_;
 };
 
 }  // namespace vulkan
