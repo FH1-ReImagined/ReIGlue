@@ -808,6 +808,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t fh1_scene_base_ = UINT32_MAX;
   VkPipeline fh1_resolve_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout fh1_resolve_layout_ = VK_NULL_HANDLE;
+  // 1000 (#879): a resolve drawn on the fractional raster is copied back to guest memory from
+  // the raster's part of its scaled copy (fh1_screen_raster.h, FractionalReadback).
+  VkPipeline fh1_raster_readback_pipeline_ = VK_NULL_HANDLE;
+  VkPipelineLayout fh1_raster_readback_layout_ = VK_NULL_HANDLE;
+  bool fh1_raster_readback_failed_ = false;
+  uint64_t fh1_raster_readbacks_ = 0;
+  bool Fh1RasterReadback(VkDescriptorSet descriptor_set, uint32_t tile_count,
+                         uint32_t source_offset_bytes, uint32_t written_address,
+                         uint32_t written_length);
   bool Fh1SynchronizeResolve(uint32_t address, uint32_t length);
   void Fh1NoteResolve(uint32_t address, uint32_t length);
   // FH1 (#380): ambient occlusion in the world's sun shadow mask (fh1_world_ao.cpp).

@@ -1347,6 +1347,42 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     }
   }
 
+  // #879: a whole picture drawn on the fractional raster fills only the raster's part of the
+  // scaled copy. Noted for the copy to guest memory, which takes that part. A whole picture:
+  // the color target the last draw rendered to, copied from its origin to the texture's, and
+  // the copy holds all of that draw's viewport (a predicated tiling tile's view and a view of
+  // which only a corner is copied are larger than their copy: those keep the ordinary copy).
+  fh1_fractional_readback_ = {};
+  const uint32_t fh1_copy_width = uint32_t(resolve_info.coordinate_info.width_div_8)
+                                  << xenos::kResolveAlignmentPixelsLog2;
+  const uint32_t fh1_copy_height = resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
+  // A tile that 0490 moved above.
+  const bool fh1_tile_moved =
+      copy_info.copy_dest_base != resolve_info.copy_dest_base ||
+      copy_info.copy_dest_coordinate_info.packed != resolve_info.copy_dest_coordinate_info.packed ||
+      copy_info.coordinate_info.packed != resolve_info.coordinate_info.packed ||
+      copy_info.height_div_8 != resolve_info.height_div_8;
+  if (fh1_last_draw_fractional_ && !fh1_tile_moved && draw_resolution_scaled &&
+      fh1_last_draw_viewport_right_ <= fh1_copy_width &&
+      fh1_last_draw_viewport_bottom_ <= fh1_copy_height && !resolve_info.IsCopyingDepth() &&
+      resolve_info.copy_dest_extent_length &&
+      resolve_info.copy_dest_extent_start == resolve_info.copy_dest_base &&
+      !resolve_info.copy_dest_coordinate_info.offset_x_div_8 &&
+      !resolve_info.copy_dest_coordinate_info.offset_y_div_8 &&
+      !resolve_info.coordinate_info.edram_offset_x_div_8 &&
+      !resolve_info.coordinate_info.edram_offset_y_div_8 &&
+      resolve_info.color_edram_info.base_tiles ==
+          (resolve_info.color_original_base & ((UINT32_C(1) << xenos::kEdramBaseTilesBits) - 1)) &&
+      !resolve_info.copy_dest_info.copy_dest_array &&
+      fh1_last_draw_surface_info_ == register_file()[XE_GPU_REG_RB_SURFACE_INFO] &&
+      fh1_last_draw_color_bases_[resolve_info.rb_copy_control.copy_src_select] ==
+          resolve_info.color_original_base) {
+    fh1::GetFractionalReadback(fh1_copy_width, fh1_copy_height, draw_resolution_scale_x(),
+                               draw_resolution_scale_y(), raster_scale_x_, raster_scale_y_,
+                               resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32,
+                               fh1_fractional_readback_);
+  }
+
   // Copying.
   bool copied = false;
   if (copy_info.copy_dest_extent_length) {
