@@ -81,4 +81,61 @@ constexpr bool GetFractionalTileResolve(int window_x_offset, int window_y_offset
   out.height = shrink(height, scale_y);
   return true;
 }
+
+// A resolve drawn on the fractional raster, copied back to guest memory (#879). The HUD's
+// shaders read every screen texture at 0.75 of its coordinates, so in the scaled resolve a
+// picture drawn there fills the top-left 0.75. The CPU reads guest memory as it is: a Big
+// Shot's tile, a replay movie's frame, a photo and its thumbnail were copied back from the whole
+// scaled surface, one host pixel a block, and came out at three quarters of their size in the
+// top left, the rest black. Such a copy takes the raster's part: each guest pixel is the
+// average of the host pixels it covers there. Only a whole picture (the copy starts at the
+// surface's and at the texture's origin); a predicated tiling tile keeps the copy it had.
+struct FractionalReadback {
+  unsigned width = 0, height = 0;                // the copy, in guest pixels
+  unsigned raster_width = 0, raster_height = 0;  // the scaled copy's host pixels with the picture
+  unsigned pitch_tiles = 0;                      // the texture's pitch in 32-pixel tiles
+  constexpr bool valid() const { return width != 0; }
+};
+// False when the raster fills the scaled surface (1440p, 4K), for an empty copy, or when the
+// picture's part is not a whole number of host pixels.
+constexpr bool GetFractionalReadback(unsigned width, unsigned height, unsigned backing_x,
+                                     unsigned backing_y, float scale_x, float scale_y,
+                                     unsigned pitch_tiles, FractionalReadback& out) {
+  if (!width || !height || !backing_x || !backing_y || !pitch_tiles ||
+      !(scale_x > 0.0f && scale_x <= 1.0f && scale_y > 0.0f && scale_y <= 1.0f) ||
+      (scale_x == 1.0f && scale_y == 1.0f) || width > pitch_tiles * 32)
+    return false;
+  const float raster_x = float(width * backing_x) * scale_x;
+  const float raster_y = float(height * backing_y) * scale_y;
+  const unsigned raster_width = unsigned(raster_x), raster_height = unsigned(raster_y);
+  if (float(raster_width) != raster_x || float(raster_height) != raster_y || !raster_width ||
+      !raster_height)
+    return false;
+  out.width = width;
+  out.height = height;
+  out.raster_width = raster_width;
+  out.raster_height = raster_height;
+  out.pitch_tiles = pitch_tiles;
+  return true;
+}
+// The host pixels one guest pixel covers along an axis where `size` guest pixels take `raster`
+// host pixels: the first one, and each one's share of the guest pixel (they add up to 1). At
+// most four, for a backing scale up to 3. The copy's shader does the same sums.
+struct RasterTaps {
+  unsigned first = 0;
+  float weights[4] = {};
+};
+constexpr RasterTaps GetRasterTaps(unsigned guest, unsigned size, unsigned raster) {
+  RasterTaps taps;
+  const float ratio = float(raster) / float(size);
+  const float low = float(guest) * ratio, high = low + ratio;
+  taps.first = unsigned(low);
+  for (unsigned i = 0; i < 4; ++i) {
+    const float pixel = float(taps.first + i);
+    const float from = low > pixel ? low : pixel;
+    const float to = high < pixel + 1.0f ? high : pixel + 1.0f;
+    taps.weights[i] = to > from ? (to - from) / ratio : 0.0f;
+  }
+  return taps;
+}
 }  // namespace rex::graphics::vulkan::fh1
