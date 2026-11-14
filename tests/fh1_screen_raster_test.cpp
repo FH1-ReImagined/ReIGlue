@@ -63,6 +63,40 @@ int main() {
   check(!GetFractionalTileResolve(0, 256, 0.75f, 0.75f, 1280, 256, tile));
   check(!GetFractionalTileResolve(0, -256, 0.75f, 0.75f, 1280, 0, tile));
   check(!GetFractionalTileResolve(0, -256, 1.5f, 0.75f, 1280, 256, tile));
+  // 0900 (FH1 #827): the scene tiles' place in the frame for the marked FM4 shadow fetch. The
+  // frame's viewport (scale 640, -360; offset 640, 360) starts in the target: no offset.
+  check(TileFrameOrigin(true, 640.0f, 640.0f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, 0, 2.0f) == 0.0f);
+  // The second and third tiles, moved up by the window offset: 256 and 512 rows, in host
+  // pixels at render scale 1, at render scale 2 and on the 1080p raster (0.75 of scale 2).
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -256, 1.0f) == 256.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -512, 1.0f) == 512.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -256, 2.0f) == 512.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -512, 2.0f) == 1024.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -256, 1.5f) == 384.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -512, 1.5f) == 768.0f);
+  // The same tiles moved by the viewport's own offset, either scale sign, columns too.
+  check(TileFrameOrigin(true, -360.0f, 104.0f, 0, 1.0f) == 256.0f);
+  check(TileFrameOrigin(true, 360.0f, -152.0f, 0, 1.0f) == 512.0f);
+  check(TileFrameOrigin(true, 640.0f, 0.0f, 0, 1.0f) == 640.0f);
+  check(TileFrameOrigin(true, 640.0f, 640.0f, -640, 2.0f) == 1280.0f);
+  // A half-pixel offset is not a tile, and a tile with one is still 256 rows up.
+  check(TileFrameOrigin(true, -360.0f, 359.5f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.5f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.5f, -256, 1.0f) == 256.0f);
+  // No offset: a viewport inside the target (a small view further down), a disabled axis, a
+  // value no frame has.
+  check(TileFrameOrigin(true, -64.0f, 400.0f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, 256, 1.0f) == 0.0f);
+  check(TileFrameOrigin(false, -360.0f, 360.0f, -256, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -8192, 1.0f) == 8192.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -8193, 1.0f) == 0.0f);
+  {
+    const float zero = 0.0f, not_a_number = zero / zero;
+    check(TileFrameOrigin(true, not_a_number, 360.0f, -256, 1.0f) == 0.0f);
+    check(TileFrameOrigin(true, -360.0f, not_a_number, -256, 1.0f) == 0.0f);
+  }
   std::printf("FH1 instrument/native raster policy: %u failures\n", failures);
   return failures ? 1 : 0;
 }

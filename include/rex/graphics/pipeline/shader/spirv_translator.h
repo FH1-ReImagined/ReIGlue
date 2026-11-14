@@ -329,9 +329,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // Patch 0396: VR true stereo: subtracted from the guest's clip-space position (the eye's
     // offset for the main view's 3D draws; zero for every other draw).
     float fh1_vr_eye[4];
+    // 0900 (FH1 #827): XY: how far the guest viewport starts before the render target's first
+    // pixel, in host pixels (the tile's place in the frame: FH1 draws its 4x MSAA scene in
+    // three tiles of rows, each at the top of the same target; zero for a viewport that starts
+    // in the target). Added to the pixel's position by a marked FM4 shadow fetch
+    // (Fh1Fm4ShadowFetch). ZW: not used.
+    float fh1_fm4_frame_origin[4];
   };
   static_assert(offsetof(SystemConstants, fh1_native) % 16 == 0);
   static_assert(offsetof(SystemConstants, fh1_vr_eye) % 16 == 0);
+  static_assert(offsetof(SystemConstants, fh1_fm4_frame_origin) % 16 == 0);
 
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
@@ -939,6 +946,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantFh1NativeTextures,
     kSystemConstantFh1FullRasterTextures,
     kSystemConstantFh1VrEye,
+    kSystemConstantFh1Fm4FrameOrigin,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
