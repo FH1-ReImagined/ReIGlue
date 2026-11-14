@@ -11049,6 +11049,40 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     dirty |= system_constants_.fh1_vr_eye[i] != fh1_stereo_draw_eye_[i];
     system_constants_.fh1_vr_eye[i] = fh1_stereo_draw_eye_[i];
   }
+  // 0900 (FH1 #827): the tile's place in the frame, for the marked FM4 shadow fetch
+  // (SpirvShaderTranslator::Fh1Fm4ShadowFetch): how far the guest viewport (with the window
+  // offset, as draw_util::GetHostViewportInfo takes it) starts before the render target's first
+  // pixel, in host pixels as UpdateDynamicState scales the viewport. FH1's scene tiles are the
+  // frame's viewport moved up by 256 and 512 rows; a viewport that starts in the target gives
+  // zero (fh1::TileFrameOrigin).
+  {
+    float frame_origin[2] = {0.0f, 0.0f};
+    if (!pa_cl_clip_cntl.clip_disable) {
+      auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+      const bool window = pa_su_sc_mode_cntl.vtx_window_offset_enable;
+      const bool fractional = render_target_cache_->UsesFractionalRaster();
+      frame_origin[0] = fh1::TileFrameOrigin(
+          pa_cl_vte_cntl.vport_x_scale_ena && pa_cl_vte_cntl.vport_x_offset_ena,
+          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
+          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+          window ? int(pa_sc_window_offset.window_x_offset) : 0,
+          float(draw_resolution_scale_x) *
+              (fractional ? render_target_cache_->raster_scale_x() : 1.0f) *
+              (fh1_screen ? ratios[0] : 1.0f));
+      frame_origin[1] = fh1::TileFrameOrigin(
+          pa_cl_vte_cntl.vport_y_scale_ena && pa_cl_vte_cntl.vport_y_offset_ena,
+          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+          window ? int(pa_sc_window_offset.window_y_offset) : 0,
+          float(draw_resolution_scale_y) *
+              (fractional ? render_target_cache_->raster_scale_y() : 1.0f) *
+              (fh1_screen ? ratios[1] : 1.0f));
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+      dirty |= system_constants_.fh1_fm4_frame_origin[i] != frame_origin[i];
+      system_constants_.fh1_fm4_frame_origin[i] = frame_origin[i];
+    }
+  }
   // Texture signedness / gamma.
   uint32_t textures_resolution_scaled = 0;
   {

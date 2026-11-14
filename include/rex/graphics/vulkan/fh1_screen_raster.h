@@ -82,6 +82,29 @@ constexpr bool GetFractionalTileResolve(int window_x_offset, int window_y_offset
   return true;
 }
 
+// The marked FM4 shadow fetch's frame origin (0900, FH1 #827). FH1 draws its 4x MSAA scene in
+// three tiles of rows (256, 256 and 208 at 720p), each at the top of the same render target
+// with the guest viewport moved up by the rows before it, while the sun's shadow mask covers
+// the whole frame. A shader that reads the mask at its pixel's position in the render target
+// (SpirvShaderTranslator::Fh1Fm4ShadowFetch) therefore needs the tile's place in the frame:
+// how far the guest viewport starts before the target's first pixel on one axis, in host
+// pixels (host_scale: the render scale, times the fractional raster's and the native screen's
+// ratios where the viewport is scaled by them). viewport_scale and viewport_offset are
+// PA_CL_VPORT_*SCALE and *OFFSET, window_offset is PA_SC_WINDOW_OFFSET's when the vertex
+// window offset is enabled, 0 otherwise. Zero for a viewport that starts in the target (the
+// first tile, every untiled pass, also with a half-pixel offset), for a disabled viewport axis,
+// and for a value no frame has (not a number, further out than the largest texture).
+constexpr float TileFrameOrigin(bool axis_enabled, float viewport_scale, float viewport_offset,
+                                int window_offset, float host_scale) {
+  if (!axis_enabled)
+    return 0.0f;
+  const float extent = viewport_scale < 0.0f ? -viewport_scale : viewport_scale;
+  const float before = extent - viewport_offset - float(window_offset);
+  if (!(before > 0.5f && before <= 8192.0f))
+    return 0.0f;
+  return float(int(before + 0.5f)) * host_scale;
+}
+
 // A resolve drawn on the fractional raster, copied back to guest memory (#879). The HUD's
 // shaders read every screen texture at 0.75 of its coordinates, so in the scaled resolve a
 // picture drawn there fills the top-left 0.75. The CPU reads guest memory as it is: a Big
