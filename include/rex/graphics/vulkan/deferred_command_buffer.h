@@ -74,6 +74,32 @@ class DeferredCommandBuffer {
   }
   // Test hook: makes the GPU wait forever (the driver then resets it: a real device loss).
   void CmdFh1TestHang() { WriteCommand(Command::kFh1TestHang, 0); }
+  // FH1 (#913): before a guest draw that had work of its own recorded first (Fh1TakeWork), the
+  // draw's number, written by the GPU to `buffer` (offset 8) once that work has finished
+  // (VK_AMD_buffer_marker only): a device loss then tells the draw from the work before it.
+  void CmdFh1SetupBreadcrumb(uint32_t seq) {
+    auto& args = *reinterpret_cast<ArgsFh1Breadcrumb*>(
+        WriteCommand(Command::kFh1SetupBreadcrumb, sizeof(ArgsFh1Breadcrumb)));
+    args.seq = seq;
+  }
+  // FH1 (#913): the commands written to the main stream since the last call, by kind (counted
+  // only while breadcrumbs are set; the hoisted stream, which runs before the render pass, is
+  // not counted). The device-lost trail keeps them with each draw.
+  struct Fh1Work {
+    uint16_t render_passes = 0;  // vkCmdBeginRenderPass, vkCmdBeginRendering
+    uint16_t draws = 0;          // vkCmdDraw, vkCmdDrawIndexed
+    uint16_t dispatches = 0;
+    uint16_t barriers = 0;
+    uint16_t copies = 0;       // buffer and image copies, blits, fills, image clears
+    uint16_t clears = 0;       // vkCmdClearAttachments
+    uint16_t queries = 0;      // vkCmdBeginQuery
+    uint16_t conditional = 0;  // conditional rendering begins
+  };
+  Fh1Work Fh1TakeWork() {
+    const Fh1Work work = fh1_work_;
+    fh1_work_ = Fh1Work();
+    return work;
+  }
 
   // FH1 (#640): GPU time per kind of work (fh1_gpu_profile.h). The zone is what the commands
   // recorded from now on are for; with a profile, a timestamp goes before the first command
@@ -533,6 +559,7 @@ class DeferredCommandBuffer {
     kFh1FillBuffer,
     kFh1BeginConditionalRendering,
     kFh1EndConditionalRendering,
+    kFh1SetupBreadcrumb,
   };
 
   struct CommandHeader {
@@ -777,6 +804,7 @@ class DeferredCommandBuffer {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  void Fh1CountWork(Command command);
   void Fh1GpuZoneMark();
   VkCommandBuffer ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
                      size_t stream_remaining, const uintmax_t* hoisted_stream,
@@ -790,6 +818,7 @@ class DeferredCommandBuffer {
   std::vector<uintmax_t>* write_stream_ = &command_stream_;
   bool native_upscale_ = false;
   const Fh1Breadcrumbs* fh1_breadcrumbs_ = nullptr;
+  Fh1Work fh1_work_;
   Fh1GpuProfile* fh1_gpu_profile_ = nullptr;
   uint16_t fh1_gpu_zone_ = 0;
   uint16_t fh1_gpu_zone_marked_ = 0;

@@ -102,6 +102,15 @@ REXCVAR_DEFINE_BOOL(shader_prebuild_only, false, "GPU/Vulkan",
                     "Create the stored and prebuild-listed pipelines, save the driver's cache "
                     "and exit before the game starts (the launcher's Prebuild shaders step)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// FH1 (#913): with the breadcrumbs (VK_AMD_buffer_marker), a second marker before a draw that
+// had work of its own recorded first, once that work has finished (fh1_device_lost_trail.h).
+// Off: it costs GPU time on every frame, and only a player whose GPU resets needs it.
+REXCVAR_DEFINE_BOOL(gpu_device_lost_setup_breadcrumbs, false, "GPU/Vulkan",
+                    "With the device-lost breadcrumbs on VK_AMD_buffer_marker, also mark the end "
+                    "of the work recorded before a draw (render passes, render target transfers, "
+                    "texture loads, barriers), so that a device loss says whether the GPU hung "
+                    "in that work or in the draw (costs GPU time: for a GPU that resets)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(fh1_fast_resolve_copy, true, "GPU/Vulkan",
     "Use bit-exact whole-word FH1 cross-scale resolve copies")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -828,6 +837,20 @@ uint64_t TestGpuLossFrame() {
     return value && *value ? uint64_t(std::strtoull(value, nullptr, 10)) : uint64_t(0);
   }();
   return frame;
+}
+
+// FH1 (#913): the command buffer's work counts as the trail keeps them.
+fh1_device_lost_trail::Work Fh1TrailWork(const DeferredCommandBuffer::Fh1Work& w) {
+  fh1_device_lost_trail::Work t;
+  t.render_passes = w.render_passes;
+  t.draws = w.draws;
+  t.dispatches = w.dispatches;
+  t.barriers = w.barriers;
+  t.copies = w.copies;
+  t.clears = w.clears;
+  t.queries = w.queries;
+  t.conditional = w.conditional;
+  return t;
 }
 
 // FH1 (#551): the draws and resolves recorded, and where the GPU writes the last numbers it
@@ -2906,7 +2929,7 @@ void VulkanCommandProcessor::Fh1BreadcrumbsInitialize() {
 }
 
 void VulkanCommandProcessor::Fh1ReportDeviceLost(const char* source) {
-  uint32_t issued = 0, finished = 0;
+  uint32_t issued = 0, finished = 0, setup_finished = 0;
   if (fh1_breadcrumb_values) {
     const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
     if (!(vulkan_device->memory_types().host_coherent & (uint32_t(1) << fh1_breadcrumb_memory_type))) {
@@ -2916,6 +2939,7 @@ void VulkanCommandProcessor::Fh1ReportDeviceLost(const char* source) {
       vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &range);
     }
     finished = fh1_breadcrumb_values[1];  // when issued is not written (its GPU cost)
+    setup_finished = fh1_breadcrumb_values[2];  // FH1 (#913): a draw's work before it
   } else if (fh1_get_queue_checkpoint_data) {
     const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
     auto queue = vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
@@ -2942,6 +2966,10 @@ void VulkanCommandProcessor::Fh1ReportDeviceLost(const char* source) {
     }
   }
   REXGPU_ERROR("{}", fh1_device_lost_trail::Describe(fh1_trail, source, issued, finished));
+  const std::string details =
+      fh1_device_lost_trail::DescribeDetails(fh1_trail, finished, setup_finished);
+  if (!details.empty())
+    REXGPU_ERROR("{}", details);
 }
 
 VkResult VulkanCommandProcessor::ReplayAndSubmit(
@@ -7050,9 +7078,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // Special copy handling.
     const bool copied = IssueCopy();
     if (fh1_breadcrumbs_on && copied && submission_open_) {
+      fh1_device_lost_trail::Details details;
+      details.work = Fh1TrailWork(deferred_command_buffer_.Fh1TakeWork());
+      details.filled = true;
       deferred_command_buffer_.CmdFh1Breadcrumb(
           fh1_trail.Record(fh1_device_lost_trail::Kind::kResolve, GetCurrentSubmission(),
-                           frame_current_, 0, 0, 0));
+                           frame_current_, 0, 0, 0, details));
     }
     return copied;
   }
@@ -7827,6 +7858,23 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  // FH1 (#913): the work recorded for this draw before the draw command (a render pass,
+  // render target transfers, texture loads, barriers), kept in the device-lost trail; when there
+  // was any, a marker the GPU writes once it has finished, so that a loss tells the two apart.
+  fh1_device_lost_trail::Details fh1_details;
+  if (fh1_breadcrumbs_on) {
+    fh1_details.work = Fh1TrailWork(deferred_command_buffer_.Fh1TakeWork());
+    if (fh1_details.work.Any() && fh1_breadcrumbs.write_buffer_marker &&
+        REXCVAR_GET(gpu_device_lost_setup_breadcrumbs)) {
+      deferred_command_buffer_.CmdFh1SetupBreadcrumb(fh1_trail.next());
+      fh1_details.setup_marked = true;
+    }
+    fh1_details.vertex_shader_modification = vertex_shader_modification.value;
+    fh1_details.pixel_shader_modification = pixel_shader ? pixel_shader_modification.value : 0;
+    fh1_details.render_pass_key = render_target_cache_->last_update_render_pass_key().key;
+    fh1_details.filled = true;
+  }
+
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -7867,10 +7915,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   // FH1 (#551): the draw's number, written by the GPU once issued and once finished.
   if (fh1_breadcrumbs_on) {
+    // FH1 (#913): the draw command itself is not work recorded before the next draw.
+    deferred_command_buffer_.Fh1TakeWork();
     deferred_command_buffer_.CmdFh1Breadcrumb(fh1_trail.Record(
         fh1_device_lost_trail::Kind::kDraw, GetCurrentSubmission(), frame_current_,
-        primitive_processing_result.host_draw_vertex_count,
-        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0));
+        primitive_processing_result.host_draw_vertex_count, vertex_shader->ucode_data_hash(),
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0, fh1_details));
   }
 
   // FH1 (#380): after the shadow mask's blur, multiplies the world AO into it.

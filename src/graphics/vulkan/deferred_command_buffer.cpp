@@ -395,6 +395,15 @@ VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buf
         }
       } break;
 
+      case Command::kFh1SetupBreadcrumb: {
+        const auto& args = *reinterpret_cast<const ArgsFh1Breadcrumb*>(stream);
+        const Fh1Breadcrumbs* b = fh1_breadcrumbs_;
+        if (b && b->write_buffer_marker) {
+          b->write_buffer_marker(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b->buffer, 8,
+                                 args.seq);
+        }
+      } break;
+
       case Command::kFh1FillBuffer: {
         const auto& args = *reinterpret_cast<const ArgsFh1FillBuffer*>(stream);
         args.fill(command_buffer, args.buffer, args.offset, args.size, args.data);
@@ -532,9 +541,55 @@ void DeferredCommandBuffer::Fh1GpuZoneMark() {
   fh1_gpu_profile_->Mark(*this, fh1_gpu_zone_);
 }
 
+void DeferredCommandBuffer::Fh1CountWork(Command command) {
+  uint16_t* counter = nullptr;
+  switch (command) {
+    case Command::kVkBeginRenderPass:
+    case Command::kVkBeginRendering:
+      counter = &fh1_work_.render_passes;
+      break;
+    case Command::kVkDraw:
+    case Command::kVkDrawIndexed:
+      counter = &fh1_work_.draws;
+      break;
+    case Command::kVkDispatch:
+      counter = &fh1_work_.dispatches;
+      break;
+    case Command::kVkPipelineBarrier:
+      counter = &fh1_work_.barriers;
+      break;
+    case Command::kVkCopyBuffer:
+    case Command::kVkCopyBufferToImage:
+    case Command::kVkCopyQueryPoolResults:
+    case Command::kVkBlitImage:
+    case Command::kFh1NativeCubeBlit:
+    case Command::kVkClearColorImage:
+    case Command::kFh1FillBuffer:
+      counter = &fh1_work_.copies;
+      break;
+    case Command::kVkClearAttachments:
+      counter = &fh1_work_.clears;
+      break;
+    case Command::kVkBeginQuery:
+      counter = &fh1_work_.queries;
+      break;
+    case Command::kFh1BeginConditionalRendering:
+      counter = &fh1_work_.conditional;
+      break;
+    default:
+      return;
+  }
+  if (*counter != UINT16_MAX)
+    ++*counter;
+}
+
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
   if (fh1_gpu_zone_pending_ && write_stream_ == &command_stream_) {
     Fh1GpuZoneMark();
+  }
+  // FH1 (#913): the work recorded for the next draw, for the device-lost trail.
+  if (fh1_breadcrumbs_ && write_stream_ == &command_stream_) {
+    Fh1CountWork(command);
   }
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
