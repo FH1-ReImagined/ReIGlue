@@ -420,9 +420,10 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   }
   // FH1 (#640): the stencil bit transfer draws to multisampled targets once per
   // pixel, through the sample mask (it replaces the sample-rate shading path).
+  // With stencil export there are no stencil bit draws, so it is not logged.
   fh1_stencil_bit_per_pixel_ =
       REXCVAR_GET(vulkan_transfer_stencil_bit_per_pixel) && device_properties.sampleRateShading;
-  if (fh1_stencil_bit_per_pixel_) {
+  if (fh1_stencil_bit_per_pixel_ && !vulkan_device->extensions().ext_EXT_shader_stencil_export) {
     REXGPU_INFO("VulkanRenderTargetCache: stencil bit transfers to multisampled targets per pixel");
   }
   bool integer_transfer_sample_1x_supported =
