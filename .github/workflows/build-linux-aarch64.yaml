@@ -121,6 +121,14 @@ jobs:
           ctest --test-dir out/build/linux-arm64 -C Release --output-on-failure --parallel 2
           -E "^unit\.(calendar (decomposition: NT epoch|recomposition: known dates|recomposition: decompose then recompose)|from_sys then to_sys round-trips)"
 
+      # FH1's study traces (0570 the PM4 trace, 0640 the list trace) are off in every build above
+      # and for players. Compile the plugin once more with both on, after the tests, so their code
+      # keeps building: the same tree reconfigured, only rexgpu-xenos is rebuilt and linked.
+      - name: Build the FH1 study traces (options on)
+        run: |
+          cmake -S . -B out/build/linux-arm64 -DREXGLUE_FH1_PM4_TRACE=ON -DREXGLUE_FH1_LIST_TRACE=ON
+          cmake --build out/build/linux-arm64 --config Release --target rexgpu-xenos --parallel
+
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
