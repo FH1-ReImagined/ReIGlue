@@ -15,7 +15,10 @@
 // first (a new render pass, render target transfers, texture loads, barriers). Each entry now
 // keeps that work as counted while it was recorded, the draw's shader modifications and render
 // pass, and, for a draw with such work, a second marker (offset 8 of the buffer) once the work
-// has finished, before the draw itself: the report then says which of the two the GPU hung on.
+// has finished, before the draw itself (gpu_device_lost_setup_breadcrumbs, off by default): the
+// report then says which of the two the GPU hung on. A draw with no work recorded between it and
+// the draw before (the draw command itself is not counted) needs no marker: the one after the
+// draw before already says that everything before it finished.
 //
 // Free of the Vulkan headers so that tools/test_device_lost_trail.cpp can test it.
 #include <array>
@@ -270,6 +273,9 @@ inline std::string DescribeDetails(const Trail& trail, uint32_t finished, uint32
   } else if (e->kind == Kind::kDraw && !d.work.Any()) {
     out += Format("; nothing else was recorded after #%" PRIu32 ": it hung in the draw itself",
                   finished);
+  } else if (e->kind == Kind::kDraw) {
+    // The marker before the draw is off by default (its GPU time): the player turns it on.
+    out += "; in that work or in the draw: gpu_device_lost_setup_breadcrumbs tells them apart";
   }
   if (const Entry* last = trail.Find(finished);
       last && last->details.filled && last->kind == Kind::kDraw &&

@@ -104,11 +104,12 @@ REXCVAR_DEFINE_BOOL(shader_prebuild_only, false, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 // FH1 (#913): with the breadcrumbs (VK_AMD_buffer_marker), a second marker before a draw that
 // had work of its own recorded first, once that work has finished (fh1_device_lost_trail.h).
-REXCVAR_DEFINE_BOOL(gpu_device_lost_setup_breadcrumbs, true, "GPU/Vulkan",
+// Off: it costs GPU time on every frame, and only a player whose GPU resets needs it.
+REXCVAR_DEFINE_BOOL(gpu_device_lost_setup_breadcrumbs, false, "GPU/Vulkan",
                     "With the device-lost breadcrumbs on VK_AMD_buffer_marker, also mark the end "
                     "of the work recorded before a draw (render passes, render target transfers, "
                     "texture loads, barriers), so that a device loss says whether the GPU hung "
-                    "in that work or in the draw")
+                    "in that work or in the draw (costs GPU time: for a GPU that resets)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(fh1_fast_resolve_copy, true, "GPU/Vulkan",
     "Use bit-exact whole-word FH1 cross-scale resolve copies")
@@ -7914,6 +7915,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   // FH1 (#551): the draw's number, written by the GPU once issued and once finished.
   if (fh1_breadcrumbs_on) {
+    // FH1 (#913): the draw command itself is not work recorded before the next draw.
+    deferred_command_buffer_.Fh1TakeWork();
     deferred_command_buffer_.CmdFh1Breadcrumb(fh1_trail.Record(
         fh1_device_lost_trail::Kind::kDraw, GetCurrentSubmission(), frame_current_,
         primitive_processing_result.host_draw_vertex_count, vertex_shader->ucode_data_hash(),
