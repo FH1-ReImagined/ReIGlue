@@ -63,6 +63,107 @@ int main() {
   check(!GetFractionalTileResolve(0, 256, 0.75f, 0.75f, 1280, 256, tile));
   check(!GetFractionalTileResolve(0, -256, 0.75f, 0.75f, 1280, 0, tile));
   check(!GetFractionalTileResolve(0, -256, 1.5f, 0.75f, 1280, 256, tile));
+  // 0900 (FH1 #827): the scene tiles' place in the frame for the marked FM4 shadow fetch. The
+  // frame's viewport (scale 640, -360; offset 640, 360) starts in the target: no offset.
+  check(TileFrameOrigin(true, 640.0f, 640.0f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, 0, 2.0f) == 0.0f);
+  // The second and third tiles, moved up by the window offset: 256 and 512 rows, in host
+  // pixels at render scale 1, at render scale 2 and on the 1080p raster (0.75 of scale 2).
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -256, 1.0f) == 256.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -512, 1.0f) == 512.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -256, 2.0f) == 512.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -512, 2.0f) == 1024.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -256, 1.5f) == 384.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -512, 1.5f) == 768.0f);
+  // The same tiles moved by the viewport's own offset, either scale sign, columns too.
+  check(TileFrameOrigin(true, -360.0f, 104.0f, 0, 1.0f) == 256.0f);
+  check(TileFrameOrigin(true, 360.0f, -152.0f, 0, 1.0f) == 512.0f);
+  check(TileFrameOrigin(true, 640.0f, 0.0f, 0, 1.0f) == 640.0f);
+  check(TileFrameOrigin(true, 640.0f, 640.0f, -640, 2.0f) == 1280.0f);
+  // A half-pixel offset is not a tile, and a tile with one is still 256 rows up.
+  check(TileFrameOrigin(true, -360.0f, 359.5f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.5f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.5f, -256, 1.0f) == 256.0f);
+  // No offset: a viewport inside the target (a small view further down), a disabled axis, a
+  // value no frame has.
+  check(TileFrameOrigin(true, -64.0f, 400.0f, 0, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, 256, 1.0f) == 0.0f);
+  check(TileFrameOrigin(false, -360.0f, 360.0f, -256, 1.0f) == 0.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -8192, 1.0f) == 8192.0f);
+  check(TileFrameOrigin(true, -360.0f, 360.0f, -8193, 1.0f) == 0.0f);
+  {
+    const float zero = 0.0f, not_a_number = zero / zero;
+    check(TileFrameOrigin(true, not_a_number, 360.0f, -256, 1.0f) == 0.0f);
+    check(TileFrameOrigin(true, -360.0f, not_a_number, -256, 1.0f) == 0.0f);
+  }
+  // #879: a whole picture drawn on the 1080p HUD target (raster 0.75 of render scale 2) is
+  // copied back from the raster's part: a Big Shot's tile, a movie's frame, a photo's thumbnail.
+  FractionalReadback copy{};
+  check(GetFractionalReadback(1280, 720, 2, 2, 0.75f, 0.75f, 40, copy) && copy.width == 1280 &&
+        copy.height == 720 && copy.raster_width == 1920 && copy.raster_height == 1080 &&
+        copy.pitch_tiles == 40 && copy.valid());
+  check(GetFractionalReadback(640, 360, 2, 2, 0.75f, 0.75f, 20, copy) && copy.raster_width == 960 &&
+        copy.raster_height == 540);
+  check(GetFractionalReadback(416, 240, 2, 2, 0.75f, 0.75f, 13, copy) && copy.raster_width == 624 &&
+        copy.raster_height == 360);
+  // Nothing changes: an integer raster (1440p, 4K), an empty copy, a part that is not whole
+  // host pixels, a copy wider than its texture.
+  copy = {};
+  check(!GetFractionalReadback(1280, 720, 2, 2, 1.0f, 1.0f, 40, copy) && !copy.valid());
+  check(!GetFractionalReadback(1280, 720, 3, 3, 1.0f, 1.0f, 40, copy));
+  check(!GetFractionalReadback(0, 720, 2, 2, 0.75f, 0.75f, 40, copy));
+  check(!GetFractionalReadback(1280, 0, 2, 2, 0.75f, 0.75f, 40, copy));
+  check(!GetFractionalReadback(1280, 720, 2, 2, 0.77f, 0.75f, 40, copy));
+  check(!GetFractionalReadback(1280, 720, 2, 2, 0.75f, 1.5f, 40, copy));
+  check(!GetFractionalReadback(1280, 720, 2, 2, 0.75f, 0.75f, 39, copy));
+  check(!GetFractionalReadback(1280, 720, 2, 2, 0.75f, 0.75f, 0, copy) && !copy.valid());
+  // A copy narrower than its texture keeps the ordinary copy: its run of tiles holds other
+  // pictures (the car picture's two views, 608 and 160 wide, in a 768x288 texture: 24 tiles; a
+  // 640x360 or 256x256 corner of a 1280-pixel pitch). One that ends in the last tile column is
+  // whole (768 and 750 of 24 tiles).
+  check(!GetFractionalReadback(608, 288, 2, 2, 0.75f, 0.75f, 24, copy) && !copy.valid());
+  check(!GetFractionalReadback(160, 288, 2, 2, 0.75f, 0.75f, 24, copy) && !copy.valid());
+  check(!GetFractionalReadback(736, 288, 2, 2, 0.75f, 0.75f, 24, copy) && !copy.valid());
+  check(!GetFractionalReadback(640, 360, 2, 2, 0.75f, 0.75f, 40, copy) && !copy.valid());
+  check(!GetFractionalReadback(256, 256, 2, 2, 0.75f, 0.75f, 40, copy) && !copy.valid());
+  check(GetFractionalReadback(768, 288, 2, 2, 0.75f, 0.75f, 24, copy) &&
+        copy.raster_width == 1152 && copy.raster_height == 432 && copy.pitch_tiles == 24);
+  check(GetFractionalReadback(744, 288, 2, 2, 0.75f, 0.75f, 24, copy) && copy.raster_width == 1116);
+  copy = {};
+  // A guest pixel covers 1.5 host pixels there: one whole and half of its neighbour, in turn.
+  const auto near = [](float a, float b) { return a - b < 1e-5f && b - a < 1e-5f; };
+  RasterTaps taps = GetRasterTaps(0, 1280, 1920);
+  check(taps.first == 0 && near(taps.weights[0], 2.0f / 3) && near(taps.weights[1], 1.0f / 3) &&
+        taps.weights[2] == 0.0f && taps.weights[3] == 0.0f);
+  taps = GetRasterTaps(1, 1280, 1920);
+  check(taps.first == 1 && near(taps.weights[0], 1.0f / 3) && near(taps.weights[1], 2.0f / 3) &&
+        taps.weights[2] == 0.0f);
+  taps = GetRasterTaps(1279, 1280, 1920);
+  check(taps.first == 1918 && near(taps.weights[0], 1.0f / 3) && near(taps.weights[1], 2.0f / 3));
+  // Every host pixel of the picture is used once in all, and nothing outside it.
+  for (unsigned size : {1280u, 720u, 640u, 360u, 416u, 240u}) {
+    for (unsigned raster : {size * 3 / 2, size * 2, size * 9 / 4, size * 3, size}) {
+      float used[8] = {};
+      bool inside = true;
+      for (unsigned guest = 0; guest < 2; ++guest) {
+        taps = GetRasterTaps(guest, size, raster);
+        float sum = 0.0f;
+        for (unsigned i = 0; i < 4; ++i) {
+          sum += taps.weights[i];
+          if (taps.weights[i] > 0.0f)
+            used[taps.first + i] += taps.weights[i] * raster / size;
+        }
+        check(near(sum, 1.0f));
+      }
+      taps = GetRasterTaps(size - 1, size, raster);
+      for (unsigned i = 0; i < 4; ++i)
+        inside &= taps.weights[i] <= 1e-5f || taps.first + i < raster;
+      check(inside);
+      for (unsigned host = 0; host + 1 < 2 * raster / size; ++host)
+        check(near(used[host], 1.0f));
+    }
+  }
   std::printf("FH1 instrument/native raster policy: %u failures\n", failures);
   return failures ? 1 : 0;
 }

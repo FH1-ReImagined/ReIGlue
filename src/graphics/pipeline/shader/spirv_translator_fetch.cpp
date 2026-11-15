@@ -2360,9 +2360,26 @@ bool SpirvShaderTranslator::Fh1Fm4ShadowFetch(const ParsedTextureFetchInstructio
                                            builder_->makeIntConstant(0));
   spv::Id size = builder_->createUnaryOp(spv::OpConvertSToF, type_float3_, size_int);
   spv::Id frag = builder_->createLoad(input_fragment_coordinates_, spv::NoPrecision);
+  // 0900 (FH1 #827): the pixel's position in the frame, not in the render target. FH1 draws its
+  // 4x MSAA scene in three tiles of rows (256, 256 and 208 at 720p), each at the top of the same
+  // target with the viewport moved up by the rows before it, while the mask covers the frame:
+  // the second and third tiles read the first one's rows of the mask, and the car's shadow was
+  // drawn again one and two tiles further up the screen. The system constant holds what the
+  // viewport is moved by (zero for the first tile and for any viewport that starts in the
+  // target).
   id_vector_temp_.clear();
-  id_vector_temp_.push_back(builder_->createCompositeExtract(frag, type_float_, 0));
-  id_vector_temp_.push_back(builder_->createCompositeExtract(frag, type_float_, 1));
+  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantFh1Fm4FrameOrigin));
+  spv::Id frame_origin = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                  id_vector_temp_),
+      spv::NoPrecision);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->createNoContractionBinOp(
+      spv::OpFAdd, type_float_, builder_->createCompositeExtract(frag, type_float_, 0),
+      builder_->createCompositeExtract(frame_origin, type_float_, 0)));
+  id_vector_temp_.push_back(builder_->createNoContractionBinOp(
+      spv::OpFAdd, type_float_, builder_->createCompositeExtract(frag, type_float_, 1),
+      builder_->createCompositeExtract(frame_origin, type_float_, 1)));
   id_vector_temp_.push_back(const_float_1_);
   spv::Id position = builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
   spv::Id coords = builder_->createNoContractionBinOp(spv::OpFDiv, type_float3_, position, size);

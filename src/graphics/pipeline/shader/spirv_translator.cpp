@@ -439,6 +439,7 @@ void SpirvShaderTranslator::StartTranslation() {
       {"fh1_native_textures", offsetof(SystemConstants, fh1_native_textures), type_uint_},
       {"fh1_full_raster_textures", offsetof(SystemConstants, fh1_full_raster_textures), type_uint_},
       {"fh1_vr_eye", offsetof(SystemConstants, fh1_vr_eye), type_float4_},
+      {"fh1_fm4_frame_origin", offsetof(SystemConstants, fh1_fm4_frame_origin), type_float4_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));

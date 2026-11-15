@@ -144,6 +144,29 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool HasNativeHudColorTarget() const {
     return last_update_accumulated_render_targets()[1] != nullptr;
   }
+  // #879: the surface the last draw rendered to and where its viewport ends, in guest pixels
+  // (only kept on a fractional raster), and what the last Resolve found: a whole picture drawn
+  // on the fractional raster, whose copy to guest memory takes the raster's part
+  // (fh1_screen_raster.h). Not valid for any other resolve.
+  void Fh1NoteDrawSurface(uint32_t viewport_right, uint32_t viewport_bottom) {
+    if (raster_scale_x_ == 1.0f && raster_scale_y_ == 1.0f)
+      return;
+    const auto& regs = register_file();
+    fh1_last_draw_surface_info_ = regs[XE_GPU_REG_RB_SURFACE_INFO];
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      fh1_last_draw_color_bases_[i] =
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_base;
+    }
+    fh1_last_draw_viewport_right_ = viewport_right;
+    fh1_last_draw_viewport_bottom_ = viewport_bottom;
+  }
+  const fh1::FractionalReadback& fh1_fractional_readback() const {
+    return fh1_fractional_readback_;
+  }
+  uint32_t fh1_last_draw_surface_info_ = 0;
+  uint32_t fh1_last_draw_color_bases_[xenos::kMaxColorRenderTargets] = {};
+  uint32_t fh1_last_draw_viewport_right_ = 0, fh1_last_draw_viewport_bottom_ = 0;
+  fh1::FractionalReadback fh1_fractional_readback_;
 
   Path GetPath() const override { return path_; }
 
