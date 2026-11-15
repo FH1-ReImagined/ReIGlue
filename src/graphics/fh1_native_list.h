@@ -379,13 +379,18 @@ enum class Skip : uint32_t {
   kNoTemplate,     // bound to a template id the plugin never got (or could not read)
   kLength,         // the indirect buffer's length is not the registered one: the address reused
   kRebound,        // the command buffer no longer names this buffer: the object reused
-  kStaticChanged,  // a static word of the list changed: its key is not the template's
+  kStaticChanged,  // a static word of the list changed: its key, the template's at an earlier
+                   // run since the bind, is not the template's now
   kNested,         // a list run inside a list being compared
+  kKeyAtBind,      // the key is not the template's at the first key check after the bind: the
+                   // template's slot table or the converter is wrong (not the game), never 0
+                   // in a correct build
   kCount,
 };
 constexpr const char* SkipName(Skip s) {
-  constexpr const char* names[] = {
-      "none", "refused", "no-template", "length", "rebound", "static-words-changed", "nested"};
+  constexpr const char* names[] = {"none",   "refused",    "no-template",
+                                   "length", "rebound",    "static-words-changed",
+                                   "nested", "key-at-bind"};
   static_assert(sizeof(names) / sizeof(names[0]) == size_t(Skip::kCount));
   return s < Skip::kCount ? names[size_t(s)] : "?";
 }
@@ -401,7 +406,21 @@ struct Binding {
   std::vector<uint32_t> pool;
   bool pool_valid = false;
   uint32_t pool_generation = 0;
+  // A key check since the bind found the template's key (KeyCheck).
+  bool key_matched = false;
 };
+
+// The lookup's key check of a run of binding b: kNone when the live key is the template's;
+// otherwise kStaticChanged when an earlier run since the bind had the template's key (the game
+// wrote a static word after it), and kKeyAtBind when none had (the template does not describe
+// the list it was bound for: a slot in the wrong place, a word the converter got wrong).
+inline Skip KeyCheck(Binding* b, bool differs) {
+  if (!differs) {
+    b->key_matched = true;
+    return Skip::kNone;
+  }
+  return b->key_matched ? Skip::kStaticChanged : Skip::kKeyAtBind;
+}
 
 enum class DefineResult { kNew, kRepeat, kInvalid };
 enum class BindResult { kNew, kSame, kReplaced };
@@ -470,12 +489,14 @@ enum Field : uint32_t {
   kFieldFetch,      // fetch constants 0x4800-0x48BF
   kFieldBoolLoop,   // bool and loop constants 0x4900-0x4927
   kFieldOther,      // (end of a list) every other register
+  kFieldWrites,     // the registers written: one the packets write and the template does not,
+                    // or the reverse, before a draw or after the last (whatever the values)
   kFieldCount,
 };
 constexpr const char* kFieldNames[kFieldCount] = {
-    "draw order",      "executed",      "bin mask",        "shader",
-    "state registers", "ALU constants", "fetch constants", "bool/loop constants",
-    "other registers"};
+    "draw order",      "executed",         "bin mask",        "shader",
+    "state registers", "ALU constants",    "fetch constants", "bool/loop constants",
+    "other registers", "registers written"};
 inline Field FieldOf(uint32_t reg) {
   if (reg >= 0x2000 && reg < 0x2400)
     return kFieldState;
@@ -492,6 +513,43 @@ inline Field FieldOf(uint32_t reg) {
 constexpr bool MarkRegister(uint32_t reg) {
   return reg == 0x57E || reg == 0x57F || (reg >= 0x5000 && reg <= 0x5002);
 }
+// Registers a packet writes as part of what it does (EVENT_WRITE*, VIZ_QUERY: the event
+// initiator; DRAW_INDX: the DMA base and size and the draw initiator), after the draw hook: the
+// write sets leave them out; their values are compared (the next draw's view, the list's end).
+constexpr bool PacketRegister(uint32_t reg) {
+  return reg >= 0x21F9 && reg <= 0x21FC;
+}
+
+// A set of registers, cleared in the time its size takes.
+class RegisterSet {
+ public:
+  void Add(uint32_t first, uint32_t count) {
+    const uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(first) + count, kRegisterLimit));
+    for (uint32_t reg = first; reg < end; ++reg) {
+      uint64_t& word = bits_[reg >> 6];
+      const uint64_t bit = uint64_t(1) << (reg & 63);
+      if (!(word & bit) && !MarkRegister(reg) && !PacketRegister(reg)) {
+        word |= bit;
+        list_.push_back(uint16_t(reg));
+      }
+    }
+  }
+  bool Has(uint32_t reg) const {
+    return reg < kRegisterLimit && (bits_[reg >> 6] >> (reg & 63)) & 1;
+  }
+  size_t size() const { return list_.size(); }
+  const std::vector<uint16_t>& registers() const { return list_; }
+  void Clear() {
+    for (uint16_t reg : list_)
+      bits_[reg >> 6] = 0;
+    list_.clear();
+  }
+
+ private:
+  uint64_t bits_[(kRegisterLimit + 63) / 64] = {};
+  std::vector<uint16_t> list_;
+};
+
 // What a draw's shaders and fixed function read, compared at every draw.
 constexpr uint32_t kDrawRanges[][2] = {{0x2000, 0x2400}, {0x4000, 0x4928}};
 
@@ -540,7 +598,12 @@ class ShadowRun {
     expected_.assign(regs, regs + kRegisterLimit);
     next_ = 0;
     order_broken_ = false;
+    template_writes_.Clear();
+    live_writes_.Clear();
   }
+  // Registers the command processor wrote for a packet of the list (any register write it
+  // makes while the run is open; the ones PacketRegister names and the marks are left out).
+  void LiveWrites(uint32_t first, uint32_t count) { live_writes_.Add(first, count); }
   uint32_t draw_count() const { return t_[kTDrawCount]; }
   uint32_t next_draw() const { return next_; }
 
@@ -565,6 +628,7 @@ class ShadowRun {
     CompareShaders(r, shaders, &o);
     for (const auto& range : kDrawRanges)
       Compare(regs, range[0], range[1], &o);
+    CompareWrites(&o);
     if (expect_run) {
       expected_[kRegDmaBase] = pool_[r[kDIndexPool]];
       expected_[kRegDmaBase + 1] = r[kDSizeWord];
@@ -586,6 +650,7 @@ class ShadowRun {
     if (mask != bin_mask)
       o.Note(kFieldBinMask);
     CompareShaders(r, shaders, &o);
+    CompareWrites(&o);
     // The marks (MarkRegister) left out.
     Compare(regs, 0, 0x57E, &o);
     Compare(regs, 0x580, 0x5000, &o);
@@ -595,7 +660,11 @@ class ShadowRun {
 
  private:
   // The record's delta over the expected register file, then the tile block in effect: the
-  // view of StateAtDraw (FH1 native_list.h), one draw at a time. Returns the bin mask.
+  // view of StateAtDraw (FH1 native_list.h), one draw at a time. Returns the bin mask. Every
+  // register it writes goes into the template's write set, so a write the template leaves out,
+  // puts on another register or applies for the wrong tile is seen even when its value is
+  // already in the register file (the window a tile block writes, which D3D's segment set for
+  // the selected tile before the list).
   uint64_t Fold(const uint32_t* r) {
     const uint32_t* deltas = t_ + t_[kTDeltas];
     const uint32_t* e = deltas + r[kDDelta] * kDeltaWords;
@@ -606,17 +675,24 @@ class ShadowRun {
         for (uint32_t k = 0; k < e[1]; ++k) {
           expected_[e[0] + k] = block ? Word(block, e[3] + k) : 0xDEADBEEFu;
         }
+        template_writes_.Add(e[0], e[1]);
       } else if (!(untiled_ && (op[0] & kOpTileBound))) {
         std::memcpy(&expected_[e[0]], pool_ + op[3] + e[3], e[1] * sizeof(uint32_t));
+        template_writes_.Add(e[0], e[1]);
       }
     }
     if (r[kDTile] == kNone)
       return mask_;
     if (!untiled_) {
       const uint32_t* tile = pool_ + Op(t_, r[kDTile])[1];
+      // The block in effect is applied at every draw after it; its packets are among this
+      // draw's ops only once.
+      const bool here = r[kDTile] >= r[kDFirstOp] && r[kDTile] - r[kDFirstOp] < r[kDOpCount];
       for (uint32_t k = 0; k < kTiles; ++k) {
         if (select_ & tile[k * 4]) {
           std::memcpy(&expected_[kRegWindowOffset], tile + k * 4 + 1, 3 * sizeof(uint32_t));
+          if (here)
+            template_writes_.Add(kRegWindowOffset, 3);
         }
       }
     }
@@ -638,6 +714,28 @@ class ShadowRun {
       }
     }
   }
+  // The registers the packets wrote since the last draw (or the run's start) against the ones
+  // the template wrote; both sets start again. A register in one set only is noted with
+  // expected / live 1 for the side that wrote it.
+  void CompareWrites(Outcome* o) {
+    if (template_writes_.size() != live_writes_.size() ||
+        !std::all_of(live_writes_.registers().begin(), live_writes_.registers().end(),
+                     [&](uint16_t reg) { return template_writes_.Has(reg); })) {
+      uint32_t first = kNone;
+      bool by_template = false;
+      for (uint16_t reg : live_writes_.registers())
+        if (!template_writes_.Has(reg) && reg < first)
+          first = reg;
+      for (uint16_t reg : template_writes_.registers())
+        if (!live_writes_.Has(reg) && reg < first) {
+          first = reg;
+          by_template = true;
+        }
+      o->Note(kFieldWrites, first, by_template ? 1 : 0, by_template ? 0 : 1);
+    }
+    template_writes_.Clear();
+    live_writes_.Clear();
+  }
   void Compare(const uint32_t* regs, uint32_t from, uint32_t to, Outcome* o) const {
     if (from >= to)
       return;
@@ -658,6 +756,7 @@ class ShadowRun {
   Shaders shaders_;
   std::vector<uint32_t> expected_;
   uint32_t next_ = 0;
+  RegisterSet template_writes_, live_writes_;
 };
 
 }  // namespace rex::graphics::fh1_list

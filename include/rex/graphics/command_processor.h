@@ -385,6 +385,13 @@ class CommandProcessor {
   bool Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader);
   void Fh1ListDraw(uint32_t packet_offset, bool executed);
   void Fh1ListEnd();
+  // A register write the decoder makes (its write paths' entries): told to the run being
+  // compared, if any.
+  void Fh1ListWrites(uint32_t first, uint32_t count) {
+    if (fh1_list_reader_)
+      Fh1ListNoteWrites(first, count);
+  }
+  void Fh1ListNoteWrites(uint32_t first, uint32_t count);
   void Fh1ListShader(uint32_t address_type, uint32_t start_size);
   void Fh1ListsSwap();
   void Fh1ListsShutdown();

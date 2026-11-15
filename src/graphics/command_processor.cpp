@@ -664,6 +664,7 @@ uint32_t* CommandProcessor::RecordRun(uint32_t start_index, uint32_t num_registe
 }
 
 void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
+  Fh1ListWrites(index, 1);  // FH1 (0650)
   if (!record_split_) {
     WriteRegister(index, value);
     return;
@@ -711,6 +712,7 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
   if (!num_registers) {
     return;
   }
+  Fh1ListWrites(start_index, num_registers);  // FH1 (0650)
   if (!record_split_) {
     WriteRegistersFromMem(start_index, const_cast<uint32_t*>(base), num_registers);
     return;
@@ -1320,6 +1322,7 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
   if (!num_registers) {
     return;
   }
+  Fh1ListWrites(base, num_registers);  // FH1 (0650)
   if (record_split_) {
     PacketWriteRangeFromRing(ring, base, num_registers);
     return;
@@ -1378,6 +1381,7 @@ bool CommandProcessor::Fh1WritePlainRangeFromRing(memory::RingBuffer* ring, uint
     const_cast<volatile uint32_t&>(values[base + i]) = memory::load_and_swap<uint32_t>(source + i);
   }
   ring->set_read_offset_within(read_offset + range_bytes);
+  Fh1ListWrites(base, count);  // FH1 (0650)
   return true;
 }
 
@@ -2549,6 +2553,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       WakeWordWaiters(host);
     } else {
       // Register.
+      Fh1ListWrites(write_reg_addr, 1);  // FH1 (0650)
       WriteRegister(write_reg_addr, write_data);
       if (record_split_ && write_reg_addr < RegisterFile::kRegisterCount) {
         decode_register_file_->values[write_reg_addr] = register_file_->values[write_reg_addr];

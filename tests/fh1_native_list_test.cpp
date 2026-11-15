@@ -9,10 +9,16 @@
 //   static word changed;
 // - the registry: a define repeated, a bind repeated or replaced, a lookup with a wrong length,
 //   an address dropped and bound again to another list;
+// - the key check: a key that differs at the first check after a bind is the template's fault
+//   (key-at-bind), one that differs after a check that matched is a static word the game wrote
+//   (static-words-changed); a template whose slot is one dword off is the first;
 // - the compare: every draw and the end agree for each tile's bin select, the bin masks a list
 //   is seen to start with, and untiled; it disagrees, in the field it should, when the packets
 //   write a register the template does not know, when a pool is stale, when a draw's predicate
-//   goes the other way, and when the draws come out of order.
+//   goes the other way, and when the draws come out of order; and, by the registers written,
+//   also when the values agree: a tile block's mask that is another tile's while the register
+//   file already holds the selected tile's window, a write the template puts on another
+//   register whose value both already hold.
 #include "../src/graphics/fh1_native_list.h"
 
 #include <cstdio>
@@ -103,6 +109,14 @@ struct Interpreter {
   int extra_write_at_draw = -1;  // before draw k's hook, a register the template knows nothing of
   bool ignore_predicate = false;
   int swap_draws = -1;  // report draw k's packet as the next one's
+  // Told of every register write, as the command processor's write paths tell the run.
+  fl::ShadowRun* run = nullptr;
+
+  void Set(uint32_t reg, uint32_t value) {
+    regs[reg] = value;
+    if (run)
+      run->LiveWrites(reg, 1);
+  }
 
   template <typename OnDraw>
   void Run(const std::vector<uint32_t>& pm4, OnDraw&& on_draw) {
@@ -117,7 +131,7 @@ struct Interpreter {
       if (type == 0) {
         const uint32_t first = h & 0x7FFF;
         for (uint32_t i = 0; i < count; ++i)
-          regs[(h & 0x8000) ? first : first + i] = pm4[d + 1 + i];
+          Set((h & 0x8000) ? first : first + i, pm4[d + 1 + i]);
         d += 1 + count;
         continue;
       }
@@ -141,7 +155,7 @@ struct Interpreter {
         case 0x2D:  // SET_CONSTANT of registers
           CHECK(((p[0] >> 16) & 0xFF) == 4);
           for (uint32_t i = 1; i < count; ++i)
-            regs[0x2000 + (p[0] & 0x7FF) + i - 1] = p[i];
+            Set(0x2000 + (p[0] & 0x7FF) + i - 1, p[i]);
           break;
         case 0x27:  // IM_LOAD
           shaders.address[p[0] & 1] = p[0];
@@ -151,17 +165,17 @@ struct Interpreter {
         case 0x2F: {  // LOAD_ALU_CONSTANT
           const uint8_t* block = Memory(nullptr, p[0] & 0x3FFFFFFF);
           for (uint32_t i = 0; i < (p[2] & 0xFFF); ++i)
-            regs[0x4000 + (p[1] & 0x7FF) + i] = fl::Word(block, i);
+            Set(0x4000 + (p[1] & 0x7FF) + i, fl::Word(block, i));
           break;
         }
         case 0x22:  // DRAW_INDX: reported before it writes its three registers
           if (int(draw) == extra_write_at_draw)
-            regs[0x2100] ^= 1;
+            Set(0x2100, regs[0x2100] ^ 1);
           on_draw(int(draw) == swap_draws ? d + 1 : d, true, draw);
           ++draw;
-          regs[0x21FC] = p[1];
-          regs[0x21FA] = p[2];
-          regs[0x21FB] = p[3];
+          Set(0x21FC, p[1]);
+          Set(0x21FA, p[2]);
+          Set(0x21FB, p[3]);
           break;
         default:
           CHECK(false);
@@ -176,8 +190,10 @@ struct Result {
   uint32_t draws = 0, draws_agree = 0, skipped = 0, draw_fields = 0, end_fields = 0;
   bool end_agree = false;
 };
+// `start`, if given, changes the register file the list starts with (after the other state).
 Result Compare(const Case& c, uint64_t select, uint64_t mask, Interpreter in = Interpreter(),
-               const std::vector<uint32_t>* stale_pool = nullptr) {
+               const std::vector<uint32_t>* stale_pool = nullptr,
+               void (*start)(const Case&, const uint32_t* pool, std::vector<uint32_t>*) = nullptr) {
   const uint32_t* t = c.tmpl.data();
   const std::vector<uint8_t> pm4 = Guest(c.pm4);
   std::vector<uint32_t> pool(t[fl::kTPoolWords]);
@@ -186,6 +202,8 @@ Result Compare(const Case& c, uint64_t select, uint64_t mask, Interpreter in = I
     pool = *stale_pool;
   for (uint32_t r = 0; r < fl::kRegisterLimit; ++r)
     in.regs[r] = r * 0x9E3779B1u;  // other state
+  if (start)
+    start(c, pool.data(), &in.regs);
   in.select = select;
   in.mask = mask;
   in.shaders.address[0] = 0x00300000;
@@ -194,6 +212,7 @@ Result Compare(const Case& c, uint64_t select, uint64_t mask, Interpreter in = I
   fl::ShadowRun run;
   run.Begin(t, pool.data(), select, mask, fl::Untiled(t, pm4.data()), in.regs.data(), in.shaders,
             Memory, nullptr);
+  in.run = &run;
   Result r;
   in.Run(c.pm4, [&](uint32_t packet, bool executed, uint32_t) {
     const fl::Outcome o = run.Draw(packet, executed, in.regs.data(), in.mask, in.shaders);
@@ -345,6 +364,132 @@ void TestRegistry() {
   CHECK(reg.Lookup(0x17184D40, b.words, &skip)->template_id == 1);
 }
 
+// The lookup's key check: the template's slot table moved one dword on (a converter bug) shows at
+// the first check after the bind; a static word the game writes after a run that matched is the
+// other reason; a bind replaced starts again.
+void TestKeyCheck() {
+  for (Case c : {Depth(), Scene()}) {
+    FixUp(c, 4);
+    const uint32_t files = c.header[fl::kHeaderFlags / 4];
+    const fl::Key key = fl::TemplateKey(c.tmpl.data());
+    fl::Binding b;
+    CHECK(fl::KeyCheck(&b, Key(c, files) != key) == fl::Skip::kNone && b.key_matched);
+    // A static word the game rewrote (the second step's benchmark model): after a matching run.
+    Case d = c;
+    d.pm4[2] ^= 0x10;
+    CHECK(fl::KeyCheck(&b, Key(d, files) != key) == fl::Skip::kStaticChanged);
+    CHECK(fl::KeyCheck(&b, Key(c, files) != key) == fl::Skip::kNone);
+    // A one-word slot whose list dword is one on (a word after it that is not a slot's): the key
+    // differs from the first check of a fresh binding, so the reason names the template.
+    Case w = c;
+    uint32_t* t = w.tmpl.data();
+    uint32_t* slot = t + t[fl::kTSlots];
+    bool moved = false;
+    for (uint32_t i = 0; i < t[fl::kTSlotCount] && !moved; ++i, slot += fl::kSlotWords) {
+      const bool next_free = i + 1 == t[fl::kTSlotCount] || slot[fl::kSlotWords + 1] > slot[1] + 2;
+      if (slot[3] == 1 && next_free && slot[1] + 1 < t[fl::kTListWords] &&
+          w.pm4[slot[1] + 1] != 0) {
+        ++slot[1];
+        moved = true;
+      }
+    }
+    CHECK(moved && fl::Validate(t, w.tmpl.size()));
+    fl::Binding fresh;
+    CHECK(fl::KeyCheck(&fresh, Key(w, files) != key) == fl::Skip::kKeyAtBind);
+    CHECK(fl::KeyCheck(&fresh, Key(w, files) != key) == fl::Skip::kKeyAtBind);
+    CHECK(!fresh.key_matched);
+    // A bind replaced (a reused command buffer): the new binding has had no check yet.
+    fl::Registry reg;
+    CHECK(reg.Define(1, c.tmpl.data(), c.tmpl.size()) == fl::DefineResult::kNew);
+    fl::Binding a;
+    a.phys = 0x17184D40;
+    a.words = uint32_t(c.pm4.size());
+    a.template_id = 1;
+    CHECK(reg.Bind(a) == fl::BindResult::kNew);
+    fl::Skip skip;
+    fl::Binding* found = reg.Lookup(a.phys, a.words, &skip);
+    CHECK(fl::KeyCheck(found, false) == fl::Skip::kNone);
+    CHECK(reg.Bind(a) == fl::BindResult::kSame && reg.Lookup(a.phys, a.words, &skip)->key_matched);
+    a.cb = 0x40002000;
+    CHECK(reg.Bind(a) == fl::BindResult::kReplaced);
+    found = reg.Lookup(a.phys, a.words, &skip);
+    CHECK(!found->key_matched && fl::KeyCheck(found, true) == fl::Skip::kKeyAtBind);
+  }
+}
+
+// The tile op the scene list's draws use, and the first draw it is in.
+const uint32_t* SceneTileOp(const std::vector<uint32_t>& tmpl) {
+  const uint32_t* t = tmpl.data();
+  for (uint32_t k = 0; k < t[fl::kTDrawCount]; ++k) {
+    const uint32_t* r = fl::DrawRecord(t, k);
+    if (r[fl::kDTile] != fl::kNone)
+      return fl::Op(t, r[fl::kDTile]);
+  }
+  return nullptr;
+}
+
+// The registers written, whatever the values: faults the value compare cannot see because the
+// register file the list starts with already holds what the template gets wrong.
+void TestWrites() {
+  Case scene = Scene();
+  FixUp(scene, 5);
+  const uint32_t* op = SceneTileOp(scene.tmpl);
+  CHECK(op);
+  const uint32_t tile_pool = op[1];
+  // The register file at the start holds the first tile's window (D3D's segment set it).
+  const auto window = [](const Case& c, const uint32_t* pool, std::vector<uint32_t>* regs) {
+    const uint32_t* tile = pool + SceneTileOp(c.tmpl)[1];
+    for (uint32_t i = 0; i < 3; ++i)
+      (*regs)[fl::kRegWindowOffset + i] = tile[1 + i];
+  };
+  CHECK(Agree(Compare(scene, 0x80000003, 0xFFFFFFFF, Interpreter(), nullptr, window), 2));
+  // The first tile's block with the second tile's mask: for the first tile's select no block of
+  // the template applies, the packets write the window (the same values): only the writes differ.
+  Case bad = scene;
+  uint32_t* tile = bad.tmpl.data() + bad.tmpl[fl::kTPool] + tile_pool;
+  tile[0] = tile[4];
+  Result r = Compare(bad, 0x80000003, 0xFFFFFFFF, Interpreter(), nullptr, window);
+  CHECK(!Agree(r, 2) && r.draw_fields == 1u << fl::kFieldWrites);
+  // The same template is right by the writes for the second tile's select (both blocks apply,
+  // the second's values last, as the packets leave them).
+  CHECK(Agree(Compare(bad, 0xCull, 0xFFFFFFFF), 2));
+  // A write the template puts on another register, where the register file already holds the
+  // value on both: draw 0's first delta of one register moved to a register no packet writes.
+  Case moved = scene;
+  uint32_t* t = moved.tmpl.data();
+  const uint32_t* r0 = fl::DrawRecord(t, 0);
+  uint32_t* e = t + t[fl::kTDeltas] + r0[fl::kDDelta] * fl::kDeltaWords;
+  uint32_t* target = nullptr;
+  for (uint32_t i = 0; i < r0[fl::kDDeltaCount] && !target; ++i, e += fl::kDeltaWords) {
+    const uint32_t* o = fl::Op(t, e[2]);
+    if ((o[0] & 0xFF) == fl::kOpRegs && !(o[0] & fl::kOpTileBound) && e[0] >= 0x2000 &&
+        e[0] < 0x2400 && !fl::PacketRegister(e[0]))
+      target = e;
+  }
+  CHECK(target);
+  static uint32_t from, to, count, value_at;
+  from = target[0];
+  to = 0x23F0;
+  count = target[1];
+  value_at = fl::Op(t, target[2])[3] + target[3];
+  target[0] = to;
+  CHECK(fl::Validate(t, moved.tmpl.size()));
+  const auto both = [](const Case&, const uint32_t* pool, std::vector<uint32_t>* regs) {
+    for (uint32_t i = 0; i < count; ++i)
+      (*regs)[from + i] = (*regs)[to + i] = pool[value_at + i];
+  };
+  CHECK(Agree(Compare(scene, 0x80000003, 0xFFFFFFFF, Interpreter(), nullptr, both), 2));
+  r = Compare(moved, 0x80000003, 0xFFFFFFFF, Interpreter(), nullptr, both);
+  CHECK(r.draws_agree == 1 && r.draw_fields == 1u << fl::kFieldWrites && r.end_agree);
+  // Untiled, the tile blocks are NOPs: no window write on either side.
+  Case untiled = scene;
+  untiled.pm4 = Untile(scene.pm4, scene.tmpl);
+  CHECK(Agree(Compare(untiled, 0x3, 0xFFFFFFFF), 2));
+  // The registers a draw packet writes are left out of the sets (their values are compared).
+  CHECK(fl::PacketRegister(0x21F9) && fl::PacketRegister(0x21FC) && !fl::PacketRegister(0x21F8) &&
+        !fl::PacketRegister(0x21FD));
+}
+
 void TestCompare() {
   Case depth = Depth(), scene = Scene();
   FixUp(depth, 1);
@@ -423,7 +568,9 @@ int main() {
   TestValidate();
   TestKey();
   TestRegistry();
+  TestKeyCheck();
   TestCompare();
+  TestWrites();
   std::printf("fh1 native list: all tests passed\n");
   return 0;
 }

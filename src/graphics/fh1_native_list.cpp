@@ -16,7 +16,11 @@
 //   select) against the register file the packets produced, over what the draw's shaders and
 //   fixed function read (0x2000-0x23FF, the ALU, fetch, bool and loop constants), the shaders,
 //   the bin mask, whether the predicate lets it run;
-// - after the buffer: the whole register file but D3D's marks, the bin mask and the shaders.
+// - after the buffer: the whole register file but D3D's marks, the bin mask and the shaders;
+// - before each draw and after the last: the registers the packets wrote (the command
+//   processor's write paths report them while the run is open) against the ones the template
+//   writes, whatever their values, so a write the template leaves out or misplaces is seen
+//   also when it only repeats a value the register file already has.
 // Anything a run is not compared for is counted with its reason. A summary every 600 frames and
 // at exit.
 #include <rex/graphics/command_processor.h>
@@ -99,6 +103,14 @@ struct CommandProcessor::Fh1Lists {
   uint32_t detailed = 0;
   uint64_t frames = 0;  // swaps decoded since the first registry op
   uint64_t perturb_every = 0, perturb_count = 0, perturbed = 0;
+  // FH1_NATIVE_LISTS_PERTURB_TILE=N: in every Nth compared run of a tiled list, the first tile
+  // block's mask in the template view is the second's (the selected tile's window is in the
+  // register file already, so only the writes can tell); tile_effective counts the runs whose
+  // select no block of the view matches any more. FH1_NATIVE_LISTS_PERTURB_SLOT=N: every Nth
+  // template defined has a one-word slot moved one dword on (the key differs from the first
+  // check: key-at-bind).
+  uint64_t perturb_tile_every = 0, perturb_tile_count = 0, tile_perturbed = 0, tile_effective = 0;
+  uint64_t perturb_slot_every = 0, slot_defines = 0, slot_moved = 0;
 };
 
 namespace {
@@ -141,9 +153,18 @@ void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t fr
       pct(all.draws_agree, all.draws), skips, refused.empty() ? " none" : refused,
       s.key_checks[0][0], s.key_checks[0][1], s.key_checks[1][0], s.key_checks[1][1],
       s.generation_changes, s.in_progress, s.stale_pools, s.other_buffers,
-      s.perturb_every
-          ? fmt::format("; {} runs perturbed on purpose (FH1_NATIVE_LISTS_PERTURB)", s.perturbed)
-          : std::string());
+      (s.perturb_every
+           ? fmt::format("; {} runs perturbed on purpose (FH1_NATIVE_LISTS_PERTURB)", s.perturbed)
+           : std::string()) +
+          (s.perturb_tile_every
+               ? fmt::format("; {} runs with a tile mask perturbed, {} of them for their select "
+                             "(FH1_NATIVE_LISTS_PERTURB_TILE)",
+                             s.tile_perturbed, s.tile_effective)
+               : std::string()) +
+          (s.perturb_slot_every
+               ? fmt::format("; {} templates with a slot moved (FH1_NATIVE_LISTS_PERTURB_SLOT)",
+                             s.slot_moved)
+               : std::string()));
   std::string draw_fields, end_fields;
   for (uint32_t f = 0; f < fl::kFieldCount; ++f) {
     if (s.draw_fields[f])
@@ -188,6 +209,10 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
     fh1_lists_ = new Fh1Lists;
     if (const char* e = std::getenv("FH1_NATIVE_LISTS_PERTURB"))
       fh1_lists_->perturb_every = std::strtoull(e, nullptr, 10);
+    if (const char* e = std::getenv("FH1_NATIVE_LISTS_PERTURB_TILE"))
+      fh1_lists_->perturb_tile_every = std::strtoull(e, nullptr, 10);
+    if (const char* e = std::getenv("FH1_NATIVE_LISTS_PERTURB_SLOT"))
+      fh1_lists_->perturb_slot_every = std::strtoull(e, nullptr, 10);
     REXGPU_INFO(
         "FH1 native lists: the game registers its model lists; each run of one is compared "
         "with its template (shadow mode: every buffer is decoded as before)");
@@ -217,7 +242,26 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
             s.host_words[i] = fl::Word(blob, i);
             h.Add(s.host_words[i]);
           }
-          if (h.Finish().w[0] != hash) {
+          const bool hash_ok = h.Finish().w[0] == hash;
+          if (hash_ok && s.perturb_slot_every && ++s.slot_defines % s.perturb_slot_every == 0 &&
+              fl::Validate(s.host_words.data(), n)) {
+            uint32_t* t = s.host_words.data();
+            uint32_t* slot = t + t[fl::kTSlots];
+            for (uint32_t i = 0; i < t[fl::kTSlotCount]; ++i, slot += fl::kSlotWords) {
+              const bool room =
+                  i + 1 == t[fl::kTSlotCount] || slot[fl::kSlotWords + 1] > slot[1] + 1;
+              if (slot[3] == 1 && room && slot[1] + 1 < t[fl::kTListWords]) {
+                ++slot[1];
+                if (fl::Validate(t, n)) {
+                  ++s.slot_moved;
+                } else {
+                  --slot[1];
+                }
+                break;
+              }
+            }
+          }
+          if (!hash_ok) {
             ++s.define_hash;
           } else if (s.registry.Define(id, s.host_words.data(), n) == fl::DefineResult::kNew) {
             ++s.defines;
@@ -329,15 +373,19 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
                   b->patch_words, pm4, count);
   const bool differs = key != fl::TemplateKey(t);
   ++s.key_checks[untiled][differs];
-  if (differs) {
+  const fl::Skip key_skip = fl::KeyCheck(b, differs);
+  if (key_skip != fl::Skip::kNone) {
     if (s.detailed < 32) {
       ++s.detailed;
       REXGPU_INFO(
-          "FH1 native lists: list {:08X} (group {}, {} dwords{}) has another key now: "
-          "its static words changed, decoded as before",
-          b->phys, b->group, count, untiled ? ", untiled" : "");
+          "FH1 native lists: list {:08X} (group {}, {} dwords{}) has another key {}, decoded "
+          "as before",
+          b->phys, b->group, count, untiled ? ", untiled" : "",
+          key_skip == fl::Skip::kKeyAtBind
+              ? "than its template at its first check since the bind: the template is wrong"
+              : "now: its static words changed after a run that had the template's");
     }
-    return no(fl::Skip::kStaticChanged);
+    return no(key_skip);
   }
   // The pool: read again when the generation changed, as a replay would; read every run too, to
   // find a slot that changed without a fixup.
@@ -377,6 +425,21 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
         ++s.perturbed;
         break;
       }
+    }
+  }
+  if (s.perturb_tile_every && !untiled && (t[fl::kTFlags] & fl::kTemplateTiled) &&
+      ++s.perturb_tile_count % s.perturb_tile_every == 0) {
+    for (uint32_t k = 0; k <= t[fl::kTDrawCount]; ++k) {
+      const uint32_t* r = fl::DrawRecord(t, k);
+      if (r[fl::kDTile] == fl::kNone)
+        continue;
+      uint32_t* tile = s.pool.data() + fl::Op(t, r[fl::kDTile])[1];
+      const uint32_t first = tile[0];
+      tile[0] = tile[4];
+      ++s.tile_perturbed;
+      if ((bin_select_ & first) && !(bin_select_ & tile[4]) && !(bin_select_ & tile[8]))
+        ++s.tile_effective;
+      break;
     }
   }
   const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;
@@ -429,6 +492,10 @@ void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
     }
   }
   s.ns_draw += NowNs() - t0;
+}
+
+void CommandProcessor::Fh1ListNoteWrites(uint32_t first, uint32_t count) {
+  fh1_lists_->run.LiveWrites(first, count);
 }
 
 void CommandProcessor::Fh1ListEnd() {
