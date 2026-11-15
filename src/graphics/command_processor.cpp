@@ -1542,8 +1542,12 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 #if REX_FH1_LIST_TRACE
   // Patch 0640: the buffer's class (as the game registered it), its time and register writes.
   const fh1_list_trace::Sources fh1_list_sources{
-      &record_registers_in_, &record_registers_out_, record_syncs_, kSyncReasonCount,
-      &bin_select_,          &bin_mask_,
+      &record_registers_in_,
+      &record_registers_out_,
+      record_syncs_,
+      kSyncReasonCount,
+      &bin_select_,
+      &bin_mask_,
       (record_split_ ? decode_register_file_.get() : register_file_)->values};
   fh1_list_trace::IndirectScope fh1_list_scope(ptr, count, fh1_list_sources);
 #endif

@@ -155,7 +155,8 @@ bool Enabled(uint8_t* physical_base) {
     if (const char* e = std::getenv("FH1_PM4_STATS_EVERY")) {
       state->every = std::max(1, std::atoi(e));
     }
-    if (const char* e = std::getenv("FH1_PM4_STATS_ALL")) state->all_foreign = std::atoi(e) != 0;
+    if (const char* e = std::getenv("FH1_PM4_STATS_ALL"))
+      state->all_foreign = std::atoi(e) != 0;
     if (!state->shm || !state->out) {
       REXGPU_ERROR("FH1 PM4 trace: cannot open {} or the shared segment", path);
       return false;
@@ -337,13 +338,16 @@ void OnSwap() {
       bool any = false;
       for (int id = 0; id < kTags; ++id) {
         const uint64_t v = __atomic_load_n(&g.dev_calls[i][id], __ATOMIC_RELAXED);
-        if (v == s.dev_calls_prev[i][id]) continue;
-        if (!any) std::fprintf(out, "GD %08X", g.devs[i]);
+        if (v == s.dev_calls_prev[i][id])
+          continue;
+        if (!any)
+          std::fprintf(out, "GD %08X", g.devs[i]);
         any = true;
         std::fprintf(out, " %d:%" PRIu64, id, v - s.dev_calls_prev[i][id]);
         s.dev_calls_prev[i][id] = v;
       }
-      if (any) std::fprintf(out, "\n");
+      if (any)
+        std::fprintf(out, "\n");
     }
     std::fprintf(out, "DEVS n=%u", ndev);
     for (uint32_t i = 0; i < ndev; ++i) {
