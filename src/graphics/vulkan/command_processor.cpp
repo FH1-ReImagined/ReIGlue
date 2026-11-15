@@ -7176,24 +7176,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       // the title sequence. Only the full front buffer marks the scene/UI split.
       const bool front_buffer = surface.surface_pitch == 1280 &&
           surface.msaa_samples == xenos::MsaaSamples::k1X;
+      // 1010 (#879): a frame that starts with a draw in the HUD's format and then draws its scene
+      // (a rally stage's) has the whole scene in the HUD layer. A Big Shot accumulates each tile
+      // over 96 frames in a render target that the two layers do not share, so a change of layer
+      // on the way left its first tile a double image: while the game holds the scene layer,
+      // only a frame that has composited its scene changes.
+      const bool hold_scene_layer = !fh1_scene_composited_ && REXCVAR_GET(fh1_hold_scene_layer);
       if (front_buffer &&
           color.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 &&
           !fh1_native_hud_active_) {
         fh1_scene_composited_ = true;
         fh1_scene_base_ = color.color_base;
-      } else if (front_buffer && color.color_format ==
-                 xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 &&
-                 !fh1_native_hud_active_ &&
+      } else if (front_buffer &&
+                 color.color_format ==
+                     xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 &&
+                 !fh1_native_hud_active_ && !hold_scene_layer &&
                  (!fh1_scene_composited_ || color.color_base == fh1_scene_base_)) {
-        // 1010 (#879): a frame that starts with such a draw and then draws its scene (a rally
-        // stage's) has the whole scene in the HUD layer. A Big Shot accumulates each tile over
-        // 96 frames in a render target that the two layers do not share, so a change of layer
-        // on the way left its first tile a double image: while the game holds the scene layer,
-        // only a frame that has composited its scene changes.
-        if (fh1_scene_composited_ || !REXCVAR_GET(fh1_hold_scene_layer)) {
-          fh1_seed_pending_ = fh1_scene_composited_;
-          Fh1SelectNativeHud(true);
-        }
+        fh1_seed_pending_ = fh1_scene_composited_;
+        Fh1SelectNativeHud(true);
       }
     }
 
