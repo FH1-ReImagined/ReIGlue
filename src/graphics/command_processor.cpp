@@ -11,6 +11,7 @@
 
 #include "fh1_command_cursor.h"
 #include "fh1_frame_cost.h"
+#include "fh1_list_trace.h"
 #include "fh1_pm4_trace.h"
 #include "fh1_vr_stereo.h"
 #include <algorithm>
@@ -1486,6 +1487,12 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
     fh1_pm4_trace::BeginPrimary(primary_buffer_ptr_, primary_buffer_size_);
   }
 #endif
+#if REX_FH1_LIST_TRACE
+  // Patch 0640: the decoder's time in the ring, the buffers it runs included.
+  fh1_list_trace::Enabled(memory_->TranslatePhysical(0));
+  fh1_list_trace::PrimaryScope fh1_list_scope(
+      (write_index + primary_buffer_size_ / 4 - read_index) % (primary_buffer_size_ / 4));
+#endif
   {
     // FH1 (#378): the pipeline lookahead's view of the ring (fh1_command_cursor.h).
     fh1_command_cursor::cursor.ring_start = read_index;
@@ -1531,6 +1538,18 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     }
   } fh1_trace_depth{fh1_pm4_trace::Enabled(memory_->TranslatePhysical(0))};
   if (fh1_trace_depth.on) fh1_pm4_trace::BeginIndirect(ptr, count);
+#endif
+#if REX_FH1_LIST_TRACE
+  // Patch 0640: the buffer's class (as the game registered it), its time and register writes.
+  const fh1_list_trace::Sources fh1_list_sources{
+      &record_registers_in_,
+      &record_registers_out_,
+      record_syncs_,
+      kSyncReasonCount,
+      &bin_select_,
+      &bin_mask_,
+      (record_split_ ? decode_register_file_.get() : register_file_)->values};
+  fh1_list_trace::IndirectScope fh1_list_scope(ptr, count, fh1_list_sources);
 #endif
   do {
     if (!ExecutePacket(&reader)) {
@@ -1748,6 +1767,12 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   if (packet & 1) {
     bool any_pass = (bin_select_ & bin_mask_) != 0;
     if (!any_pass || opcode == PM4_XE_SWAP) {
+#if REX_FH1_LIST_TRACE
+      if (fh1_list_trace::g_on && opcode == PM4_INDIRECT_BUFFER) {  // patch 0640
+        memory::RingBuffer peek = *reader;
+        fh1_list_trace::SkippedIndirect(GpuToCpu(CpuToGpu(peek.ReadAndSwap<uint32_t>())));
+      }
+#endif
       reader->AdvanceRead(count * sizeof(uint32_t));
       return true;
     }
@@ -1763,6 +1788,13 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     std::fprintf(fh1_frame_trace::file, " binsel=%llX binmask=%llX\n",
                  (unsigned long long)bin_select_, (unsigned long long)bin_mask_);
   }
+#if REX_FH1_LIST_TRACE
+  if (fh1_list_trace::g_on && count >= 2 && fh1_list_trace::ReadsRegister(opcode)) {  // 0640
+    memory::RingBuffer peek = *reader;
+    const uint32_t first[2] = {peek.ReadAndSwap<uint32_t>(), peek.ReadAndSwap<uint32_t>()};
+    fh1_list_trace::RegisterRead(opcode, first);
+  }
+#endif
   bool result = false;
   switch (opcode) {
     case PM4_ME_INIT:
@@ -2191,6 +2223,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 #if REX_FH1_PM4_TRACE
     fh1_pm4_trace::OnSwap();  // patch 0570
 #endif
+#if REX_FH1_LIST_TRACE
+    fh1_list_trace::OnSwap();  // patch 0640
+#endif
     ++counter_;
     return true;
   }
@@ -2200,6 +2235,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   fh1_frame_trace::OnSwap();  // patch 0396
 #if REX_FH1_PM4_TRACE
   fh1_pm4_trace::OnSwap();  // patch 0570
+#endif
+#if REX_FH1_LIST_TRACE
+  fh1_list_trace::OnSwap();  // patch 0640
 #endif
   Fh1StereoOnSwap();
 

@@ -122,6 +122,18 @@ if(REXGLUE_FH1_PM4_TRACE)
     target_compile_definitions(rexgpu-xenos PRIVATE REX_FH1_PM4_TRACE=1)
 endif()
 
+# FH1 (patch 0640): the list trace, a study build of the command processor that times the
+# command lists the game runs with RunCommandBuffer by their class, as the game's FORZA_LIST_TRACE
+# build registers them (fh1_list_trace.h). Off for players.
+option(REXGLUE_FH1_LIST_TRACE "Time and count the game's command lists (FH1 native renderer study, Linux)" OFF)
+if(REXGLUE_FH1_LIST_TRACE)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "REXGLUE_FH1_LIST_TRACE is Linux only (POSIX shared memory)")
+    endif()
+    target_sources(rexgpu-xenos PRIVATE fh1_list_trace.cpp)
+    target_compile_definitions(rexgpu-xenos PRIVATE REX_FH1_LIST_TRACE=1)
+endif()
+
 if(REXGLUE_USE_VULKAN)
     include(${REXGLUE_ROOT}/cmake/ForzaSmaa.cmake)
 endif()
