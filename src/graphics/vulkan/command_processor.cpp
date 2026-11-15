@@ -7180,6 +7180,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         fh1_seed_pending_ = fh1_scene_composited_;
         Fh1SelectNativeHud(true);
       }
+      }
     }
 
     // Shader translations and render passes belong to the active render scale.
@@ -8284,12 +8285,14 @@ void main() {
 
 // 1000 (#879): the copy to guest memory of a whole picture drawn on the fractional raster (the
 // HUD target at a 1080p output: 0.75 of render scale 2). The scaled resolve holds the picture in
-// its top-left raster part, which is how the HUD's shaders read it; the ordinary copy takes one
-// host pixel of every scale x scale block of the whole surface, so guest memory got the picture
-// at three quarters of its size, the rest black. This one gives each guest pixel the average of
-// the host pixels it covers in that part (8:8:8:8 and 2:10:10:10; the nearest one for other
-// 32-bit formats). Records the dispatch that fills the downscale buffer and returns true, or
-// false for the ordinary copy (any other resolve, another pixel size, the cvar off).
+// its top-left raster part, which is how the HUD's shaders read it; the ordinary copy takes its
+// pixels from the whole scaled surface, so guest memory got the picture at three quarters of its
+// size, the rest black. This one gives each guest pixel of the picture the average of the host
+// pixels it covers in that part (8:8:8:8 and 2:10:10:10; the nearest one for other 32-bit
+// formats). It runs after the ordinary copy's dispatch into the same downscale buffer and writes
+// only the picture's pixels: the rest of the run (the texture's padding beside and below the
+// picture) keeps what the ordinary copy put there. Returns false when it records nothing (any
+// other resolve, another pixel size, the cvar off).
 bool VulkanCommandProcessor::Fh1RasterReadback(VkDescriptorSet descriptor_set, uint32_t tile_count,
                                                uint32_t source_offset_bytes,
                                                uint32_t written_address, uint32_t written_length) {
@@ -8369,6 +8372,8 @@ void main() {
   if (tile >= tileCount) return;
   uvec2 local = gl_LocalInvocationID.xy;
   uvec2 guest = uvec2(tile % pitchTiles, tile / pitchTiles) * 32u + local;
+  // Only the picture: the other pixels of the run keep the ordinary copy's values.
+  if (guest.x >= width || guest.y >= height) return;
   uvec2 last = uvec2(rasterWidth, rasterHeight) - 1u;
   uint value;
   if (mode == 0u) {
@@ -8386,7 +8391,6 @@ void main() {
       for (uint x = 0u; x < 4u; ++x) {
         float weight = weightsX[x] * weightsY[y];
         if (weight <= 0.0) continue;
-        // Past the picture (the texture's padding): its last row or column.
         sum += channels(load(min(uvec2(firstX + x, firstY + y), last))) * weight;
         total += weight;
       }
@@ -8450,6 +8454,19 @@ void main() {
                                 copy.raster_height,
                                 mode,
                                 uint32_t(dest_info.copy_dest_endian)};
+  // After the ordinary copy's writes to the downscale buffer.
+  VkBufferMemoryBarrier barrier = {};
+  barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.buffer = resolve_downscale_buffer_;
+  barrier.offset = 0;
+  barrier.size = written_length;
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                                                1, &barrier, 0, nullptr);
   BindExternalComputePipeline(fh1_raster_readback_pipeline_);
   deferred_command_buffer_.CmdVkPushConstants(
       fh1_raster_readback_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
@@ -9014,34 +9031,32 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &pre_barrier, 0, nullptr);
 
-    // 1000 (#879): a picture drawn on the fractional raster is copied from the part it fills.
-    if (!Fh1RasterReadback(descriptor_set, tile_count,
-                           uint32_t(scaled_start - scaled_source_window_start), written_address,
-                           written_length)) {
-      BindExternalComputePipeline(resolve_downscale_pipeline_);
+    BindExternalComputePipeline(resolve_downscale_pipeline_);
 
-      ResolveDownscaleConstants constants;
-      constants.scale_x = texture_cache_->draw_resolution_scale_x();
-      constants.scale_y = texture_cache_->draw_resolution_scale_y();
-      constants.pixel_size_log2 = pixel_size_log2;
-      constants.tile_count = tile_count;
-      constants.source_offset_bytes = uint32_t(scaled_start - scaled_source_window_start);
-      constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
-                                     (constants.scale_x > 1 || constants.scale_y > 1))
-                                        ? 1u
-                                        : 0u;
-      // RGBA8 car thumbnails are saved at guest resolution. Average their
-      // supersampled pixels rather than discarding all but one sample.
-      if (thumbnail_readback)
-        constants.half_pixel_offset = 2u;
-      deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
-                                                  VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
-                                                  &constants);
-      deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                       resolve_downscale_pipeline_layout_, 0, 1,
-                                                       &descriptor_set, 0, nullptr);
-      deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
-    }
+    ResolveDownscaleConstants constants;
+    constants.scale_x = texture_cache_->draw_resolution_scale_x();
+    constants.scale_y = texture_cache_->draw_resolution_scale_y();
+    constants.pixel_size_log2 = pixel_size_log2;
+    constants.tile_count = tile_count;
+    constants.source_offset_bytes = uint32_t(scaled_start - scaled_source_window_start);
+    constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
+                                   (constants.scale_x > 1 || constants.scale_y > 1))
+                                      ? 1u
+                                      : 0u;
+    // RGBA8 car thumbnails are saved at guest resolution. Average their
+    // supersampled pixels rather than discarding all but one sample.
+    if (thumbnail_readback) constants.half_pixel_offset = 2u;
+    deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
+                                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                                                &constants);
+    deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                     resolve_downscale_pipeline_layout_, 0, 1,
+                                                     &descriptor_set, 0, nullptr);
+    deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
+    // 1000 (#879): a picture drawn on the fractional raster is then copied over that from the
+    // part it fills; the pixels of the run outside the picture keep the ordinary copy's.
+    Fh1RasterReadback(descriptor_set, tile_count, constants.source_offset_bytes, written_address,
+                      written_length);
 
     VkBufferMemoryBarrier downscale_barrier = {};
     downscale_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -10217,6 +10232,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
           const ui::vulkan::VulkanDevice::Properties& properties =
               GetVulkanDevice()->properties();
           ReadSensors(properties.vendorID, properties.deviceID, snapshot);
+          // 1000 (#879): the minute's copies of pictures drawn on the fractional raster.
+          if (fh1_raster_readbacks_ != fh1_raster_readbacks_logged_) {
+            REXGPU_INFO("Fractional raster readbacks: {} in the last minute, {} in all",
+                        fh1_raster_readbacks_ - fh1_raster_readbacks_logged_,
+                        fh1_raster_readbacks_);
+            fh1_raster_readbacks_logged_ = fh1_raster_readbacks_;
+          }
           // FH1 (#45): how many draws kept the previous render target setup, once a minute.
           for (VulkanRenderTargetCache* rt_cache :
                {render_target_cache_.get(), fh1_other_render_targets_.get()}) {

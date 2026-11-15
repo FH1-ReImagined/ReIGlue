@@ -814,6 +814,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipelineLayout fh1_raster_readback_layout_ = VK_NULL_HANDLE;
   bool fh1_raster_readback_failed_ = false;
   uint64_t fh1_raster_readbacks_ = 0;
+  uint64_t fh1_raster_readbacks_logged_ = 0;
   bool Fh1RasterReadback(VkDescriptorSet descriptor_set, uint32_t tile_count,
                          uint32_t source_offset_bytes, uint32_t written_address,
                          uint32_t written_length);

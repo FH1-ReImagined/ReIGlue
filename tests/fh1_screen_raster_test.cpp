@@ -118,6 +118,19 @@ int main() {
   check(!GetFractionalReadback(1280, 720, 2, 2, 0.75f, 1.5f, 40, copy));
   check(!GetFractionalReadback(1280, 720, 2, 2, 0.75f, 0.75f, 39, copy));
   check(!GetFractionalReadback(1280, 720, 2, 2, 0.75f, 0.75f, 0, copy) && !copy.valid());
+  // A copy narrower than its texture keeps the ordinary copy: its run of tiles holds other
+  // pictures (the car picture's two views, 608 and 160 wide, in a 768x288 texture: 24 tiles; a
+  // 640x360 or 256x256 corner of a 1280-pixel pitch). One that ends in the last tile column is
+  // whole (768 and 750 of 24 tiles).
+  check(!GetFractionalReadback(608, 288, 2, 2, 0.75f, 0.75f, 24, copy) && !copy.valid());
+  check(!GetFractionalReadback(160, 288, 2, 2, 0.75f, 0.75f, 24, copy) && !copy.valid());
+  check(!GetFractionalReadback(736, 288, 2, 2, 0.75f, 0.75f, 24, copy) && !copy.valid());
+  check(!GetFractionalReadback(640, 360, 2, 2, 0.75f, 0.75f, 40, copy) && !copy.valid());
+  check(!GetFractionalReadback(256, 256, 2, 2, 0.75f, 0.75f, 40, copy) && !copy.valid());
+  check(GetFractionalReadback(768, 288, 2, 2, 0.75f, 0.75f, 24, copy) &&
+        copy.raster_width == 1152 && copy.raster_height == 432 && copy.pitch_tiles == 24);
+  check(GetFractionalReadback(744, 288, 2, 2, 0.75f, 0.75f, 24, copy) && copy.raster_width == 1116);
+  copy = {};
   // A guest pixel covers 1.5 host pixels there: one whole and half of its neighbour, in turn.
   const auto near = [](float a, float b) { return a - b < 1e-5f && b - a < 1e-5f; };
   RasterTaps taps = GetRasterTaps(0, 1280, 1920);

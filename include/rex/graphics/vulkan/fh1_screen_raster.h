@@ -109,24 +109,29 @@ constexpr float TileFrameOrigin(bool axis_enabled, float viewport_scale, float v
 // shaders read every screen texture at 0.75 of its coordinates, so in the scaled resolve a
 // picture drawn there fills the top-left 0.75. The CPU reads guest memory as it is: a Big
 // Shot's tile, a replay movie's frame, a photo and its thumbnail were copied back from the whole
-// scaled surface, one host pixel a block, and came out at three quarters of their size in the
-// top left, the rest black. Such a copy takes the raster's part: each guest pixel is the
-// average of the host pixels it covers there. Only a whole picture (the copy starts at the
-// surface's and at the texture's origin); a predicated tiling tile keeps the copy it had.
+// scaled surface and came out at three quarters of their size in the top left, the rest black.
+// Such a copy takes the raster's part: each guest pixel is the average of the host pixels it
+// covers there. Only a whole picture: the copy starts at the surface's and at the texture's
+// origin and reaches the texture's last column of 32-pixel tiles. The readback covers a run of
+// whole tiles from the copy's first to its last, so a copy narrower than its texture has other
+// pictures' tiles in its run (a car picture's two views share a 768x288 texture): it keeps the
+// ordinary copy, as a predicated tiling tile does.
 struct FractionalReadback {
   unsigned width = 0, height = 0;                // the copy, in guest pixels
   unsigned raster_width = 0, raster_height = 0;  // the scaled copy's host pixels with the picture
   unsigned pitch_tiles = 0;                      // the texture's pitch in 32-pixel tiles
   constexpr bool valid() const { return width != 0; }
 };
-// False when the raster fills the scaled surface (1440p, 4K), for an empty copy, or when the
-// picture's part is not a whole number of host pixels.
+// False when the raster fills the scaled surface (1440p, 4K), for an empty copy, for a copy that
+// does not reach the last tile column of its texture's pitch, or when the picture's part is not a
+// whole number of host pixels.
 constexpr bool GetFractionalReadback(unsigned width, unsigned height, unsigned backing_x,
                                      unsigned backing_y, float scale_x, float scale_y,
                                      unsigned pitch_tiles, FractionalReadback& out) {
   if (!width || !height || !backing_x || !backing_y || !pitch_tiles ||
       !(scale_x > 0.0f && scale_x <= 1.0f && scale_y > 0.0f && scale_y <= 1.0f) ||
-      (scale_x == 1.0f && scale_y == 1.0f) || width > pitch_tiles * 32)
+      (scale_x == 1.0f && scale_y == 1.0f) || width > pitch_tiles * 32 ||
+      width + 32 <= pitch_tiles * 32)
     return false;
   const float raster_x = float(width * backing_x) * scale_x;
   const float raster_y = float(height * backing_y) * scale_y;
