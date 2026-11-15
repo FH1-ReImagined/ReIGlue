@@ -46,7 +46,33 @@ enum Op : uint32_t {
   // for the next record: [2] island id, [3] the first word (from register 0x4000), [4] words,
   // then the words.
   kOpLiterals = 0x15,
+  // 0650: the native renderer's model lists (FH1 M4, "third step"; fh1_native_list.cpp). Unlike
+  // the ops above they are handled on the decoder, when the command processor reads them, so a
+  // list is registered before the indirect buffer that runs it is decoded.
+  // A template (FH1 src/platform/native_list.h): [2] its id, [3] the guest (virtual) address
+  // of its words (guest byte order), [4] its words, [5] a sequence number, [6] the first word
+  // of the 128-bit hash of its words (host order), [7] the guest (virtual) address of the
+  // game's acknowledgement word: the command processor stores the sequence number there once it
+  // has read the template, and the game reuses its memory only after that. An id seen before
+  // (the same packet replayed for another tile) is not read again.
+  kOpListDefine = 0x20,
+  // A list at a physical address: [2] the address, [3] its dwords, [4] its template's id, or
+  // kListRefused when the game's converter refused it, [5] the refusal's code then, [6] the
+  // guest (virtual) address of its state word (big endian: the generation, which the game
+  // makes odd while a fixup writes the list and even again after it), [7] the command buffer
+  // (guest virtual: its header), [8] its patch table (guest virtual), [9] the patch table's
+  // words, [10] the pass group (pass * 3 + layer, kListGroupNone if not known), [11] flags
+  // (kListRetiled).
+  kOpListBind = 0x21,
+  // The list at a physical address is unloaded: [2] the address, [3] its dwords.
+  kOpListDrop = 0x22,
 };
+constexpr uint32_t kListDefineWords = 8, kListBindWords = 12, kListDropWords = 4;
+constexpr uint32_t kListRefused = 0xFFFFFFFFu;
+constexpr uint32_t kListGroupNone = 0xFF;
+// The game converted the list from a copy with its tile-bound packets put back (it was untiled
+// when it first ran).
+constexpr uint32_t kListRetiled = 1;
 constexpr uint32_t kLiteralsHeaderWords = 5;
 constexpr uint32_t kRefMaxWords = 16384;
 constexpr uint32_t kConstantsSeed = 1;

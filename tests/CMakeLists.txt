@@ -11,6 +11,12 @@ add_executable(fh1_screen_raster_test fh1_screen_raster_test.cpp)
 target_include_directories(fh1_screen_raster_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME fh1.screen_raster COMMAND fh1_screen_raster_test)
 
+# FH1 (0650): the model list registry and its shadow compare, header only, on a fixture of FH1's
+# converter (tests/fh1_native_list_fixture.h).
+add_executable(fh1_native_list_test fh1_native_list_test.cpp)
+target_include_directories(fh1_native_list_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME fh1.native_list COMMAND fh1_native_list_test)
+
 find_package(Threads REQUIRED)
 add_executable(pipeline_retirement_test pipeline_retirement_test.cpp)
 target_include_directories(pipeline_retirement_test PRIVATE ${PROJECT_SOURCE_DIR}/include)

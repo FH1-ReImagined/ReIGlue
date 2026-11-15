@@ -97,6 +97,9 @@ class CommandProcessor {
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
   // FH1 (0610): the native renderer's shadow mode statistics (fh1_native_shadow.cpp).
   struct Fh1NativeShadow;
+  // FH1 (0650): the native renderer's model list registry and its shadow compare
+  // (fh1_native_list.cpp).
+  struct Fh1Lists;
 
   virtual bool Initialize();
   virtual void Shutdown();
@@ -371,6 +374,20 @@ class CommandProcessor {
   void Fh1NativeShadowPacket(const uint32_t* words, uint32_t count);
   void Fh1NativeShadowDraw(uint32_t initiator, bool indexed, uint32_t index_base);
   void Fh1NativeShadowShutdown();
+
+  // FH1 (0650): the game's model lists (fh1_native_list.cpp): the registry ops, handled on the
+  // decoder; the run of a registered list compared with its template. Null until the first
+  // registry op, so without the game's native_lists switch nothing here runs.
+  Fh1Lists* fh1_lists_ = nullptr;
+  // The indirect buffer whose list is being compared (its draw packets are reported).
+  memory::RingBuffer* fh1_list_reader_ = nullptr;
+  void Fh1ListPacket(const uint32_t* words, uint32_t count);
+  bool Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader);
+  void Fh1ListDraw(uint32_t packet_offset, bool executed);
+  void Fh1ListEnd();
+  void Fh1ListShader(uint32_t address_type, uint32_t start_size);
+  void Fh1ListsSwap();
+  void Fh1ListsShutdown();
 
   // (type-0 packet, SET_CONSTANT of registers, SET_CONSTANT2) made only of such registers from
   // the ring itself, without the two virtual calls and the backend's sorting of the range (most
