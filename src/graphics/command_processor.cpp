@@ -664,12 +664,20 @@ uint32_t* CommandProcessor::RecordRun(uint32_t start_index, uint32_t num_registe
 }
 
 void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
-  Fh1ListWrites(index, 1);  // FH1 (0650)
   if (!record_split_) {
+    // FH1 (0650): with a run open, the write told and made out of line (a tail call): the
+    // unsplit path stays a test and the tail call, without a stack frame.
+    if (fh1_list_reader_) [[unlikely]] {
+      Fh1ListWriteRegister(index, value);
+      return;
+    }
     WriteRegister(index, value);
     return;
   }
   ++record_registers_in_;
+  // FH1 (0650). After the count: as the unsplit path's first instruction it would be hoisted
+  // above the split test, a load on the unsplit path.
+  Fh1ListWrites(index, 1);
   if (record_elide_ && ElidableOne(index) && decode_register_file_->values[index] == value) {
     return;
   }
@@ -712,19 +720,21 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
   if (!num_registers) {
     return;
   }
-  Fh1ListWrites(start_index, num_registers);  // FH1 (0650)
   if (!record_split_) {
+    Fh1ListWrites(start_index, num_registers);  // FH1 (0650)
     WriteRegistersFromMem(start_index, const_cast<uint32_t*>(base), num_registers);
     return;
   }
   if (uint64_t(start_index) + num_registers > RegisterFile::kRegisterCount) {
-    // Out of the register file: one at a time, as WriteRegistersFromMem does.
+    // Out of the register file: one at a time, as WriteRegistersFromMem does (each told to the
+    // run, FH1 0650, by PacketWriteRegister).
     for (uint32_t i = 0; i < num_registers; ++i) {
       PacketWriteRegister(start_index + i, memory::load_and_swap<uint32_t>(base + i));
     }
     return;
   }
   record_registers_in_ += num_registers;
+  Fh1ListWrites(start_index, num_registers);  // FH1 (0650)
   if (record_elide_ && start_index >= kElideFirst &&
       !(start_index <= XE_GPU_REG_VGT_DRAW_INITIATOR &&
         start_index + num_registers > XE_GPU_REG_VGT_EVENT_INITIATOR)) {
@@ -1381,7 +1391,6 @@ bool CommandProcessor::Fh1WritePlainRangeFromRing(memory::RingBuffer* ring, uint
     const_cast<volatile uint32_t&>(values[base + i]) = memory::load_and_swap<uint32_t>(source + i);
   }
   ring->set_read_offset_within(read_offset + range_bytes);
-  Fh1ListWrites(base, count);  // FH1 (0650)
   return true;
 }
 
@@ -1713,7 +1722,7 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   uint32_t write_one_reg = (packet >> 15) & 0x1;
   if (!write_one_reg) {
     // FH1 (#45, patch 0360): render state the backend only stores, straight from the ring.
-    if (fh1_plain_registers_ && Fh1WritePlainRangeFromRing(reader, base_index, count)) {
+    if (fh1_plain_registers_ && Fh1WritePlainRange(reader, base_index, count)) {
       return true;
     }
     // Consecutive registers: as a range, so the backend can take the constant
@@ -2923,8 +2932,7 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reade
       break;
     case 4:  // REGISTERS
       // FH1 (#45, patch 0360): as in ExecutePacketType0.
-      if (fh1_plain_registers_ &&
-          Fh1WritePlainRangeFromRing(reader, index + 0x2000, count_registers)) {
+      if (fh1_plain_registers_ && Fh1WritePlainRange(reader, index + 0x2000, count_registers)) {
         break;
       }
       WriteREGISTERSRangeFromRing(reader, index, count_registers);
@@ -2942,7 +2950,7 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
   uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
   uint32_t index = offset_type & 0xFFFF;
   // FH1 (#45, patch 0360): as in ExecutePacketType0.
-  if (fh1_plain_registers_ && Fh1WritePlainRangeFromRing(reader, index, count - 1)) {
+  if (fh1_plain_registers_ && Fh1WritePlainRange(reader, index, count - 1)) {
     return true;
   }
   WriteRegisterRangeFromRing(reader, index, count - 1);

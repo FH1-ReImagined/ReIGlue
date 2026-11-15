@@ -342,6 +342,13 @@ void TestRegistry() {
   b.cb = 0x40001000;
   CHECK(reg.Bind(b) == fl::BindResult::kNew);
   CHECK(reg.Bind(b) == fl::BindResult::kSame);  // the packet replayed for another tile
+  // Another pass group, or the retiled flag, is another bind.
+  fl::Binding other = b;
+  other.group = 12;
+  CHECK(reg.Bind(other) == fl::BindResult::kReplaced && reg.Bind(other) == fl::BindResult::kSame);
+  other.flags = 1;
+  CHECK(reg.Bind(other) == fl::BindResult::kReplaced);
+  CHECK(reg.Bind(b) == fl::BindResult::kReplaced && reg.bindings() == 1);
   fl::Skip skip;
   fl::Binding* found = reg.Lookup(0x17184D40, b.words, &skip);
   CHECK(found && found->template_id == 1 && skip == fl::Skip::kNone);
@@ -359,6 +366,8 @@ void TestRegistry() {
   CHECK(!reg.Lookup(0x17184D40, b.words, &skip) && skip == fl::Skip::kLength);
   // Dropped at the unload, then the address bound to another list.
   CHECK(reg.Drop(0x17184D40) && !reg.Drop(0x17184D40));
+  // A miss there is at a dropped list's address, not at a buffer that was never a list.
+  CHECK(reg.WasBound(0x17184D40) && !reg.WasBound(0x17184D44));
   CHECK(!reg.Lookup(0x17184D40, c.words, &skip) && skip == fl::Skip::kNone);
   CHECK(reg.Bind(b) == fl::BindResult::kNew && reg.bindings() == 1);
   CHECK(reg.Lookup(0x17184D40, b.words, &skip)->template_id == 1);

@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rex::graphics::fh1_list {
@@ -401,7 +402,7 @@ struct Template {
 
 struct Binding {
   uint32_t phys = 0, words = 0, template_id = kNone, refusal = 0;
-  uint32_t state_word = 0, cb = 0, patch = 0, patch_words = 0, group = 0xFF;
+  uint32_t state_word = 0, cb = 0, patch = 0, patch_words = 0, group = 0xFF, flags = 0;
   // The pool resolved at generation pool_generation (even), when pool_valid.
   std::vector<uint32_t> pool;
   bool pool_valid = false;
@@ -442,19 +443,23 @@ class Registry {
     return it == templates_.end() ? nullptr : &it->second;
   }
   BindResult Bind(const Binding& b) {
+    ever_bound_.insert(b.phys);
     auto [it, fresh] = bindings_.try_emplace(b.phys, b);
     if (fresh)
       return BindResult::kNew;
     Binding& e = it->second;
     if (e.words == b.words && e.template_id == b.template_id && e.refusal == b.refusal &&
         e.state_word == b.state_word && e.cb == b.cb && e.patch == b.patch &&
-        e.patch_words == b.patch_words) {
+        e.patch_words == b.patch_words && e.group == b.group && e.flags == b.flags) {
       return BindResult::kSame;
     }
     e = b;
     return BindResult::kReplaced;
   }
   bool Drop(uint32_t phys) { return bindings_.erase(phys) != 0; }
+  // Whether a list was ever bound at phys (a lookup miss there is not a buffer that was never a
+  // list: a list dropped before its run was decoded, or the memory reused for another buffer).
+  bool WasBound(uint32_t phys) const { return ever_bound_.count(phys) != 0; }
   // The list registered at physical address phys for an indirect buffer of `count` dwords, or
   // null (and `*skip` kLength when the address is registered with another length).
   Binding* Lookup(uint32_t phys, uint32_t count, Skip* skip) {
@@ -474,6 +479,7 @@ class Registry {
  private:
   std::unordered_map<uint32_t, Template> templates_;
   std::unordered_map<uint32_t, Binding> bindings_;
+  std::unordered_set<uint32_t> ever_bound_;
 };
 
 // ---- The shadow compare -------------------------------------------------------------------------

@@ -191,6 +191,14 @@ class CommandProcessor {
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   // FH1 (#45, patch 0360): see fh1_plain_registers_.
   bool Fh1WritePlainRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t count);
+  // FH1 (0650): its call sites' entry. With a run open, the range written and told out of line
+  // (Fh1ListWritePlainRange); without one, the test and Fh1WritePlainRangeFromRing as on main.
+  bool Fh1WritePlainRange(memory::RingBuffer* ring, uint32_t base, uint32_t count) {
+    if (fh1_list_reader_) [[unlikely]] {
+      return Fh1ListWritePlainRange(ring, base, count);
+    }
+    return Fh1WritePlainRangeFromRing(ring, base, count);
+  }
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet);
@@ -386,12 +394,38 @@ class CommandProcessor {
   void Fh1ListDraw(uint32_t packet_offset, bool executed);
   void Fh1ListEnd();
   // A register write the decoder makes (its write paths' entries): told to the run being
-  // compared, if any.
+  // compared, if any. These paths are the decoder's hottest (PacketWriteRegister, the ranges
+  // from the ring), so without a run open this must be the null test and a branch never taken,
+  // nothing else: the call is out of line and cold, and on x86-64 clang it keeps every register
+  // but r11 (preserve_most), so a caller keeps its values where they are and saves no register
+  // for it. Where even a call would add to the path (it needs a stack frame), the path instead
+  // hands the whole write to a cold function that tells and makes it: PacketWriteRegister's
+  // unsplit path tail-calls Fh1ListWriteRegister, and Fh1WritePlainRangeFromRing's call sites
+  // take Fh1ListWritePlainRange (Fh1WritePlainRange), so that function stays main's.
   void Fh1ListWrites(uint32_t first, uint32_t count) {
-    if (fh1_list_reader_)
+    if (fh1_list_reader_) [[unlikely]]
       Fh1ListNoteWrites(first, count);
   }
-  void Fh1ListNoteWrites(uint32_t first, uint32_t count);
+#if defined(__clang__) && defined(_M_X64)
+#define REX_FH1_LIST_SEAM __attribute__((noinline, cold, preserve_most))
+#elif defined(__clang__) && defined(__x86_64__)
+  // Hidden: always a direct call, never through the PLT (a lazy binding resolver keeps only
+  // the argument registers, preserve_most needs them all).
+#define REX_FH1_LIST_SEAM __attribute__((noinline, cold, preserve_most, visibility("hidden")))
+#elif defined(__GNUC__) || defined(__clang__)
+#define REX_FH1_LIST_SEAM __attribute__((noinline, cold))
+#else
+#define REX_FH1_LIST_SEAM __declspec(noinline)
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+#define REX_FH1_LIST_COLD __attribute__((noinline, cold))
+#else
+#define REX_FH1_LIST_COLD __declspec(noinline)
+#endif
+  REX_FH1_LIST_SEAM void Fh1ListNoteWrites(uint32_t first, uint32_t count);
+  REX_FH1_LIST_COLD void Fh1ListWriteRegister(uint32_t index, uint32_t value);
+  REX_FH1_LIST_COLD bool Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t base,
+                                                uint32_t count);
   void Fh1ListShader(uint32_t address_type, uint32_t start_size);
   void Fh1ListsSwap();
   void Fh1ListsShutdown();

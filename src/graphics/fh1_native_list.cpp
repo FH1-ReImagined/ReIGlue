@@ -32,6 +32,7 @@
 #include <rex/system/xmemory.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -56,6 +57,9 @@ uint32_t GroupIndex(uint32_t group) {
   return group < 21 ? group : 21;
 }
 constexpr uint32_t kRefusals = 32;
+// The template words the plugin keeps at most (64 MB; a session of the benchmark keeps 1.6 M,
+// the most measured 2.2 M). Templates are never freed in this step (docs, "M4, third step").
+constexpr uint64_t kTemplateWordsCap = uint64_t(16) << 20;
 
 struct GroupCounts {
   uint64_t runs = 0, compared = 0, agree = 0, draws = 0, draws_agree = 0, draws_skipped = 0;
@@ -90,6 +94,12 @@ struct CommandProcessor::Fh1Lists {
   GroupCounts groups[kGroups];
   uint64_t refusals[kRefusals] = {};
   uint64_t other_buffers = 0;
+  // Lookup misses at an address a list was bound at before (dropped since): not counted with
+  // the other buffers, which were never a list.
+  uint64_t dropped_address_misses = 0;
+  // Template words kept are capped (kTemplateWordsCap): a define past it is acknowledged and
+  // counted, not kept (its lists' runs: no-template).
+  uint64_t define_capped = 0;
   // Static key checks: [untiled][differs].
   uint64_t key_checks[2][2] = {};
   uint64_t generation_changes = 0, in_progress = 0, stale_pools = 0;
@@ -147,12 +157,12 @@ void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t fr
       "agree {} ({:.4f}%); draws {} ({} predicated off), agree {} ({:.4f}%); not compared:{} "
       "refusal codes:{}; key checks tiled {} same {} differ, untiled {} same {} differ; pools: "
       "{} generation changes, {} runs during a fixup, {} stale (a slot changed without a fixup); "
-      "other buffers {}{}",
+      "other buffers {}, misses at a dropped list's address {}{}",
       when, frames, all.runs, all.compared, all.untiled_runs, all.agree,
       pct(all.agree, all.compared), all.draws, all.draws_skipped, all.draws_agree,
       pct(all.draws_agree, all.draws), skips, refused.empty() ? " none" : refused,
       s.key_checks[0][0], s.key_checks[0][1], s.key_checks[1][0], s.key_checks[1][1],
-      s.generation_changes, s.in_progress, s.stale_pools, s.other_buffers,
+      s.generation_changes, s.in_progress, s.stale_pools, s.other_buffers, s.dropped_address_misses,
       (s.perturb_every
            ? fmt::format("; {} runs perturbed on purpose (FH1_NATIVE_LISTS_PERTURB)", s.perturbed)
            : std::string()) +
@@ -174,14 +184,15 @@ void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t fr
   }
   REXGPU_INFO(
       "FH1 native lists: draws differing in:{} | list ends differing in:{} | templates {} ({} "
-      "words; defines {}, repeats {}, invalid {}, unreadable {}, hash {}), bound {} (binds {}, "
+      "words; defines {}, repeats {}, invalid {}, unreadable {}, hash {}, past the cap {}), "
+      "bound {} (binds {}, "
       "same {}, replaced {}, to an unknown template {}), drops {} ({} unknown), malformed {}; "
       "compare {:.2f} us a run (begin {:.2f}, draws {:.2f}, end {:.2f}), {:.3f} ms a frame, "
       "packets {:.3f} ms in all",
       draw_fields.empty() ? " none" : draw_fields, end_fields.empty() ? " none" : end_fields,
       s.registry.templates(), s.template_words, s.defines, s.define_repeats, s.define_invalid,
-      s.define_unreadable, s.define_hash, s.registry.bindings(), s.binds, s.bind_same,
-      s.bind_replaced, s.bind_no_template, s.drops, s.drop_unknown, s.malformed,
+      s.define_unreadable, s.define_hash, s.define_capped, s.registry.bindings(), s.binds,
+      s.bind_same, s.bind_replaced, s.bind_no_template, s.drops, s.drop_unknown, s.malformed,
       double(s.ns_begin + s.ns_draw + s.ns_end) * per_run, double(s.ns_begin) * per_run,
       double(s.ns_draw) * per_run, double(s.ns_end) * per_run,
       frames ? double(s.ns_begin + s.ns_draw + s.ns_end) * 1e-6 / double(frames) : 0.0,
@@ -229,6 +240,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
                      hash = words[6], ack = words[7];
       if (s.registry.FindTemplate(id)) {
         ++s.define_repeats;
+      } else if (s.template_words + n > kTemplateWordsCap) {
+        ++s.define_capped;
       } else {
         const auto* blob = n && n <= (8u << 20) && Plausible(address) && Plausible(address + n * 4)
                                ? memory_->TranslateVirtual<const uint8_t*>(address)
@@ -292,6 +305,7 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
       b.patch = words[8];
       b.patch_words = words[9];
       b.group = words[10];
+      b.flags = words[11];
       if (b.template_id != fh::kListRefused && !s.registry.FindTemplate(b.template_id))
         ++s.bind_no_template;
       switch (s.registry.Bind(b)) {
@@ -333,6 +347,8 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     if (skip == fl::Skip::kLength) {
       ++s.groups[21].runs;
       ++s.groups[21].skips[size_t(skip)];
+    } else if (s.registry.WasBound(ptr & 0x1FFFFFFFu)) {
+      ++s.dropped_address_misses;
     } else {
       ++s.other_buffers;
     }
@@ -389,13 +405,18 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   }
   // The pool: read again when the generation changed, as a replay would; read every run too, to
   // find a slot that changed without a fixup.
+  // As a seqlock's reader (the game's fixup hook is the writer): the generation, the slots, the
+  // generation again; odd, or changed in between, is a fixup under way.
   const uint32_t pool_words = t[fl::kTPoolWords];
   s.fresh_pool.resize(pool_words);
-  fl::Resolve(t, pm4, s.fresh_pool.data());
   const auto* state =
       Plausible(b->state_word) ? memory_->TranslateVirtual<const uint8_t*>(b->state_word) : nullptr;
   const uint32_t generation = state ? fl::Word(state, 0) : 0;
-  if (generation & 1) {
+  std::atomic_thread_fence(std::memory_order_acquire);
+  fl::Resolve(t, pm4, s.fresh_pool.data());
+  std::atomic_thread_fence(std::memory_order_acquire);
+  const uint32_t generation_after = state ? fl::Word(state, 0) : 0;
+  if ((generation & 1) || generation_after != generation) {
     ++s.in_progress;
     b->pool_valid = false;
     s.pool = s.fresh_pool;
@@ -496,6 +517,23 @@ void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
 
 void CommandProcessor::Fh1ListNoteWrites(uint32_t first, uint32_t count) {
   fh1_lists_->run.LiveWrites(first, count);
+}
+
+// The write paths' cold halves, with a run open: PacketWriteRegister's unsplit path tail-calls
+// the first (so that path needs no stack frame), Fh1WritePlainRange's call sites call the second
+// (so Fh1WritePlainRangeFromRing stays main's).
+void CommandProcessor::Fh1ListWriteRegister(uint32_t index, uint32_t value) {
+  fh1_lists_->run.LiveWrites(index, 1);
+  WriteRegister(index, value);
+}
+
+bool CommandProcessor::Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t base,
+                                              uint32_t count) {
+  if (!Fh1WritePlainRangeFromRing(ring, base, count)) {
+    return false;
+  }
+  fh1_lists_->run.LiveWrites(base, count);
+  return true;
 }
 
 void CommandProcessor::Fh1ListEnd() {
