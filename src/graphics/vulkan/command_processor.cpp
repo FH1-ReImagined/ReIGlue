@@ -180,6 +180,14 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_skip_render_targets, true, "GPU/Vulkan",
                     "readback buffer was dropped (after the map or a menu)")
     .debug_only();
 
+REXCVAR_DEFINE_BOOL(fh1_hold_scene_layer, false, "GPU/Vulkan",
+                    "FH1 scene/HUD split: while set, a frame's draw to the front buffer in the "
+                    "HUD's format does not take the frame to the HUD layer before the scene is "
+                    "composited. A game sets it while it accumulates a picture over many frames "
+                    "(Forza Horizon's photo mode Big Shot), whose frames then stay in the scene "
+                    "layer whatever they draw first")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_fractional_raster_readback, true, "GPU/Vulkan",
                     "FH1 scene/HUD split at a 1080p output: a picture drawn on the HUD target's "
                     "fractional raster is copied back to guest memory from the part it fills, at "
@@ -7177,9 +7185,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                  xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 &&
                  !fh1_native_hud_active_ &&
                  (!fh1_scene_composited_ || color.color_base == fh1_scene_base_)) {
-        fh1_seed_pending_ = fh1_scene_composited_;
-        Fh1SelectNativeHud(true);
-      }
+        // 1010 (#879): a frame that starts with such a draw and then draws its scene (a rally
+        // stage's) has the whole scene in the HUD layer. A Big Shot accumulates each tile over
+        // 96 frames in a render target that the two layers do not share, so a change of layer
+        // on the way left its first tile a double image: while the game holds the scene layer,
+        // only a frame that has composited its scene changes.
+        if (fh1_scene_composited_ || !REXCVAR_GET(fh1_hold_scene_layer)) {
+          fh1_seed_pending_ = fh1_scene_composited_;
+          Fh1SelectNativeHud(true);
+        }
       }
     }
 
