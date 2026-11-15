@@ -64,6 +64,8 @@ struct State {
   bool unlinked = false;
   uint64_t game_prev[6][kTags]{};
   uint64_t mask_prev[kTags][6]{};
+  uint64_t dev_calls_prev[fh1pm4::kDevices][kTags]{};
+  bool all_foreign = false;  // FH1_PM4_STATS_ALL=1: every foreign buffer, not the 60 most read
 };
 State* g_state = nullptr;
 thread_local int t_ib_depth = 0;
@@ -153,6 +155,7 @@ bool Enabled(uint8_t* physical_base) {
     if (const char* e = std::getenv("FH1_PM4_STATS_EVERY")) {
       state->every = std::max(1, std::atoi(e));
     }
+    if (const char* e = std::getenv("FH1_PM4_STATS_ALL")) state->all_foreign = std::atoi(e) != 0;
     if (!state->shm || !state->out) {
       REXGPU_ERROR("FH1 PM4 trace: cannot open {} or the shared segment", path);
       return false;
@@ -297,7 +300,8 @@ void OnSwap() {
   for (const auto& [key, f] : s.foreign) order.emplace_back(f.times * (key & 0xFFFFF), key);
   std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
   std::fprintf(out, "FOREIGN distinct=%zu\n", s.foreign.size());
-  for (size_t i = 0; i < order.size() && i < 60; ++i) {
+  const size_t shown = s.all_foreign ? order.size() : 60;
+  for (size_t i = 0; i < order.size() && i < shown; ++i) {
     const State::Foreign& f = s.foreign[order[i].second];
     std::fprintf(out, "F %08X n=%u times=%" PRIu64 " depth=%u setconst=%u parent=%u\n",
                  uint32_t(order[i].second >> 20), uint32_t(order[i].second & 0xFFFFF), f.times,
@@ -328,6 +332,19 @@ void OnSwap() {
       std::fprintf(out, "\n");
     }
     uint32_t ndev = std::min<uint32_t>(g.ndev, fh1pm4::kDevices);
+    // Patch 0640: the calls of each device, by function, as deltas.
+    for (uint32_t i = 0; i < ndev; ++i) {
+      bool any = false;
+      for (int id = 0; id < kTags; ++id) {
+        const uint64_t v = __atomic_load_n(&g.dev_calls[i][id], __ATOMIC_RELAXED);
+        if (v == s.dev_calls_prev[i][id]) continue;
+        if (!any) std::fprintf(out, "GD %08X", g.devs[i]);
+        any = true;
+        std::fprintf(out, " %d:%" PRIu64, id, v - s.dev_calls_prev[i][id]);
+        s.dev_calls_prev[i][id] = v;
+      }
+      if (any) std::fprintf(out, "\n");
+    }
     std::fprintf(out, "DEVS n=%u", ndev);
     for (uint32_t i = 0; i < ndev; ++i) {
       std::fprintf(out, " %08X:%" PRIu64, g.devs[i], g.dev_bytes[i]);

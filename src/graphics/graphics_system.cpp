@@ -11,6 +11,8 @@
 
 #include <rex/graphics/graphics_system.h>
 
+#include "fh1_list_trace.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -247,6 +249,9 @@ void GraphicsSystem::WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, u
 
 uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
   uint32_t r = (addr & 0xFFFF) / 4;
+#if REX_FH1_LIST_TRACE
+  if (fh1_list_trace::g_on) fh1_list_trace::CpuRegisterRead(r);  // patch 0640
+#endif
 
   switch (r) {
     case 0x0F00:  // RB_EDRAM_TIMING
