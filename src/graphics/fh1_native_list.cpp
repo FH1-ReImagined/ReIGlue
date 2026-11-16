@@ -238,6 +238,16 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
       }
       const uint32_t id = words[2], address = words[3], n = words[4], sequence = words[5],
                      hash = words[6], ack = words[7];
+      if (!Plausible(ack) || ack % fl::kDefineAckAlignment != 0) {
+        ++s.malformed;
+        break;
+      }
+      // A replay may name storage the game has already reused, even if the first decode
+      // rejected the template or hit the cap and never registered its id.
+      if (!fl::IsNewDefineSequence(sequence, s.last_ack)) {
+        ++s.define_repeats;
+        break;
+      }
       if (s.registry.FindTemplate(id)) {
         ++s.define_repeats;
       } else if (s.template_words + n > kTemplateWordsCap) {
@@ -284,10 +294,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
           }
         }
       }
-      if (Plausible(ack) && sequence > s.last_ack) {
-        s.last_ack = sequence;
-        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual<uint32_t*>(ack), sequence);
-      }
+      fl::PublishDefineAck(*memory_->TranslateVirtual<uint32_t*>(ack), sequence);
+      s.last_ack = sequence;
       break;
     }
     case fh::kOpListBind: {
@@ -419,7 +427,8 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   if ((generation & 1) || generation_after != generation) {
     ++s.in_progress;
     b->pool_valid = false;
-    s.pool = s.fresh_pool;
+    // The rejected snapshot cannot establish agreement with the packet decoder.
+    return no(fl::Skip::kFixupInProgress);
   } else if (b->pool_valid && b->pool_generation == generation) {
     if (b->pool != s.fresh_pool)
       ++s.stale_pools;

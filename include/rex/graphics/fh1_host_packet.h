@@ -52,9 +52,9 @@ enum Op : uint32_t {
   // A template (FH1 src/platform/native_list.h): [2] its id, [3] the guest (virtual) address
   // of its words (guest byte order), [4] its words, [5] a sequence number, [6] the first word
   // of the 128-bit hash of its words (host order), [7] the guest (virtual) address of the
-  // game's acknowledgement word: the command processor stores the sequence number there once it
-  // has read the template, and the game reuses its memory only after that. An id seen before
-  // (the same packet replayed for another tile) is not read again.
+  // game's 64-byte-aligned acknowledgement word: the command processor release-stores the
+  // big-endian sequence after reading the template, and the game acquires it before reuse.
+  // A replayed sequence or an already registered id does not cause another payload read.
   kOpListDefine = 0x20,
   // A list at a physical address: [2] the address, [3] its dwords, [4] its template's id, or
   // kListRefused when the game's converter refused it, [5] the refusal's code then, [6] the

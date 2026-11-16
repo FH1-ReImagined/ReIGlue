@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
@@ -190,6 +191,22 @@ inline uint32_t Word(const uint8_t* guest, size_t index) {
   std::memcpy(&v, guest + index * 4, 4);
   return __builtin_bswap32(v);
 }
+
+constexpr uint32_t kDefineAckAlignment = 64;
+static_assert(std::atomic_ref<uint32_t>::is_always_lock_free);
+static_assert(kDefineAckAlignment % std::atomic_ref<uint32_t>::required_alignment == 0);
+
+// The producer's ring holds fewer than 2^31 outstanding sequences, including at wrap.
+inline bool IsNewDefineSequence(uint32_t sequence, uint32_t last_ack) {
+  const uint32_t distance = sequence - last_ack;
+  return distance != 0 && distance < (uint32_t{1} << 31);
+}
+
+// Once the decoder has finished reading a template, let the game reuse its storage.
+inline void PublishDefineAck(uint32_t& word, uint32_t sequence) {
+  std::atomic_ref<uint32_t>(word).store(__builtin_bswap32(sequence), std::memory_order_release);
+}
+
 inline Key TemplateKey(const uint32_t* t) {
   Key k;
   std::memcpy(k.w, t + kTKey, sizeof(k.w));
@@ -386,12 +403,13 @@ enum class Skip : uint32_t {
   kKeyAtBind,      // the key is not the template's at the first key check after the bind: the
                    // template's slot table or the converter is wrong (not the game), never 0
                    // in a correct build
+  kFixupInProgress,  // the slot snapshot was rejected by the generation check
   kCount,
 };
 constexpr const char* SkipName(Skip s) {
-  constexpr const char* names[] = {"none",   "refused",    "no-template",
-                                   "length", "rebound",    "static-words-changed",
-                                   "nested", "key-at-bind"};
+  constexpr const char* names[] = {"none",    "refused",     "no-template",
+                                   "length",  "rebound",     "static-words-changed",
+                                   "nested",  "key-at-bind", "fixup-in-progress"};
   static_assert(sizeof(names) / sizeof(names[0]) == size_t(Skip::kCount));
   return s < Skip::kCount ? names[size_t(s)] : "?";
 }
