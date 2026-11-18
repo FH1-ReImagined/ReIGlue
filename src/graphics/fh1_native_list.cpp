@@ -380,6 +380,25 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   if (!tmpl)
     return no(fl::Skip::kNoTemplate);
   const uint32_t* t = tmpl->words.data();
+  constexpr auto generation_alignment = std::atomic_ref<uint32_t>::required_alignment;
+  auto* state = Plausible(b->state_word)
+                    ? memory_->TranslateVirtual<uint32_t*>(b->state_word)
+                    : nullptr;
+  if (state && reinterpret_cast<uintptr_t>(state) % generation_alignment)
+    return no(fl::Skip::kFixupInProgress);
+  const auto load_generation = [state]() {
+    return state ? __builtin_bswap32(std::atomic_ref<uint32_t>(*state).load(
+                       std::memory_order_acquire))
+                 : 0u;
+  };
+  const auto generation_changed = [&]() {
+    ++s.in_progress;
+    b->pool_valid = false;
+    return no(fl::Skip::kFixupInProgress);
+  };
+  const uint32_t generation = load_generation();
+  if (generation & 1) return generation_changed();
+
   // The command buffer still names this buffer (its first segment: +116 the chain, then the
   // count, the words and the physical address).
   if (!Plausible(b->cb) || !Plausible(b->patch) || b->patch_words > (1u << 16))
@@ -419,18 +438,12 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   // generation again; odd, or changed in between, is a fixup under way.
   const uint32_t pool_words = t[fl::kTPoolWords];
   s.fresh_pool.resize(pool_words);
-  const auto* state =
-      Plausible(b->state_word) ? memory_->TranslateVirtual<const uint8_t*>(b->state_word) : nullptr;
-  const uint32_t generation = state ? fl::Word(state, 0) : 0;
-  std::atomic_thread_fence(std::memory_order_acquire);
   fl::Resolve(t, pm4, s.fresh_pool.data());
   std::atomic_thread_fence(std::memory_order_acquire);
-  const uint32_t generation_after = state ? fl::Word(state, 0) : 0;
-  if ((generation & 1) || generation_after != generation) {
-    ++s.in_progress;
-    b->pool_valid = false;
+  const uint32_t generation_after = load_generation();
+  if (generation_after != generation) {
     // The rejected snapshot cannot establish agreement with the packet decoder.
-    return no(fl::Skip::kFixupInProgress);
+    return generation_changed();
   } else if (b->pool_valid && b->pool_generation == generation) {
     if (b->pool != s.fresh_pool)
       ++s.stale_pools;
