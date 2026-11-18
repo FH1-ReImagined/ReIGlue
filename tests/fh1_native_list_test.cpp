@@ -20,6 +20,7 @@
 //   file already holds the selected tile's window, a write the template puts on another
 //   register whose value both already hold.
 #include "../src/graphics/fh1_native_list.h"
+#include "../src/graphics/fh1_native_replay_plan.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -586,11 +587,72 @@ void TestDefineAck() {
   CHECK(!fl::IsNewDefineSequence(0x80000000u, 0));
 }
 
+void TestOwnedReplayPlan() {
+  auto untiled = Scene();
+  FixUp(untiled, 3);
+  untiled.pm4 = Untile(std::move(untiled.pm4), untiled.tmpl);
+  for (const auto& fixture : {Depth(), Scene(), untiled}) {
+    const fl::Template registered{fixture.tmpl};
+    auto candidate = fixture.pm4;
+    const auto key = Key(fixture, fixture.header[fl::kHeaderFlags / 4]);
+    const auto compile = [&](const std::vector<uint32_t>& words) {
+      return fl::ReplayPlan::Compile(registered, {2, 2, key, words});
+    };
+    auto plan = compile(candidate);
+    CHECK(plan);
+    // A later change to the producer's copy cannot affect plan operands.
+    std::fill(candidate.begin(), candidate.end(), 0);
+    size_t next = 0;
+    for (const auto& op : plan->operations()) {
+      while (next + 1 < op.first_word) {
+        CHECK(fixture.pm4[next] >> 30 == 2);
+        ++next;
+      }
+      CHECK(op.first_word == next + 1);
+      CHECK(op.header == fixture.pm4[next]);
+      const auto body = plan->body(op);
+      CHECK(body.size() == op.count);
+      CHECK(std::equal(body.begin(), body.end(), fixture.pm4.begin() + op.first_word));
+      next = op.first_word + op.count;
+    }
+    while (next < fixture.pm4.size()) {
+      CHECK(fixture.pm4[next] >> 30 == 2);
+      ++next;
+    }
+    unsigned recorded = 0;
+    CHECK(!plan->Dispatch([&](const auto&, auto) { return ++recorded != 2; }));
+    CHECK(recorded == 2);
+    recorded = 0;
+    CHECK(plan->Dispatch([&](const auto&, auto) { ++recorded; return true; }));
+    CHECK(recorded == plan->operations().size());
+    auto wrong_key = key;
+    wrong_key.w[0] ^= 1;
+    CHECK(!fl::ReplayPlan::Compile(registered, {2, 2, wrong_key, fixture.pm4}));
+    CHECK(!fl::ReplayPlan::Compile(registered, {3, 3, key, fixture.pm4}));
+    CHECK(!fl::ReplayPlan::Compile(registered, {2, 4, key, fixture.pm4}));
+
+    auto denied = fixture.pm4;
+    denied.pop_back();
+    CHECK(!compile(denied));
+    denied = fixture.pm4;
+    denied[0] = 0xffff0000;  // Declared body escapes the owned snapshot.
+    CHECK(!compile(denied));
+    denied[0] = 0xc0001000;  // Host NOP carrying a registry operation.
+    denied[1] = rex::graphics::fh1_host::kMagic;
+    CHECK(!compile(denied));
+    denied[0] = 0xc0003f00;  // Nested INDIRECT_BUFFER.
+    CHECK(!compile(denied));
+    denied[0] = 0x00005003;  // Extended register state outside the trained path.
+    CHECK(!compile(denied));
+  }
+}
+
 }  // namespace
 
 int main() {
   TestValidate();
   TestDefineAck();
+  TestOwnedReplayPlan();
   TestKey();
   TestRegistry();
   TestKeyCheck();
