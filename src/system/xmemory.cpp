@@ -36,6 +36,10 @@
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
 
+#if REX_PLATFORM_WIN32
+#include "physical_replay_capture_win.h"
+#endif
+
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -515,6 +519,58 @@ int Memory::MapViewsMac() {
   return 0;
 }
 #endif  // REX_PLATFORM_MAC
+
+bool Memory::CopyPhysicalForReplay(uint32_t physical, uint8_t* destination, size_t size) {
+#if REX_PLATFORM_WIN32
+  constexpr uint64_t kBackingBase = UINT64_C(0x100000000);
+  constexpr uint64_t kPhysicalSize = UINT64_C(0x20000000);
+  constexpr size_t kPageSize = 4096;
+  constexpr size_t kMaxReplayBytes = 65536 * sizeof(uint32_t);
+  if (!destination || !size || size > kMaxReplayBytes || physical >= kPhysicalSize ||
+      size > kPhysicalSize - physical || rex::memory::page_size() != kPageSize) {
+    return false;
+  }
+  auto lock = std::unique_lock(rex::thread::global_critical_region::mutex(), std::try_to_lock);
+  if (!lock || !virtual_membase_ || !physical_membase_) return false;
+
+  const uintptr_t output = reinterpret_cast<uintptr_t>(destination);
+  const uintptr_t guest = reinterpret_cast<uintptr_t>(virtual_membase_);
+  const uintptr_t guest_end = reinterpret_cast<uintptr_t>(physical_membase_) + kPhysicalSize;
+  if (size > UINTPTR_MAX - output || (output < guest_end && output + size > guest))
+    return false;
+
+  const uint32_t page = physical & ~uint32_t(kPageSize - 1);
+  const size_t offset = physical - page;
+  const size_t span = (offset + size + kPageSize - 1) & ~(kPageSize - 1);
+  HeapAllocationInfo allocation{};
+  if (!heaps_.physical.QueryRegionInfo(page, &allocation) ||
+      !(allocation.state & kMemoryAllocationCommit) || span > allocation.region_size) {
+    return false;
+  }
+
+  const uint64_t first = kBackingBase + page;
+  const uint64_t last = first + span;
+  const uint64_t offset_mask = ~uint64_t(ViewOffsetGranularity() - 1);
+  std::array<uint8_t*, 4> aliases{};
+  size_t count = 0;
+  for (size_t i = 0; i < rex::countof(map_info); ++i) {
+    const auto& view = map_info[i];
+    const uint64_t begin = view.target_address & offset_mask;
+    const uint64_t end = begin + (view.virtual_address_end - view.virtual_address_start + 1);
+    if (last <= begin || first >= end) continue;
+    if (first < begin || last > end || count == aliases.size() || !views_.all_views[i])
+      return false;
+    aliases[count++] = views_.all_views[i] + (first - begin);
+  }
+  if (count != aliases.size() || aliases.back() != physical_membase_ + page) return false;
+  return detail::CopyFrozenReplayAliases(aliases, span, offset, {destination, size});
+#else
+  (void)physical;
+  (void)destination;
+  (void)size;
+  return false;
+#endif
+}
 
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));

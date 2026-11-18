@@ -442,6 +442,10 @@ class Memory {
   // Base address of physical memory in the host address space.
   // This is often something like 0x200000000.
   inline uint8_t* physical_membase() const { return physical_membase_; }
+  // Copy command bytes from one committed physical allocation into private
+  // host storage. The caller still supplies the current binding and its
+  // native write/free guard. Unsupported mappings return false.
+  bool CopyPhysicalForReplay(uint32_t physical, uint8_t* destination, size_t size);
 
   // Translates a guest physical address to a host address that can be accessed
   // as a normal pointer.
