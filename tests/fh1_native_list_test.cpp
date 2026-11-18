@@ -571,10 +571,26 @@ void TestCompare() {
         !fl::MarkRegister(0x57D) && !fl::MarkRegister(0x2080));
 }
 
+void TestDefineAck() {
+  alignas(fl::kDefineAckAlignment) uint32_t ack = 0;
+  constexpr uint8_t guest_bytes[] = {1, 2, 3, 4};
+  fl::PublishDefineAck(ack, 0x01020304u);
+  CHECK(std::memcmp(&ack, guest_bytes, sizeof(ack)) == 0);
+
+  CHECK(fl::IsNewDefineSequence(1, 0));
+  CHECK(!fl::IsNewDefineSequence(1, 1));
+  CHECK(!fl::IsNewDefineSequence(1, 2));
+  CHECK(fl::IsNewDefineSequence(0, UINT32_MAX));
+  CHECK(fl::IsNewDefineSequence(1, UINT32_MAX));
+  CHECK(!fl::IsNewDefineSequence(UINT32_MAX, 0));
+  CHECK(!fl::IsNewDefineSequence(0x80000000u, 0));
+}
+
 }  // namespace
 
 int main() {
   TestValidate();
+  TestDefineAck();
   TestKey();
   TestRegistry();
   TestKeyCheck();
