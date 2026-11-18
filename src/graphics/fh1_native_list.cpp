@@ -44,6 +44,8 @@
 #include <fmt/format.h>
 
 #include "fh1_native_list.h"
+#include "fh1_command_cursor.h"
+#include "fh1_native_replay_plan.h"
 
 namespace rex::graphics {
 
@@ -486,6 +488,30 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     ++g.untiled_runs;
   fh1_list_reader_ = reader;
   s.ns_begin += NowNs() - t0;
+  return true;
+}
+
+bool CommandProcessor::Fh1RecordOwnedList(const fl::ReplayPlan& plan) {
+  const auto words = plan.guest_words();
+  // RingBuffer's constructor takes a writable pointer. The selected PM4
+  // handlers only read this backing and advance the cursor.
+  auto* data = reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(words.data()));
+  memory::RingBuffer reader(data, words.size_bytes());
+  reader.set_write_offset(words.size_bytes());
+  fh1_command_cursor::Scope cursor_scope(&reader);
+  for (const auto& op : plan.operations()) {
+    reader.set_read_offset_within(op.first_word * sizeof(uint32_t));
+    const bool ok = op.kind == fl::ReplayPlan::Kind::kType3
+                        ? ExecutePacketType3(&reader, op.header)
+                        : ExecutePacketType0(&reader, op.header);
+    // Dispatch has started and may have changed emulated state. The caller
+    // reports an execution failure instead of restarting on the stock path.
+    const size_t end = (op.first_word + op.count) * sizeof(uint32_t);
+    const size_t next = end == words.size_bytes() ? 0 : end;
+    if (!ok || reader.read_offset() != next) {
+      return false;
+    }
+  }
   return true;
 }
 

@@ -5,6 +5,7 @@
 #include <rex/graphics/fh1_host_packet.h>
 
 #include <optional>
+#include <ranges>
 #include <span>
 #include <utility>
 
@@ -66,12 +67,17 @@ class ReplayPlan {
       i += count;
     }
     if (plan.operations_.empty()) return std::nullopt;
+    // Use the same byte order as a stock PM4 reader. This conversion runs
+    // once at preparation, rather than once per recorded packet.
+    for (auto& word : plan.words_) word = __builtin_bswap32(word);
     return plan;
   }
 
   std::span<const Operation> operations() const { return operations_; }
-  std::span<const uint32_t> body(const Operation& op) const {
-    return std::span(words_).subspan(op.first_word, op.count);
+  std::span<const uint32_t> guest_words() const { return words_; }
+  auto body(const Operation& op) const {
+    return guest_words().subspan(op.first_word, op.count) |
+           std::views::transform([](uint32_t word) { return __builtin_bswap32(word); });
   }
 
   // A false result means dispatch may already have produced effects. The

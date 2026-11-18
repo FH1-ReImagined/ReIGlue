@@ -600,6 +600,9 @@ void TestOwnedReplayPlan() {
     };
     auto plan = compile(candidate);
     CHECK(plan);
+    const auto guest = Guest(fixture.pm4);
+    CHECK(plan->guest_words().size_bytes() == guest.size());
+    CHECK(std::memcmp(plan->guest_words().data(), guest.data(), guest.size()) == 0);
     // A later change to the producer's copy cannot affect plan operands.
     std::fill(candidate.begin(), candidate.end(), 0);
     size_t next = 0;
