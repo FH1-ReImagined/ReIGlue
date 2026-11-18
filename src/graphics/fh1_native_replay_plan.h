@@ -4,6 +4,7 @@
 
 #include <rex/graphics/fh1_host_packet.h>
 
+#include <array>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -16,6 +17,7 @@ namespace rex::graphics::fh1_list {
 class ReplayPlan {
  public:
   enum class Kind { kRegisterRange, kRepeatedRegister, kType3 };
+  enum class AddressSpace { kVirtual, kPhysical };
 
   struct Operation {
     Kind kind;
@@ -43,9 +45,6 @@ class ReplayPlan {
   };
 
   static std::optional<ReplayPlan> Compile(const Template& registered, Snapshot snapshot) {
-    // Keep both the input image and the operation table bounded. Large lists
-    // continue through the ordinary decoder.
-    constexpr size_t kMaxWords = 1u << 16;
     if ((snapshot.generation_before & 1) ||
         snapshot.generation_before != snapshot.generation_after ||
         snapshot.words.empty() || snapshot.words.size() > kMaxWords ||
@@ -54,8 +53,105 @@ class ReplayPlan {
         registered.words[kTListWords] != snapshot.words.size()) {
       return std::nullopt;
     }
-    ReplayPlan plan(std::move(snapshot.words));
     size_t input_count = 0;
+    auto plan = Build(std::move(snapshot.words), [&](uint32_t address, uint32_t dwords)
+                         -> std::optional<MemorySnapshot> {
+      if (input_count == snapshot.inputs.size()) return std::nullopt;
+      auto& input = snapshot.inputs[input_count++];
+      if (input.address != address || input.guest_words.size() != dwords) return std::nullopt;
+      return std::move(input);
+    });
+    if (input_count != snapshot.inputs.size()) return std::nullopt;
+    return plan;
+  }
+
+  // Called with a producer lease that excludes writes and frees for the
+  // binding and checks ownership of every requested range. Generations
+  // detect fixups and publication changes, but do not confer that lease.
+  template <typename Lease>
+  static std::optional<ReplayPlan> Capture(const Template& registered, const Binding& binding,
+                                           Lease& lease) {
+    if (!binding.incarnation || !binding.state_word || !binding.cb ||
+        (binding.cb & 3) || (binding.state_word & 3) || (binding.patch & 3) ||
+        binding.patch_words > kMaxWords || (binding.patch_words && !binding.patch) ||
+        !binding.words || binding.words > kMaxWords || (binding.phys & 3) ||
+        binding.phys >= kPhysicalBytes ||
+        binding.words * sizeof(uint32_t) > kPhysicalBytes - binding.phys ||
+        !Validate(registered.words.data(), registered.words.size()) ||
+        registered.words[kTListWords] != binding.words || !lease.Matches(binding))
+      return std::nullopt;
+
+    const auto generation = lease.ReadGeneration(binding.state_word);
+    if (!generation || (*generation & 1)) return std::nullopt;
+    const auto copy = [&](AddressSpace space, uint32_t address, auto& data) {
+      auto bytes = std::as_writable_bytes(std::span(data));
+      return bytes.empty() || (bytes.size() - 1 <= UINT32_MAX - address &&
+                               lease.Copy(space, address, bytes));
+    };
+    std::array<uint8_t, kHeaderBytes> header;
+    std::array<uint8_t, 16> link;
+    if (!copy(AddressSpace::kVirtual, binding.cb, header)) return std::nullopt;
+    const uint32_t chain = Word(header.data(), kCommandChain / 4);
+    if (!chain || (chain & 3) || Word(header.data(), kCommandPatch / 4) != binding.patch ||
+        Word(header.data(), kHeaderPatchWords / 4) != binding.patch_words ||
+        !copy(AddressSpace::kVirtual, chain, link) ||
+        Word(link.data(), 0) || Word(link.data(), 1) != 1 ||
+        (Word(link.data(), 2) & 0xffffffu) != binding.words ||
+        (Word(link.data(), 3) & 0x1fffffffu) != binding.phys) return std::nullopt;
+
+    std::vector<uint32_t> patch(binding.patch_words), words(binding.words);
+    if (!copy(AddressSpace::kVirtual, binding.patch, patch) ||
+        !copy(AddressSpace::kPhysical, binding.phys, words)) return std::nullopt;
+    const uint32_t* t = registered.words.data();
+    if (LiveKey(t, header.data(), FilesFormFlags(Word(header.data(), kHeaderFlags / 4)),
+                reinterpret_cast<const uint8_t*>(patch.data()), binding.patch_words,
+                reinterpret_cast<const uint8_t*>(words.data()), binding.words) != TemplateKey(t))
+      return std::nullopt;
+
+    for (auto& word : words) word = __builtin_bswap32(word);
+    auto plan = Build(std::move(words), [&](uint32_t address, uint32_t dwords)
+                          -> std::optional<MemorySnapshot> {
+      MemorySnapshot input{address, std::vector<uint32_t>(dwords)};
+      if (!copy(AddressSpace::kPhysical, address & 0x1fffffffu, input.guest_words))
+        return std::nullopt;
+      return input;
+    });
+    if (!plan || lease.ReadGeneration(binding.state_word) != generation) return std::nullopt;
+    plan->captured_generation_ = generation;
+    return plan;
+  }
+
+  std::optional<uint32_t> captured_generation() const { return captured_generation_; }
+  std::span<const Operation> operations() const { return operations_; }
+  std::span<const uint32_t> guest_words() const { return words_; }
+  std::span<const uint32_t> input_words(const Operation& op) const {
+    return op.input == UINT32_MAX ? std::span<const uint32_t>{} : inputs_[op.input].guest_words;
+  }
+  auto body(const Operation& op) const {
+    return guest_words().subspan(op.first_word, op.count) |
+           std::views::transform([](uint32_t word) { return __builtin_bswap32(word); });
+  }
+
+  // A false result means dispatch may already have produced effects. The
+  // caller decides on stock fallback before starting this operation.
+  template <typename Recorder>
+  bool Dispatch(Recorder&& record) const {
+    for (const auto& op : operations_) {
+      if (!record(op, body(op))) return false;
+    }
+    return true;
+  }
+
+ private:
+  static constexpr size_t kMaxWords = 1u << 16;
+  static constexpr uint32_t kPhysicalBytes = 0x20000000u;
+  static constexpr uint32_t kCommandChain = 116, kCommandPatch = 144, kHeaderPatchWords = 124;
+
+  explicit ReplayPlan(std::vector<uint32_t> words) : words_(std::move(words)) {}
+
+  template <typename ReadInput>
+  static std::optional<ReplayPlan> Build(std::vector<uint32_t> words, ReadInput&& read_input) {
+    ReplayPlan plan(std::move(words));
     size_t input_words = 0;
     for (uint32_t i = 0; i < plan.words_.size();) {
       const uint32_t header = plan.words_[i++];
@@ -80,50 +176,25 @@ class ReplayPlan {
         const uint32_t address = plan.words_[i] & (opcode == 0x27 ? ~3u : 0x3fffffffu);
         const uint32_t dwords = opcode == 0x27 ? plan.words_[i + 1] : kLiteralWords;
         const uint32_t physical = address & 0x1fffffffu;
-        if ((address & 3) || input_count == snapshot.inputs.size() ||
-            dwords > kMaxWords - input_words ||
-            dwords * sizeof(uint32_t) > 0x20000000u - physical) {
+        if ((address & 3) || dwords > kMaxWords - input_words ||
+            dwords * sizeof(uint32_t) > kPhysicalBytes - physical) {
           return std::nullopt;
         }
-        const auto& input = snapshot.inputs[input_count];
-        if (input.address != address || input.guest_words.size() != dwords)
-          return std::nullopt;
-        op.input = uint32_t(input_count++);
+        auto input = read_input(address, dwords);
+        if (!input) return std::nullopt;
+        op.input = uint32_t(plan.inputs_.size());
+        plan.inputs_.push_back(std::move(*input));
         input_words += dwords;
       }
       plan.operations_.push_back(op);
       i += count;
     }
-    if (plan.operations_.empty() || input_count != snapshot.inputs.size()) return std::nullopt;
-    plan.inputs_ = std::move(snapshot.inputs);
+    if (plan.operations_.empty()) return std::nullopt;
     // Use the same byte order as a stock PM4 reader. This conversion runs
     // once at preparation, rather than once per recorded packet.
     for (auto& word : plan.words_) word = __builtin_bswap32(word);
     return plan;
   }
-
-  std::span<const Operation> operations() const { return operations_; }
-  std::span<const uint32_t> guest_words() const { return words_; }
-  std::span<const uint32_t> input_words(const Operation& op) const {
-    return op.input == UINT32_MAX ? std::span<const uint32_t>{} : inputs_[op.input].guest_words;
-  }
-  auto body(const Operation& op) const {
-    return guest_words().subspan(op.first_word, op.count) |
-           std::views::transform([](uint32_t word) { return __builtin_bswap32(word); });
-  }
-
-  // A false result means dispatch may already have produced effects. The
-  // caller decides on stock fallback before starting this operation.
-  template <typename Recorder>
-  bool Dispatch(Recorder&& record) const {
-    for (const auto& op : operations_) {
-      if (!record(op, body(op))) return false;
-    }
-    return true;
-  }
-
- private:
-  explicit ReplayPlan(std::vector<uint32_t> words) : words_(std::move(words)) {}
 
   static bool SupportedType3(uint32_t header, std::span<const uint32_t> body) {
     if (header & 0x80fe) return false;
@@ -152,6 +223,7 @@ class ReplayPlan {
   std::vector<uint32_t> words_;
   std::vector<Operation> operations_;
   std::vector<MemorySnapshot> inputs_;
+  std::optional<uint32_t> captured_generation_;
 };
 
 // Holds a prepared replay until the next indirect-buffer admission. The
@@ -159,6 +231,21 @@ class ReplayPlan {
 // This class only owns copied bytes and never dereferences guest addresses.
 class PendingReplay {
  public:
+  template <typename Lease>
+  bool PrepareFromLease(Registry& registry, uint32_t phys, uint32_t words, Lease& lease) {
+    plan_.reset();
+    Skip skip;
+    const Binding* binding = registry.Lookup(phys, words, &skip);
+    if (!binding) return false;
+    const Template* registered = registry.FindTemplate(binding->template_id);
+    if (!registered) return false;
+    plan_ = ReplayPlan::Capture(*registered, *binding, lease);
+    if (!plan_) return false;
+    incarnation_ = binding->incarnation;
+    generation_ = *plan_->captured_generation();
+    return true;
+  }
+
   bool Prepare(Registry& registry, uint32_t phys, uint32_t words, uint64_t captured_incarnation,
                ReplayPlan::Snapshot snapshot) {
     plan_.reset();

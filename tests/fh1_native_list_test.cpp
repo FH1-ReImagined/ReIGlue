@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <tuple>
 #include <vector>
 
 #include "fh1_native_list_fixture.h"
@@ -799,6 +800,115 @@ void TestPendingReplayLifetime() {
   CHECK(executed == owned->operations().size());
 }
 
+void TestCaptureFromLease() {
+  using Space = fl::ReplayPlan::AddressSpace;
+  struct Lease {
+    fl::Binding identity;
+    std::map<std::tuple<Space, uint32_t, size_t>, std::vector<uint8_t>> ranges;
+    std::optional<uint32_t> generation = 2;
+    std::optional<uint32_t> closing_generation = 2;
+    unsigned samples = 0, reads = 0;
+
+    bool Matches(const fl::Binding& b) const {
+      return identity.incarnation == b.incarnation && identity.phys == b.phys &&
+             identity.words == b.words && identity.cb == b.cb && identity.patch == b.patch &&
+             identity.patch_words == b.patch_words && identity.state_word == b.state_word;
+    }
+    std::optional<uint32_t> ReadGeneration(uint32_t address) {
+      if (address != identity.state_word) return std::nullopt;
+      return samples++ ? closing_generation : generation;
+    }
+    bool Copy(Space space, uint32_t address, std::span<std::byte> bytes) {
+      ++reads;
+      const auto range = ranges.find({space, address, bytes.size()});
+      if (range == ranges.end()) return false;
+      std::memcpy(bytes.data(), range->second.data(), bytes.size());
+      return true;
+    }
+    void Add(Space space, uint32_t address, std::vector<uint8_t> bytes) {
+      ranges[{space, address, bytes.size()}] = std::move(bytes);
+    }
+  };
+
+  fl::Registry registry;
+  uint32_t model = 0;
+  for (auto fixture : {Depth(), Scene()}) {
+    const uint32_t id = ++model;
+    FixUp(fixture, id);
+    CHECK(registry.Define(id, fixture.tmpl.data(), fixture.tmpl.size()) == fl::DefineResult::kNew);
+    fl::Binding binding;
+    binding.template_id = id;
+    binding.phys = 0x10000000 + id * 0x10000;
+    binding.words = uint32_t(fixture.pm4.size());
+    binding.cb = 0x40000000 + id * 0x10000;
+    binding.patch = binding.cb + 0x1000;
+    binding.patch_words = uint32_t(fixture.table.size());
+    binding.state_word = binding.cb + 0x2000;
+    const uint32_t chain = binding.cb + 0x3000;
+    CHECK(registry.Bind(binding) == fl::BindResult::kNew);
+    fl::Skip skip;
+    binding = *registry.Lookup(binding.phys, binding.words, &skip);
+
+    fixture.header[116 / 4] = chain;
+    fixture.header[144 / 4] = binding.patch;
+    Lease lease;
+    lease.identity = binding;
+    const auto pm4 = Guest(fixture.pm4);
+    lease.Add(Space::kVirtual, binding.cb, Guest(fixture.header));
+    lease.Add(Space::kVirtual, chain, Guest({0, 1, binding.words, binding.phys}));
+    lease.Add(Space::kVirtual, binding.patch, Guest(fixture.table));
+    lease.Add(Space::kPhysical, binding.phys, pm4);
+    const auto snapshot = ReplaySnapshot(fixture, fl::TemplateKey(fixture.tmpl.data()));
+    for (const auto& input : snapshot.inputs) {
+      const auto* p = reinterpret_cast<const uint8_t*>(input.guest_words.data());
+      lease.Add(Space::kPhysical, input.address & 0x1fffffffu,
+                {p, p + input.guest_words.size() * sizeof(uint32_t)});
+    }
+
+    fl::PendingReplay pending;
+    const auto prepare = [&](Lease& source) {
+      return pending.PrepareFromLease(registry, binding.phys, binding.words, source);
+    };
+    auto refused = lease;
+    refused.identity.incarnation++;
+    CHECK(!prepare(refused) && refused.samples == 0 && refused.reads == 0);
+    refused = lease;
+    refused.generation = 3;
+    CHECK(!prepare(refused) && refused.reads == 0);
+    refused = lease;
+    refused.Add(Space::kVirtual, chain, Guest({0, 1, binding.words, binding.phys + 4}));
+    CHECK(!prepare(refused) && refused.reads == 2);
+    refused = lease;
+    refused.Add(Space::kVirtual, chain, Guest({chain + 16, 1, binding.words, binding.phys}));
+    CHECK(!prepare(refused) && refused.reads == 2);
+    refused = lease;
+    refused.ranges.at({Space::kPhysical, binding.phys, pm4.size()})[0] ^= 1;
+    CHECK(!prepare(refused) && refused.reads == 4);
+    refused = lease;
+    const auto& first_input = snapshot.inputs.front();
+    refused.ranges.erase({Space::kPhysical, first_input.address & 0x1fffffffu,
+                          first_input.guest_words.size() * sizeof(uint32_t)});
+    CHECK(!prepare(refused));
+    refused = lease;
+    refused.closing_generation = 4;
+    CHECK(!prepare(refused) && refused.samples == 2);
+    CHECK(!pending.Take(registry, binding.phys, binding.words, 2));
+
+    CHECK(prepare(lease) && lease.samples == 2);
+    lease.ranges.clear();
+    auto owned = pending.Take(registry, binding.phys, binding.words, 2);
+    CHECK(owned && std::memcmp(owned->guest_words().data(), pm4.data(), pm4.size()) == 0);
+    size_t input_index = 0;
+    for (const auto& op : owned->operations()) {
+      const auto data = owned->input_words(op);
+      if (data.empty()) continue;
+      const auto& expected = snapshot.inputs.at(input_index++).guest_words;
+      CHECK(std::equal(data.begin(), data.end(), expected.begin(), expected.end()));
+    }
+    CHECK(input_index == snapshot.inputs.size());
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -806,6 +916,7 @@ int main() {
   TestDefineAck();
   TestOwnedReplayPlan();
   TestPendingReplayLifetime();
+  TestCaptureFromLease();
   TestKey();
   TestRegistry();
   TestKeyCheck();
