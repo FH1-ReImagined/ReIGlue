@@ -424,6 +424,7 @@ struct Binding {
   // Decoder-local incarnation. A recycled guest address may have the same
   // header, template and generation as an earlier allocation.
   uint64_t incarnation = 0;
+  uint64_t producer_lifetime = 0;
   // The pool resolved at generation pool_generation (even), when pool_valid.
   std::vector<uint32_t> pool;
   bool pool_valid = false;
@@ -445,7 +446,7 @@ inline Skip KeyCheck(Binding* b, bool differs) {
 }
 
 enum class DefineResult { kNew, kRepeat, kInvalid };
-enum class BindResult { kNew, kSame, kReplaced };
+enum class BindResult { kNew, kSame, kReplaced, kStale };
 
 class Registry {
  public:
@@ -471,16 +472,26 @@ class Registry {
       return BindResult::kNew;
     }
     Binding& e = it->second;
+    if (b.producer_lifetime && b.producer_lifetime < e.producer_lifetime)
+      return BindResult::kStale;
     if (e.words == b.words && e.template_id == b.template_id && e.refusal == b.refusal &&
         e.state_word == b.state_word && e.cb == b.cb && e.patch == b.patch &&
-        e.patch_words == b.patch_words && e.group == b.group && e.flags == b.flags) {
+        e.patch_words == b.patch_words && e.group == b.group && e.flags == b.flags &&
+        e.producer_lifetime == b.producer_lifetime) {
       return BindResult::kSame;
     }
     e = b;
     e.incarnation = NextIncarnation();
     return BindResult::kReplaced;
   }
-  bool Drop(uint32_t phys) { return bindings_.erase(phys) != 0; }
+  bool Drop(uint32_t phys, uint64_t producer_lifetime = 0) {
+    auto it = bindings_.find(phys);
+    if (it == bindings_.end() ||
+        (producer_lifetime && producer_lifetime != it->second.producer_lifetime))
+      return false;
+    bindings_.erase(it);
+    return true;
+  }
   // Whether a list was ever bound at phys (a lookup miss there is not a buffer that was never a
   // list: a list dropped before its run was decoded, or the memory reused for another buffer).
   bool WasBound(uint32_t phys) const { return ever_bound_.count(phys) != 0; }

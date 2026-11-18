@@ -68,6 +68,10 @@ enum Op : uint32_t {
   kOpListDrop = 0x22,
 };
 constexpr uint32_t kListDefineWords = 8, kListBindWords = 12, kListDropWords = 4;
+// Optional trailing identity (low, high) of a title-side binding lifetime.
+// Older consumers still use the original packet prefixes.
+constexpr uint32_t kListBindLifetimeWords = kListBindWords + 2;
+constexpr uint32_t kListDropLifetimeWords = kListDropWords + 2;
 constexpr uint32_t kListRefused = 0xFFFFFFFFu;
 constexpr uint32_t kListGroupNone = 0xFF;
 // The game converted the list from a copy with its tile-bound packets put back (it was untiled

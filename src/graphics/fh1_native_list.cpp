@@ -43,6 +43,9 @@
 
 #include <fmt/format.h>
 
+#if REX_PLATFORM_WIN32
+#include <Windows.h>
+#endif
 #include "fh1_native_list.h"
 #include "fh1_command_cursor.h"
 #include "fh1_native_replay_plan.h"
@@ -109,6 +112,12 @@ struct CommandProcessor::Fh1Lists {
            define_hash = 0, template_words = 0;
   uint64_t binds = 0, bind_same = 0, bind_replaced = 0, bind_no_template = 0, drops = 0,
            drop_unknown = 0, malformed = 0;
+  uint64_t stale_binds = 0;
+#if REX_PLATFORM_WIN32
+  bool audit_binding = false;
+  uint32_t audit_attempts = 0;
+  std::array<uint64_t, 16> audited_lifetimes{};
+#endif
   uint64_t draw_fields[fl::kFieldCount] = {}, end_fields[fl::kFieldCount] = {};
   uint64_t ns_begin = 0, ns_draw = 0, ns_end = 0, ns_packets = 0;
   uint32_t last_ack = 0;
@@ -213,6 +222,7 @@ void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t fr
     groups += ";";
   }
   REXGPU_INFO("FH1 native lists by pass group:{}", groups.empty() ? " none" : groups);
+  if (s.stale_binds) REXGPU_INFO("FH1 native lists: {} stale binds ignored", s.stale_binds);
 }
 
 }  // namespace
@@ -220,6 +230,10 @@ void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t fr
 void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
   if (!fh1_lists_) {
     fh1_lists_ = new Fh1Lists;
+#if REX_PLATFORM_WIN32
+    if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT"))
+      fh1_lists_->audit_binding = std::strcmp(e, "1") == 0;
+#endif
     if (const char* e = std::getenv("FH1_NATIVE_LISTS_PERTURB"))
       fh1_lists_->perturb_every = std::strtoull(e, nullptr, 10);
     if (const char* e = std::getenv("FH1_NATIVE_LISTS_PERTURB_TILE"))
@@ -316,6 +330,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
       b.patch_words = words[9];
       b.group = words[10];
       b.flags = words[11];
+      if (count == fh::kListBindLifetimeWords)
+        b.producer_lifetime = uint64_t(words[13]) << 32 | words[12];
       if (b.template_id != fh::kListRefused && !s.registry.FindTemplate(b.template_id))
         ++s.bind_no_template;
       switch (s.registry.Bind(b)) {
@@ -328,19 +344,29 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
         case fl::BindResult::kReplaced:
           ++s.bind_replaced;
           break;
+        case fl::BindResult::kStale:
+          ++s.stale_binds;
+          break;
       }
       break;
     }
-    case fh::kOpListDrop:
+    case fh::kOpListDrop: {
       if (count < fh::kListDropWords) {
         ++s.malformed;
         break;
       }
-      if (s.registry.Drop(words[2] & 0x1FFFFFFFu))
+      const uint64_t lifetime =
+          count == fh::kListDropLifetimeWords ? uint64_t(words[5]) << 32 | words[4] : 0;
+      if (count == fh::kListDropLifetimeWords && !lifetime) {
+        ++s.malformed;
+        break;
+      }
+      if (s.registry.Drop(words[2] & 0x1FFFFFFFu, lifetime))
         ++s.drops;
       else
         ++s.drop_unknown;  // already dropped (a replayed packet) or never bound
       break;
+    }
     default:
       ++s.malformed;
       break;
@@ -376,6 +402,37 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     ++s.refusals[std::min<uint32_t>(b->refusal, kRefusals - 1)];
     return no(fl::Skip::kRefused);
   }
+#if REX_PLATFORM_WIN32
+  if (s.audit_binding && s.audit_attempts < 64 && b->producer_lifetime) {
+    auto& tested = s.audited_lifetimes;
+    const auto unused = std::ranges::find(tested, 0);
+    if (unused != tested.end() && std::ranges::find(tested, b->producer_lifetime) == tested.end()) {
+      using Visit = bool (*)(void*, uint32_t) noexcept;
+      using WithBinding = bool (*)(const uint32_t*, uint32_t, Visit, void*) noexcept;
+      static const auto with_binding = reinterpret_cast<WithBinding>(
+          GetProcAddress(GetModuleHandleW(nullptr), "ForzaM4WithBindingV1"));
+      ++s.audit_attempts;
+      if (with_binding) {
+        uint32_t query[fh::kListBindLifetimeWords] = {
+            fh::kMagic, fh::kOpListBind, b->phys, b->words, b->template_id, b->refusal,
+            b->state_word, b->cb, b->patch, b->patch_words, b->group, b->flags,
+            uint32_t(b->producer_lifetime), uint32_t(b->producer_lifetime >> 32)};
+        uint32_t generation = 0;
+        const auto capture = [](void* out, uint32_t value) noexcept {
+          *static_cast<uint32_t*>(out) = value;
+          return true;
+        };
+        if (with_binding(query, fh::kListBindLifetimeWords, capture, &generation)) {
+          *unused = b->producer_lifetime;
+          query[13] ^= 0x80000000u;
+          const bool wrong = with_binding(query, fh::kListBindLifetimeWords, capture, &generation);
+          REXGPU_INFO("M4 binding audit: phys={:08X} lifetime={} generation={} wrong_lifetime={}",
+                      b->phys, b->producer_lifetime, generation, wrong);
+        }
+      }
+    }
+  }
+#endif
   const fl::Template* tmpl = s.registry.FindTemplate(b->template_id);
   if (!tmpl)
     return no(fl::Skip::kNoTemplate);

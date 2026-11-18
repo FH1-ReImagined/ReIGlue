@@ -909,6 +909,24 @@ void TestCaptureFromLease() {
   }
 }
 
+void TestWireLifetime() {
+  fl::Registry registry;
+  fl::Binding binding;
+  binding.phys = 0x1717b1a0;
+  binding.words = 1917;
+  binding.producer_lifetime = 10;
+  CHECK(registry.Bind(binding) == fl::BindResult::kNew);
+  auto current = binding;
+  current.producer_lifetime++;
+  CHECK(registry.Bind(current) == fl::BindResult::kReplaced);
+  CHECK(registry.Bind(binding) == fl::BindResult::kStale);
+  CHECK(!registry.Drop(binding.phys, binding.producer_lifetime));
+  fl::Skip skip;
+  const auto* live = registry.Lookup(current.phys, current.words, &skip);
+  CHECK(live && live->producer_lifetime == current.producer_lifetime);
+  CHECK(registry.Drop(current.phys, current.producer_lifetime));
+}
+
 }  // namespace
 
 int main() {
@@ -917,6 +935,7 @@ int main() {
   TestOwnedReplayPlan();
   TestPendingReplayLifetime();
   TestCaptureFromLease();
+  TestWireLifetime();
   TestKey();
   TestRegistry();
   TestKeyCheck();
