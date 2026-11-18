@@ -115,4 +115,42 @@ class ReplayPlan {
   std::vector<Operation> operations_;
 };
 
+// Holds a prepared replay until the next indirect-buffer admission. The
+// snapshot provider must pin or copy the producer storage before returning.
+// This class only owns copied bytes and never dereferences guest addresses.
+class PendingReplay {
+ public:
+  bool Prepare(Registry& registry, uint32_t phys, uint32_t words, uint64_t captured_incarnation,
+               ReplayPlan::Snapshot snapshot) {
+    plan_.reset();
+    Skip skip;
+    const Binding* binding = registry.Lookup(phys, words, &skip);
+    if (!captured_incarnation || !binding || binding->incarnation != captured_incarnation)
+      return false;
+    const Template* registered = registry.FindTemplate(binding->template_id);
+    if (!registered) return false;
+    const uint32_t generation = snapshot.generation_before;
+    plan_ = ReplayPlan::Compile(*registered, std::move(snapshot));
+    if (!plan_) return false;
+    incarnation_ = binding->incarnation;
+    generation_ = generation;
+    return true;
+  }
+
+  std::optional<ReplayPlan> Take(Registry& registry, uint32_t phys, uint32_t words,
+                                 std::optional<uint32_t> current_generation) {
+    auto plan = std::exchange(plan_, std::nullopt);
+    if (!plan || current_generation != generation_) return std::nullopt;
+    Skip skip;
+    const Binding* binding = registry.Lookup(phys, words, &skip);
+    if (!binding || binding->incarnation != incarnation_) return std::nullopt;
+    return plan;
+  }
+
+ private:
+  uint64_t incarnation_ = 0;
+  uint32_t generation_ = 0;
+  std::optional<ReplayPlan> plan_;
+};
+
 }  // namespace rex::graphics::fh1_list

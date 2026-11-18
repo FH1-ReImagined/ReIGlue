@@ -619,6 +619,31 @@ void TestOwnedReplayPlan() {
       CHECK(fixture.pm4[next] >> 30 == 2);
       ++next;
     }
+    for (uint64_t select : {0x80000003ull, 0xCull, 0x30ull}) {
+      Interpreter stock, replay;
+      stock.select = replay.select = select;
+      std::vector<std::pair<uint32_t, bool>> stock_draws, replay_draws;
+      stock.Run(fixture.pm4, [&](uint32_t packet, bool executed, uint32_t) {
+        stock_draws.emplace_back(packet, executed);
+      });
+      CHECK(plan->Dispatch([&](const auto& op, auto body) {
+        // Decode just the known packet body. The plan supplies the header and
+        // offset, so this sink never parses a header or length from the list.
+        std::vector<uint32_t> packet{op.header};
+        packet.insert(packet.end(), body.begin(), body.end());
+        replay.Run(packet, [&](uint32_t offset, bool executed, uint32_t) {
+          replay_draws.emplace_back(op.first_word - 1 + offset, executed);
+        });
+        return true;
+      }));
+      CHECK(!stock_draws.empty() && stock_draws == replay_draws);
+      CHECK(stock.regs == replay.regs && stock.mask == replay.mask);
+      for (unsigned stage = 0; stage < 2; ++stage) {
+        CHECK(stock.shaders.valid[stage] == replay.shaders.valid[stage]);
+        CHECK(stock.shaders.address[stage] == replay.shaders.address[stage]);
+        CHECK(stock.shaders.size[stage] == replay.shaders.size[stage]);
+      }
+    }
     unsigned recorded = 0;
     CHECK(!plan->Dispatch([&](const auto&, auto) { return ++recorded != 2; }));
     CHECK(recorded == 2);
@@ -647,12 +672,79 @@ void TestOwnedReplayPlan() {
   }
 }
 
+void TestPendingReplayLifetime() {
+  const auto fixture = Depth();
+  const auto key = Key(fixture, fixture.header[fl::kHeaderFlags / 4]);
+  const uint32_t words = uint32_t(fixture.pm4.size());
+  fl::Registry registry;
+  CHECK(registry.Define(1, fixture.tmpl.data(), fixture.tmpl.size()) == fl::DefineResult::kNew);
+  fl::Binding published;
+  published.phys = 0x1717b1a0;
+  published.words = words;
+  published.template_id = 1;
+  published.state_word = 0x40101000;
+  published.cb = 0x40102000;
+  published.patch = 0x40103000;
+  CHECK(registry.Bind(published) == fl::BindResult::kNew);
+  const auto incarnation = [&]() {
+    fl::Skip skip;
+    const auto* active = registry.Lookup(published.phys, words, &skip);
+    CHECK(active && skip == fl::Skip::kNone);
+    return active->incarnation;
+  };
+  const auto old = incarnation();
+  CHECK(old);
+  auto snapshot = [&]() { return fl::ReplayPlan::Snapshot{2, 2, key, fixture.pm4}; };
+
+  fl::PendingReplay pending;
+  CHECK(pending.Prepare(registry, published.phys, words, old, snapshot()));
+  CHECK(registry.Bind(published) == fl::BindResult::kSame);
+  CHECK(incarnation() == old);
+  auto owned = pending.Take(registry, published.phys, words, 2);
+  CHECK(owned);
+  CHECK(!pending.Take(registry, published.phys, words, 2));
+
+  // Reuse all the old wire fields, including the guest generation word.
+  CHECK(pending.Prepare(registry, published.phys, words, old, snapshot()));
+  CHECK(registry.Drop(published.phys));
+  CHECK(registry.Bind(published) == fl::BindResult::kNew);
+  const auto replacement = incarnation();
+  CHECK(replacement && replacement != old);
+  CHECK(!pending.Take(registry, published.phys, words, 2));
+  CHECK(!pending.Prepare(registry, published.phys, words, old, snapshot()));
+
+  for (auto current : {std::optional<uint32_t>{}, std::optional<uint32_t>{3},
+                       std::optional<uint32_t>{4}}) {
+    CHECK(pending.Prepare(registry, published.phys, words, replacement, snapshot()));
+    CHECK(!pending.Take(registry, published.phys, words, current));
+  }
+
+  CHECK(pending.Prepare(registry, published.phys, words, replacement, snapshot()));
+  CHECK(!pending.Take(registry, published.phys, words + 1, 2));
+  CHECK(!pending.Take(registry, published.phys, words, 2));
+  CHECK(pending.Prepare(registry, published.phys, words, replacement, snapshot()));
+  ++published.patch;
+  CHECK(registry.Bind(published) == fl::BindResult::kReplaced);
+  CHECK(!pending.Take(registry, published.phys, words, 2));
+
+  // The decoder's private copy survives guest header and model teardown.
+  CHECK(registry.Drop(published.phys));
+  unsigned executed = 0;
+  CHECK(owned->Dispatch([&](const auto&, auto body) {
+    CHECK(!body.empty());
+    ++executed;
+    return true;
+  }));
+  CHECK(executed == owned->operations().size());
+}
+
 }  // namespace
 
 int main() {
   TestValidate();
   TestDefineAck();
   TestOwnedReplayPlan();
+  TestPendingReplayLifetime();
   TestKey();
   TestRegistry();
   TestKeyCheck();
