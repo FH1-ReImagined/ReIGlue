@@ -501,9 +501,37 @@ bool CommandProcessor::Fh1RecordOwnedList(const fl::ReplayPlan& plan) {
   fh1_command_cursor::Scope cursor_scope(&reader);
   for (const auto& op : plan.operations()) {
     reader.set_read_offset_within(op.first_word * sizeof(uint32_t));
-    const bool ok = op.kind == fl::ReplayPlan::Kind::kType3
-                        ? ExecutePacketType3(&reader, op.header)
-                        : ExecutePacketType0(&reader, op.header);
+    const auto input = plan.input_words(op);
+    bool ok = true;
+    if (input.empty()) {
+      ok = op.kind == fl::ReplayPlan::Kind::kType3 ? ExecutePacketType3(&reader, op.header)
+                                                 : ExecutePacketType0(&reader, op.header);
+    } else if (((op.header >> 8) & 0x7f) == 0x27) {  // IM_LOAD
+      const uint32_t addr_type = reader.ReadAndSwap<uint32_t>();
+      const uint32_t start_size = reader.ReadAndSwap<uint32_t>();
+      const auto shader_type = static_cast<xenos::ShaderType>(addr_type & 3);
+      if (fh1_lists_) Fh1ListShader(addr_type, start_size);
+      if (record_split_) {
+        // The existing immediate-shader record owns its payload through the
+        // recorder's last read, even after the replay plan is destroyed.
+        uint32_t* record = RecordWords(3 + uint32_t(input.size()));
+        record[0] = kRecordShaderImmediate;
+        record[1] = uint32_t(shader_type);
+        record[2] = uint32_t(input.size());
+        std::memcpy(record + 3, input.data(), input.size_bytes());
+      } else {
+        auto* shader = LoadShader(shader_type, addr_type & ~3u, input.data(), uint32_t(input.size()));
+        (shader_type == xenos::ShaderType::kVertex ? active_vertex_shader_ : active_pixel_shader_) =
+            shader;
+      }
+    } else {
+      // LOAD_ALU_CONSTANT. Preparation checks the literal count and ALU type.
+      reader.AdvanceRead(sizeof(uint32_t));
+      const uint32_t index = reader.ReadAndSwap<uint32_t>() & 0x7ff;
+      reader.AdvanceRead(sizeof(uint32_t));
+      PacketWriteRegistersFromMem(fh::kAluFirstRegister + index, input.data(),
+                                  uint32_t(input.size()));
+    }
     // Dispatch has started and may have changed emulated state. The caller
     // reports an execution failure instead of restarting on the stock path.
     const size_t end = (op.first_word + op.count) * sizeof(uint32_t);

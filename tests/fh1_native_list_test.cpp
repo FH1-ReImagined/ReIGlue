@@ -120,7 +120,8 @@ struct Interpreter {
   }
 
   template <typename OnDraw>
-  void Run(const std::vector<uint32_t>& pm4, OnDraw&& on_draw) {
+  void Run(const std::vector<uint32_t>& pm4, OnDraw&& on_draw,
+           std::span<const uint32_t> owned_literal = {}) {
     uint32_t draw = 0;
     for (uint32_t d = 0; d < pm4.size();) {
       const uint32_t h = pm4[d];
@@ -164,7 +165,9 @@ struct Interpreter {
           shaders.valid[p[0] & 1] = true;
           break;
         case 0x2F: {  // LOAD_ALU_CONSTANT
-          const uint8_t* block = Memory(nullptr, p[0] & 0x3FFFFFFF);
+          const uint8_t* block = owned_literal.empty()
+                                     ? Memory(nullptr, p[0] & 0x3FFFFFFF)
+                                     : reinterpret_cast<const uint8_t*>(owned_literal.data());
           for (uint32_t i = 0; i < (p[2] & 0xFFF); ++i)
             Set(0x4000 + (p[1] & 0x7FF) + i, fl::Word(block, i));
           break;
@@ -587,25 +590,55 @@ void TestDefineAck() {
   CHECK(!fl::IsNewDefineSequence(0x80000000u, 0));
 }
 
+fl::ReplayPlan::Snapshot ReplaySnapshot(const Case& fixture, const fl::Key& key) {
+  fl::ReplayPlan::Snapshot snapshot{2, 2, key, fixture.pm4, {}};
+  for (size_t i = 0; i < fixture.pm4.size();) {
+    const uint32_t header = fixture.pm4[i++];
+    if (header >> 30 == 2) continue;
+    const uint32_t opcode = (header >> 8) & 0x7f;
+    if (header >> 30 == 3 && (opcode == 0x27 || opcode == 0x2f)) {
+      const uint32_t address = fixture.pm4[i] & (opcode == 0x27 ? ~3u : 0x3fffffffu);
+      const uint32_t count = opcode == 0x27 ? fixture.pm4[i + 1] : fl::kLiteralWords;
+      auto& input = snapshot.inputs.emplace_back(
+          fl::ReplayPlan::MemorySnapshot{address, std::vector<uint32_t>(count)});
+      if (opcode == 0x2f) {
+        std::memcpy(input.guest_words.data(), Memory(nullptr, address), count * sizeof(uint32_t));
+      } else {
+        for (uint32_t word = 0; word < count; ++word)
+          input.guest_words[word] = __builtin_bswap32(address ^ word);
+      }
+    }
+    i += ((header >> 16) & 0x3fff) + 1;
+  }
+  return snapshot;
+}
+
 void TestOwnedReplayPlan() {
   auto untiled = Scene();
   FixUp(untiled, 3);
   untiled.pm4 = Untile(std::move(untiled.pm4), untiled.tmpl);
   for (const auto& fixture : {Depth(), Scene(), untiled}) {
     const fl::Template registered{fixture.tmpl};
-    auto candidate = fixture.pm4;
     const auto key = Key(fixture, fixture.header[fl::kHeaderFlags / 4]);
+    auto source = ReplaySnapshot(fixture, key);
+    const auto expected_inputs = source.inputs;
     const auto compile = [&](const std::vector<uint32_t>& words) {
-      return fl::ReplayPlan::Compile(registered, {2, 2, key, words});
+      auto snapshot = ReplaySnapshot(fixture, key);
+      snapshot.words = words;
+      return fl::ReplayPlan::Compile(registered, std::move(snapshot));
     };
-    auto plan = compile(candidate);
+    auto plan = fl::ReplayPlan::Compile(registered, source);
     CHECK(plan);
+    CHECK(!expected_inputs.empty());
+    for (auto& input : source.inputs) std::fill(input.guest_words.begin(), input.guest_words.end(), 0);
+    source.inputs.clear();
     const auto guest = Guest(fixture.pm4);
     CHECK(plan->guest_words().size_bytes() == guest.size());
     CHECK(std::memcmp(plan->guest_words().data(), guest.data(), guest.size()) == 0);
     // A later change to the producer's copy cannot affect plan operands.
-    std::fill(candidate.begin(), candidate.end(), 0);
+    std::fill(source.words.begin(), source.words.end(), 0);
     size_t next = 0;
+    size_t input_index = 0;
     for (const auto& op : plan->operations()) {
       while (next + 1 < op.first_word) {
         CHECK(fixture.pm4[next] >> 30 == 2);
@@ -616,8 +649,18 @@ void TestOwnedReplayPlan() {
       const auto body = plan->body(op);
       CHECK(body.size() == op.count);
       CHECK(std::equal(body.begin(), body.end(), fixture.pm4.begin() + op.first_word));
+      const uint32_t opcode = (op.header >> 8) & 0x7f;
+      const auto input = plan->input_words(op);
+      if (op.kind == fl::ReplayPlan::Kind::kType3 && (opcode == 0x27 || opcode == 0x2f)) {
+        CHECK(input_index < expected_inputs.size());
+        const auto& expected = expected_inputs[input_index++].guest_words;
+        CHECK(std::equal(input.begin(), input.end(), expected.begin(), expected.end()));
+      } else {
+        CHECK(input.empty());
+      }
       next = op.first_word + op.count;
     }
+    CHECK(input_index == expected_inputs.size());
     while (next < fixture.pm4.size()) {
       CHECK(fixture.pm4[next] >> 30 == 2);
       ++next;
@@ -636,7 +679,7 @@ void TestOwnedReplayPlan() {
         packet.insert(packet.end(), body.begin(), body.end());
         replay.Run(packet, [&](uint32_t offset, bool executed, uint32_t) {
           replay_draws.emplace_back(op.first_word - 1 + offset, executed);
-        });
+        }, plan->input_words(op));
         return true;
       }));
       CHECK(!stock_draws.empty() && stock_draws == replay_draws);
@@ -653,11 +696,26 @@ void TestOwnedReplayPlan() {
     recorded = 0;
     CHECK(plan->Dispatch([&](const auto&, auto) { ++recorded; return true; }));
     CHECK(recorded == plan->operations().size());
-    auto wrong_key = key;
-    wrong_key.w[0] ^= 1;
-    CHECK(!fl::ReplayPlan::Compile(registered, {2, 2, wrong_key, fixture.pm4}));
-    CHECK(!fl::ReplayPlan::Compile(registered, {3, 3, key, fixture.pm4}));
-    CHECK(!fl::ReplayPlan::Compile(registered, {2, 4, key, fixture.pm4}));
+    auto invalid = ReplaySnapshot(fixture, key);
+    invalid.key.w[0] ^= 1;
+    CHECK(!fl::ReplayPlan::Compile(registered, invalid));
+    invalid.key = key;
+    invalid.generation_before = invalid.generation_after = 3;
+    CHECK(!fl::ReplayPlan::Compile(registered, invalid));
+    invalid.generation_before = 2;
+    CHECK(!fl::ReplayPlan::Compile(registered, invalid));
+    invalid.generation_after = 2;
+    invalid.inputs.pop_back();
+    CHECK(!fl::ReplayPlan::Compile(registered, invalid));
+    invalid.inputs = expected_inputs;
+    invalid.inputs.front().address ^= 4;
+    CHECK(!fl::ReplayPlan::Compile(registered, invalid));
+    invalid.inputs = expected_inputs;
+    invalid.inputs.front().guest_words.pop_back();
+    CHECK(!fl::ReplayPlan::Compile(registered, invalid));
+    invalid.inputs = expected_inputs;
+    invalid.inputs.push_back(expected_inputs.front());
+    CHECK(!fl::ReplayPlan::Compile(registered, invalid));
 
     auto denied = fixture.pm4;
     denied.pop_back();
@@ -697,7 +755,7 @@ void TestPendingReplayLifetime() {
   };
   const auto old = incarnation();
   CHECK(old);
-  auto snapshot = [&]() { return fl::ReplayPlan::Snapshot{2, 2, key, fixture.pm4}; };
+  auto snapshot = [&]() { return ReplaySnapshot(fixture, key); };
 
   fl::PendingReplay pending;
   CHECK(pending.Prepare(registry, published.phys, words, old, snapshot()));
