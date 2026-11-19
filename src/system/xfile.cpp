@@ -21,6 +21,10 @@
 
 #include <span>
 
+#if REX_PLATFORM_WIN32
+#include "physical_replay_gate.h"
+#endif
+
 namespace rex::system {
 
 XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
@@ -155,6 +159,12 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                                         memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
+#if REX_PLATFORM_WIN32
+          memory::detail::PhysicalReplayGate::Write write(
+              memory::detail::physical_replay_gate,
+              buffer_physical_heap ||
+                  memory::detail::WritesPhysicalAlias(buffer_guest_address, buffer_length));
+#endif
           result = file_->ReadSync(
               std::span<uint8_t>(
                   buffer_physical_heap
@@ -214,6 +224,12 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
 
   uint32_t read_total = 0;
   uint32_t read_remain = length;
+#if REX_PLATFORM_WIN32
+  // A scatter read may target different aliases. Exclude a snapshot between
+  // segments as well as during each write.
+  memory::detail::PhysicalReplayGate::Write scatter(memory::detail::physical_replay_gate,
+                                                    length != 0);
+#endif
   while (read_remain) {
     uint32_t read_length = read_remain;
     uint32_t read_buffer = *segments;

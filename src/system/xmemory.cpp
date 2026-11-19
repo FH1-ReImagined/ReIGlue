@@ -38,6 +38,7 @@
 
 #if REX_PLATFORM_WIN32
 #include "physical_replay_capture_win.h"
+#include "physical_replay_gate.h"
 #endif
 
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
@@ -530,6 +531,10 @@ bool Memory::CopyPhysicalForReplay(uint32_t physical, uint8_t* destination, size
       size > kPhysicalSize - physical || rex::memory::page_size() != kPageSize) {
     return false;
   }
+  auto writers_closed = detail::physical_replay_gate.TryCapture();
+  if (!writers_closed) return false;
+  // A writer may enter while holding the global region. Never wait for it
+  // here while holding the replay gate.
   auto lock = std::unique_lock(rex::thread::global_critical_region::mutex(), std::try_to_lock);
   if (!lock || !virtual_membase_ || !physical_membase_) return false;
 
@@ -680,14 +685,22 @@ uint32_t Memory::GetPhysicalAddress(uint32_t address) const {
 }
 
 void Memory::Zero(uint32_t address, uint32_t size) {
-  std::memset(TranslateVirtual(address), 0, size);
+  Fill(address, size, 0);
 }
 
 void Memory::Fill(uint32_t address, uint32_t size, uint8_t value) {
+#if REX_PLATFORM_WIN32
+  detail::PhysicalReplayGate::Write write(detail::physical_replay_gate,
+                                          detail::WritesPhysicalAlias(address, size));
+#endif
   std::memset(TranslateVirtual(address), value, size);
 }
 
 void Memory::Copy(uint32_t dest, uint32_t src, uint32_t size) {
+#if REX_PLATFORM_WIN32
+  detail::PhysicalReplayGate::Write write(detail::physical_replay_gate,
+                                          detail::WritesPhysicalAlias(dest, size));
+#endif
   uint8_t* pdest = TranslateVirtual(dest);
   const uint8_t* psrc = TranslateVirtual(src);
   std::memcpy(pdest, psrc, size);
