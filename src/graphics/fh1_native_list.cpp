@@ -127,6 +127,7 @@ struct CommandProcessor::Fh1Lists {
   vulkan::VulkanCommandProcessor* index_audit_cp = nullptr;
   bool timed_replay = false;
   bool timed_pixel_parity = false;
+  bool timed_texture_parity = false;
   bool refused_replay_control = false;
   uint32_t pixel_parity_sampling_passes = 0;
   std::shared_ptr<const fl::ReplayPlan> timed_plan;
@@ -323,8 +324,11 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
 #if REX_HAS_VULKAN
       fh1_lists_->timed_replay = std::strcmp(e, "timed-replay") == 0;
       const char* parity = std::getenv("FH1_M4_REPLAY_PIXEL_PARITY");
+      fh1_lists_->timed_texture_parity =
+          fh1_lists_->timed_replay && parity && std::strcmp(parity, "texture") == 0;
       fh1_lists_->timed_pixel_parity =
-          fh1_lists_->timed_replay && parity && std::strcmp(parity, "1") == 0;
+          fh1_lists_->timed_texture_parity ||
+          (fh1_lists_->timed_replay && parity && std::strcmp(parity, "1") == 0);
 #endif
       fh1_lists_->audit_bind =
           std::strcmp(e, "bind") == 0 || std::strcmp(e, "bind-vertex") == 0 ||
@@ -485,6 +489,11 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     static const auto race_measuring = reinterpret_cast<Measuring>(
         GetProcAddress(GetModuleHandleW(nullptr), "ForzaM4BenchmarkMeasuringV1"));
     measuring = race_measuring && race_measuring();
+    if (measuring && s.timed_texture_parity) {
+      const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;
+      measuring = regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth &&
+                  regs.Get<reg::RB_COLOR_MASK>().value != 0;
+    }
   }
 #else
   constexpr bool measuring = true;

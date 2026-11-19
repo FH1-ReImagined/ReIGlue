@@ -786,7 +786,7 @@ void VulkanTextureCache::DestroyReplayTextureSlot(ReplayTextureSlot& slot) {
 
 VkImageView VulkanTextureCache::GetFh1ReplayTextureView(uint32_t fetch_constant_index,
                                                          xenos::FetchOpDimension dimension,
-                                                         bool is_signed) {
+                                                         bool is_signed, uint32_t* owned_views) {
   const VkImageView stock =
       GetActiveBindingOrNullImageView(fetch_constant_index, dimension, is_signed);
   const auto fallback = [&](const char* reason) {
@@ -823,7 +823,10 @@ VkImageView VulkanTextureCache::GetFh1ReplayTextureView(uint32_t fetch_constant_
   ReplayTextureSlot* matching = nullptr;
   ReplayTextureSlot* vacant = nullptr;
   for (auto& slot : replay_texture_slots_) {
-    if (slot.source_this_draw == stock && compatible(slot)) return slot.view;
+    if (slot.source_this_draw == stock && compatible(slot)) {
+      if (owned_views) ++*owned_views;
+      return slot.view;
+    }
     if (slot.source_this_draw) continue;
     if (compatible(slot)) {
       matching = &slot;
@@ -900,6 +903,7 @@ VkImageView VulkanTextureCache::GetFh1ReplayTextureView(uint32_t fetch_constant_
       guest_shader_pipeline_stages_, transfer_write, read, dst, sampled);
   slot->last_submission = command_processor_.GetCurrentSubmission();
   slot->source_this_draw = stock;
+  if (owned_views) ++*owned_views;
   REXGPU_INFO("M4 texture bind audit: submission={} fetch={} {}x{} mips={} format={} reused={} "
               "source_pages={:05X}/{:05X} slot={}",
               slot->last_submission, fetch_constant_index, width, height, mip_count,

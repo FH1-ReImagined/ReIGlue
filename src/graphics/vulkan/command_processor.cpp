@@ -7060,7 +7060,7 @@ void VulkanCommandProcessor::ReadFh1ReplayPixels(
 VulkanCommandProcessor::ReplayPixelComparison VulkanCommandProcessor::BeginFh1ReplayPixelComparison(
     const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
     const std::array<uint32_t, 2>& vertex_window,
-    const PrimitiveProcessor::ProcessingResult& indices) {
+    const PrimitiveProcessor::ProcessingResult& indices, uint32_t owned_texture_views) {
   ReplayPixelComparison result;
   if (active_occlusion_query_.valid || !REXCVAR_GET(vulkan_dynamic_rendering) ||
       !GetVulkanDevice()->properties().dynamicRendering ||
@@ -7072,6 +7072,15 @@ VulkanCommandProcessor::ReplayPixelComparison VulkanCommandProcessor::BeginFh1Re
     return {};
   }
   if (!primitive_processor_->CanSampleReplayPixels(result.targets[1].image != VK_NULL_HANDLE)) {
+    return {};
+  }
+  static const bool texture_only = [] {
+    const char* mode = std::getenv("FH1_M4_REPLAY_PIXEL_PARITY");
+    return mode && std::strcmp(mode, "texture") == 0;
+  }();
+  if (texture_only && (!result.targets[1].image || !owned_texture_views)) {
+    REXGPU_INFO("M4 texture parity skipped: color_format={} owned_texture_views={}",
+                uint32_t(result.targets[1].format), owned_texture_views);
     return {};
   }
   const auto extent = render_target_cache_->last_update_framebuffer()->host_extent;
@@ -7244,9 +7253,11 @@ VulkanCommandProcessor::ReplayPixelComparison VulkanCommandProcessor::BeginFh1Re
     deferred_command_buffer_.CmdVkPushConstants(layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                                                  sizeof(vertex_window), vertex_window.data());
   }
-  REXGPU_INFO("M4 pixel parity draw: submission={} index_count={} vertex={} color={} depth={}",
+  REXGPU_INFO("M4 pixel parity draw: submission={} index_count={} vertex={} color={} depth={} "
+              "owned_texture_views={} color_format={}",
               submission, indices.host_draw_vertex_count, vertex_window[1] != 0,
-              live[1] != VK_NULL_HANDLE, live[0] != VK_NULL_HANDLE);
+              live[1] != VK_NULL_HANDLE, live[0] != VK_NULL_HANDLE, owned_texture_views,
+              uint32_t(result.targets[1].format));
   return result;
 }
 
@@ -7967,7 +7978,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
+  uint32_t owned_texture_views = 0;
+  if (!UpdateBindings(vertex_shader, pixel_shader, &owned_texture_views)) {
     return draw_fail("update_bindings");
   }
 
@@ -8139,7 +8151,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   ReplayPixelComparison replay_comparison;
   if (replay_index.first && VulkanRenderTargetCache::ReplayParityEnabled()) {
     replay_comparison = BeginFh1ReplayPixelComparison(
-        vertex_shader, pixel_shader, replay_vertex_window, primitive_processing_result);
+        vertex_shader, pixel_shader, replay_vertex_window, primitive_processing_result,
+        owned_texture_views);
   }
 
   // FH1 (#640): the draw's render pass (and pixel shader) as its zone.
@@ -11674,7 +11687,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 }
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
-                                            const VulkanShader* pixel_shader) {
+                                             const VulkanShader* pixel_shader,
+                                             uint32_t* owned_texture_views) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -11918,7 +11932,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   auto texture_view = [&](const VulkanShader::TextureBinding& binding) {
     if (replay_textures) {
       return texture_cache_->GetFh1ReplayTextureView(binding.fetch_constant, binding.dimension,
-                                                     bool(binding.is_signed));
+                                                     bool(binding.is_signed), owned_texture_views);
     }
     return texture_cache_->GetActiveBindingOrNullImageView(binding.fetch_constant, binding.dimension,
                                                            bool(binding.is_signed));

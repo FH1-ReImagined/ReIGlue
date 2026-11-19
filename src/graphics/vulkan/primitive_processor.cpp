@@ -311,14 +311,19 @@ VulkanPrimitiveProcessor::AllocateReplayPixelReadback(VkRect2D rect, VkFormat de
       case VK_FORMAT_R8G8B8A8_SRGB:
       case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
       case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+      case VK_FORMAT_R16G16_SNORM:
+      case VK_FORMAT_R16G16_SFLOAT:
+      case VK_FORMAT_R32_SFLOAT:
         add(VK_IMAGE_ASPECT_COLOR_BIT, 4);
         break;
       case VK_FORMAT_R16G16B16A16_UNORM:
       case VK_FORMAT_R16G16B16A16_SNORM:
       case VK_FORMAT_R16G16B16A16_SFLOAT:
+      case VK_FORMAT_R32G32_SFLOAT:
         add(VK_IMAGE_ASPECT_COLOR_BIT, 8);
         break;
       default:
+        REXGPU_INFO("M4 pixel parity unsupported color format={}", uint32_t(color_format));
         return nullptr;
     }
   }

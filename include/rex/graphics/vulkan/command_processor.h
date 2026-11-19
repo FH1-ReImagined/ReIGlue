@@ -642,7 +642,8 @@ class VulkanCommandProcessor : public CommandProcessor {
       bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
-  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+                      uint32_t* owned_texture_views = nullptr);
   struct ReplayPixelComparison {
     std::array<VulkanRenderTargetCache::ReplayParityTarget, 2> targets{};
     VulkanPrimitiveProcessor::ReplayPixelReadback* readback = nullptr;
@@ -650,7 +651,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   ReplayPixelComparison BeginFh1ReplayPixelComparison(
       const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
       const std::array<uint32_t, 2>& vertex_window,
-      const PrimitiveProcessor::ProcessingResult& indices);
+      const PrimitiveProcessor::ProcessingResult& indices, uint32_t owned_texture_views);
   void ReadFh1ReplayPixels(ReplayPixelComparison& comparison, uint32_t arm,
                           const std::array<VkImage, 2>& images);
   void EndFh1ReplayPixelComparison(ReplayPixelComparison& comparison);

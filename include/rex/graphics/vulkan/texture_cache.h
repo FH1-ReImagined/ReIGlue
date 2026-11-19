@@ -90,7 +90,8 @@ class VulkanTextureCache final : public TextureCache {
   void RequestTextures(uint32_t used_texture_mask) override;
   bool BeginFh1ReplayTextureDraw();
   VkImageView GetFh1ReplayTextureView(uint32_t fetch_constant_index,
-                                      xenos::FetchOpDimension dimension, bool is_signed);
+                                      xenos::FetchOpDimension dimension, bool is_signed,
+                                      uint32_t* owned_views);
 
 
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,

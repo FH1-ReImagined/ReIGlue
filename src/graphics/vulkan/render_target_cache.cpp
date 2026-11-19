@@ -1905,7 +1905,7 @@ bool VulkanRenderTargetCache::PredictRenderPassKey(BindingPrediction& prediction
 bool VulkanRenderTargetCache::ReplayParityEnabled() {
   static const bool enabled = [] {
     const char* value = std::getenv("FH1_M4_REPLAY_PIXEL_PARITY");
-    return value && std::strcmp(value, "1") == 0;
+    return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "texture") == 0);
   }();
   return enabled;
 }
