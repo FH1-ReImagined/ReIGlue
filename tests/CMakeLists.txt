@@ -17,6 +17,12 @@ add_executable(fh1_native_list_test fh1_native_list_test.cpp)
 target_include_directories(fh1_native_list_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME fh1.native_list COMMAND fh1_native_list_test)
 
+if(WIN32)
+  add_executable(physical_replay_capture_test physical_replay_capture_test.cpp)
+  target_compile_definitions(physical_replay_capture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  add_test(NAME memory.physical_replay_capture COMMAND physical_replay_capture_test)
+endif()
+
 find_package(Threads REQUIRED)
 add_executable(pipeline_retirement_test pipeline_retirement_test.cpp)
 target_include_directories(pipeline_retirement_test PRIVATE ${PROJECT_SOURCE_DIR}/include)

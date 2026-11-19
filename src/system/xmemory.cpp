@@ -880,6 +880,11 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   // if guest metadata says the page is writable but host protection is still
   // read-only / no-access, restore write access and resume execution.
   if (is_write) {
+#if REX_PLATFORM_WIN32
+    // TriggerCallbacks consumed the previous lock. Keep recovery's permission
+    // change serialized with both physical allocation and replay page sealing.
+    auto recovery_lock = global_critical_region_.Acquire();
+#endif
     constexpr uint32_t kWriteProtectMask =
         memory::kMemoryProtectWrite | memory::kMemoryProtectWriteCombine;
     uint32_t guest_protect = 0;
@@ -1224,7 +1229,8 @@ BaseHeap::~BaseHeap() = default;
 
 std::unique_lock<std::recursive_mutex> BaseHeap::AcquireHostPageReconcileLock() const {
 #if REX_PLATFORM_WIN32
-  if (this == &memory_->heaps_.physical) return rex::thread::global_critical_region::AcquireDirect();
+  // The replay transaction owns this lock across all four mapped aliases.
+  if (heap_type_ == HeapType::kGuestPhysical) return rex::thread::global_critical_region::AcquireDirect();
 #endif
   if (page_size_ >= memory_->system_page_size_) {
     return {};
@@ -1456,6 +1462,10 @@ uint32_t BaseHeap::GetUnreservedPageCount() {
 
 bool BaseHeap::Save(stream::ByteStream* stream) {
   REXSYS_DEBUG("Heap {:08X}-{:08X}", heap_base_, heap_base_ + (heap_size_ - 1));
+#if REX_PLATFORM_WIN32
+  std::unique_lock<std::recursive_mutex> replay_lock;
+  if (heap_type_ == HeapType::kGuestPhysical) replay_lock = AcquireHostPageReconcileLock();
+#endif
 
   for (size_t i = 0; i < page_table_.size(); i++) {
     auto& page = page_table_[i];

@@ -293,7 +293,8 @@ class BaseHeap {
   // heap_mutex_, which deadlocks.
   //
   // Returns an empty (unlocked) guard when guest pages are at least host page
-  // sized, since no reconcile happens then and the lock would be pure cost.
+  // sized, except for Windows physical heaps, where replay relies on the same
+  // lock to serialize allocation and protection changes across aliases.
   virtual std::unique_lock<std::recursive_mutex> AcquireHostPageReconcileLock() const;
 
   // Whether a host page is currently write-watched for guest invalidation.
