@@ -3,6 +3,20 @@
 #include <cstdio>
 #include <cstdlib>
 
+namespace rex::memory::detail {
+
+struct FrozenReplayPagesTestAccess {
+  static bool Counts(const FrozenReplayPages& capture, size_t restores, size_t spans) {
+    return capture.restore_.size() == restores && capture.sealed_.size() == spans;
+  }
+  static bool HeapStorage(const FrozenReplayPages& capture, bool restores, bool spans) {
+    return (capture.restore_.overflow.capacity() != 0) == restores &&
+           (capture.sealed_.overflow.capacity() != 0) == spans;
+  }
+};
+
+}  // namespace rex::memory::detail
+
 namespace {
 
 #define CHECK(condition)                                                        \
@@ -47,6 +61,35 @@ int main() {
   std::array<uint8_t, 16> bytes{};
   std::array<uint8_t, 4 * kPage> expected{};
   std::memcpy(expected.data(), at(2)[3], expected.size());
+  {
+    using Journal = rex::memory::detail::FrozenReplayPagesTestAccess;
+    rex::memory::detail::FrozenReplayPages capture;
+    for (size_t page : {0u, 3u, 4u, 5u}) CHECK(capture.Copy(at(page), kPage, 0, bytes));
+    CHECK(Journal::Counts(capture, 16, 16));
+    CHECK(Journal::HeapStorage(capture, false, false));
+
+    // A partially preflighted spill must truncate back to the inline boundary.
+    bytes.fill(0xcd);
+    CHECK(!capture.Copy(at(8), kPage, 0, bytes));
+    CHECK(Journal::Counts(capture, 16, 16));
+    CHECK(Journal::HeapStorage(capture, true, false));
+    for (auto byte : bytes) CHECK(byte == 0xcd);
+    CHECK(Protection(at(8)[0]) == PAGE_READWRITE && Protection(at(8)[1]) == PAGE_READWRITE);
+    CHECK(Protection(at(8)[2]) == PAGE_NOACCESS);
+
+    CHECK(capture.Copy(at(6), kPage, 0, bytes));
+    CHECK(Journal::Counts(capture, 20, 20));
+    CHECK(Journal::HeapStorage(capture, true, true));
+    // Rollback must also retain already applied overflow entries.
+    CHECK(!capture.Copy(at(8), kPage, 0, bytes));
+    CHECK(Journal::Counts(capture, 20, 20));
+    for (size_t page : {7u, 9u, 3u}) CHECK(capture.Copy(at(page), kPage, 0, bytes));
+    CHECK(Journal::Counts(capture, 28, 28));
+    for (size_t page : {0u, 3u, 4u, 5u, 6u, 7u, 9u})
+      for (auto* address : at(page)) CHECK(Protection(address) == PAGE_READONLY);
+  }
+  for (size_t page : {0u, 3u, 4u, 5u, 6u, 7u, 9u})
+    for (auto* address : at(page)) CHECK(Protection(address) == PAGE_READWRITE);
   {
     rex::memory::detail::FrozenReplayPages capture;
     CHECK(capture.Copy(at(0), kPage, 0, bytes));
