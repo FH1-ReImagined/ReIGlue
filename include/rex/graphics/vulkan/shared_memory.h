@@ -49,6 +49,10 @@ class VulkanSharedMemory : public SharedMemory {
 
   VkBuffer buffer() const { return buffer_; }
 
+  bool CanReuseFh1ReplayVertexCopy(VkBuffer destination, uint32_t address, uint32_t size) const;
+  void RememberFh1ReplayVertexCopy(VkBuffer destination, uint32_t address, uint32_t size);
+  void InvalidateFh1ReplayVertexCopy() { replay_vertex_copy_.destination = VK_NULL_HANDLE; }
+
   using SharedMemory::page_size_log2;
 
  protected:
@@ -84,6 +88,17 @@ class VulkanSharedMemory : public SharedMemory {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+
+  // One copy in the current deferred command buffer. Shared-memory writes
+  // clear it, including uploads hoisted before the current render pass.
+  struct ReplayVertexCopy {
+    VkBuffer destination = VK_NULL_HANDLE;
+    uint32_t address = 0;
+    uint32_t size = 0;
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+  };
+  ReplayVertexCopy replay_vertex_copy_;
 };
 
 }  // namespace rex::graphics::vulkan

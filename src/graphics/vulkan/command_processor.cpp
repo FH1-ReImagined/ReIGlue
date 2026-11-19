@@ -8130,26 +8130,31 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   if (replay_vertex_window[1]) {
     const VkBuffer replay_vertex = primitive_processor_->replay_vertex_buffer();
-    const VkDeviceSize size = VkDeviceSize(replay_vertex_window[1]) * sizeof(uint32_t);
-    EndRenderPass();
-    PushBufferMemoryBarrier(replay_vertex, 0, size,
-                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                            VK_ACCESS_TRANSFER_WRITE_BIT);
-    SubmitBarriers(true);
-    const VkBufferCopy region{VkDeviceSize(replay_vertex_window[0]) * sizeof(uint32_t), 0, size};
-    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), replay_vertex, 1, &region);
-    PushBufferMemoryBarrier(replay_vertex, 0, size, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                            VK_ACCESS_SHADER_READ_BIT);
+    const uint32_t address = replay_vertex_window[0] * sizeof(uint32_t);
+    const uint32_t size = replay_vertex_window[1] * sizeof(uint32_t);
+    const bool reuse = shared_memory_->CanReuseFh1ReplayVertexCopy(replay_vertex, address, size);
+    if (!reuse) {
+      EndRenderPass();
+      PushBufferMemoryBarrier(replay_vertex, 0, size,
+                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_TRANSFER_WRITE_BIT);
+      SubmitBarriers(true);
+      const VkBufferCopy region{address, 0, size};
+      deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), replay_vertex, 1, &region);
+      PushBufferMemoryBarrier(replay_vertex, 0, size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT);
+      shared_memory_->RememberFh1ReplayVertexCopy(replay_vertex, address, size);
+    }
     deferred_command_buffer_.CmdVkPushConstants(
         current_guest_graphics_pipeline_layout_->GetPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT,
         0, sizeof(replay_vertex_window), replay_vertex_window.data());
     if (!fh1_list::SustainedReplayRequested()) {
-      REXGPU_INFO("M4 vertex bind audit: frame={} submission={} address={:08X} bytes={} vs={:016X}",
-                  GetCurrentFrame(), GetCurrentSubmission(), region.srcOffset, size,
-                  vertex_shader->ucode_data_hash());
+      REXGPU_INFO("M4 vertex bind audit: frame={} submission={} address={:08X} bytes={} vs={:016X} reused={}",
+                  GetCurrentFrame(), GetCurrentSubmission(), address, size,
+                  vertex_shader->ucode_data_hash(), reuse);
     }
   }
 
@@ -10174,6 +10179,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    if (shared_memory_) shared_memory_->InvalidateFh1ReplayVertexCopy();
     if (deferred_command_buffer_.fh1_gpu_profiling()) {
       fh1_gpu_profile.BeginSubmission(deferred_command_buffer_, GetCurrentSubmission(),
                                       frame_current_);

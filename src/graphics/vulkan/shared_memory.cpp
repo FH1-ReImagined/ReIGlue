@@ -23,6 +23,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/thread/mutex.h>
 #include <rex/ui/vulkan/util.h>
 
 #include "fh1_device_memory.h"
@@ -46,6 +47,7 @@ VulkanSharedMemory::~VulkanSharedMemory() {
 }
 
 bool VulkanSharedMemory::Initialize() {
+  InvalidateFh1ReplayVertexCopy();
   InitializeCommon();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -176,6 +178,7 @@ bool VulkanSharedMemory::Initialize() {
 }
 
 void VulkanSharedMemory::Shutdown(bool from_destructor) {
+  InvalidateFh1ReplayVertexCopy();
   upload_buffer_pool_.reset();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -201,10 +204,33 @@ void VulkanSharedMemory::CompletedSubmissionUpdated() {
 }
 
 void VulkanSharedMemory::EndSubmission() {
+  InvalidateFh1ReplayVertexCopy();
   upload_buffer_pool_->FlushWrites();
 }
 
+bool VulkanSharedMemory::CanReuseFh1ReplayVertexCopy(VkBuffer destination, uint32_t address,
+                                                     uint32_t size) const {
+  if (destination == VK_NULL_HANDLE || !size || address >= kBufferSize ||
+      size > kBufferSize - address || replay_vertex_copy_.destination != destination ||
+      replay_vertex_copy_.address != address || replay_vertex_copy_.size != size ||
+      replay_vertex_copy_.frame != command_processor_.GetCurrentFrame() ||
+      replay_vertex_copy_.submission != command_processor_.GetCurrentSubmission()) {
+    return false;
+  }
+  // CPU writes and frees invalidate the stock shared-memory pages. If they
+  // have already been uploaded again, UploadRanges cleared the copy record.
+  const auto lock = thread::global_critical_region::AcquireDirect();
+  return IsRangeValid(address, size);
+}
+
+void VulkanSharedMemory::RememberFh1ReplayVertexCopy(VkBuffer destination, uint32_t address,
+                                                     uint32_t size) {
+  replay_vertex_copy_ = {destination, address, size, command_processor_.GetCurrentFrame(),
+                         command_processor_.GetCurrentSubmission()};
+}
+
 void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
+  if (usage != Usage::kRead) InvalidateFh1ReplayVertexCopy();
   written_range.first = std::min(written_range.first, kBufferSize);
   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
@@ -283,6 +309,7 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  InvalidateFh1ReplayVertexCopy();
   // FH1 (#45): guest memory the CPU wrote, copied for the GPU (fh1_frame_cost.h).
   fh1_frame_cost::Frame& cost = fh1_frame_cost::Current();
   fh1_frame_cost::Timer cost_timer(cost.upload_ms);
