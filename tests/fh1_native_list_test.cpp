@@ -864,6 +864,20 @@ void TestCaptureFromLease() {
       lease.Add(Space::kPhysical, input.address & 0x1fffffffu,
                 {p, p + input.guest_words.size() * sizeof(uint32_t)});
     }
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t, size_t>> dma;
+    for (size_t i = 0; i + 4 < fixture.pm4.size(); ++i) {
+      if ((fixture.pm4[i] & ~1u) != 0xc0032200u) continue;
+      const uint32_t width = (fixture.pm4[i + 2] & 0x800) ? 4 : 2;
+      const uint32_t address = fixture.pm4[i + 3] & ~(width - 1);
+      const uint32_t control = fixture.pm4[i + 4];
+      const size_t bytes = width * std::min(fixture.pm4[i + 2] >> 16, control & 0xffffffu);
+      CHECK(bytes);
+      dma.emplace_back(address, width, control >> 30, bytes);
+      std::vector<uint8_t> payload(bytes);
+      for (size_t j = 0; j < bytes; ++j) payload[j] = uint8_t(j % 251);
+      lease.Add(Space::kPhysical, address, std::move(payload));
+    }
+    CHECK(!dma.empty());
 
     fl::PendingReplay pending;
     const auto prepare = [&](Lease& source) {
@@ -890,6 +904,9 @@ void TestCaptureFromLease() {
                           first_input.guest_words.size() * sizeof(uint32_t)});
     CHECK(!prepare(refused));
     refused = lease;
+    refused.ranges.erase({Space::kPhysical, std::get<0>(dma.front()), std::get<3>(dma.front())});
+    CHECK(!prepare(refused) && refused.samples == 1);
+    refused = lease;
     refused.closing_generation = 4;
     CHECK(!prepare(refused) && refused.samples == 2);
     CHECK(!pending.Take(registry, binding.phys, binding.words, 2));
@@ -899,13 +916,21 @@ void TestCaptureFromLease() {
     auto owned = pending.Take(registry, binding.phys, binding.words, 2);
     CHECK(owned && std::memcmp(owned->guest_words().data(), pm4.data(), pm4.size()) == 0);
     size_t input_index = 0;
+    size_t index_draw = 0;
     for (const auto& op : owned->operations()) {
+      if (const auto* index = owned->index_input(op)) {
+        const auto [address, width, endian, bytes] = dma.at(index_draw++);
+        CHECK(index->address == address && index->width == width && index->endian == endian &&
+              index->bytes.size() == bytes);
+        for (size_t j = 0; j < bytes; ++j) CHECK(index->bytes[j] == std::byte(j % 251));
+      }
       const auto data = owned->input_words(op);
       if (data.empty()) continue;
       const auto& expected = snapshot.inputs.at(input_index++).guest_words;
       CHECK(std::equal(data.begin(), data.end(), expected.begin(), expected.end()));
     }
     CHECK(input_index == snapshot.inputs.size());
+    CHECK(index_draw == dma.size());
   }
 }
 

@@ -150,6 +150,7 @@ struct LiveCaptureProbe {
   const char* status = "binding-busy";
   uint32_t generation = 0, address = 0;
   size_t input_bytes = 0, range_bytes = 0, copied = 0;
+  size_t index_bytes = 0, index_draws = 0;
   fl::ReplayPlan::AddressSpace space = fl::ReplayPlan::AddressSpace::kVirtual;
   bool refused_range = false;
 };
@@ -194,8 +195,13 @@ bool ProbeLiveCapture(void* context, uint32_t generation) noexcept {
             probe.status = probe.refused_range ? "range-refused" : "plan-refused";
             return false;
           }
-          for (const auto& op : plan->operations())
+          for (const auto& op : plan->operations()) {
             probe.input_bytes += plan->input_words(op).size_bytes();
+            if (const auto* index = plan->index_input(op)) {
+              ++probe.index_draws;
+              probe.index_bytes += index->bytes.size();
+            }
+          }
           probe.status = "captured";
           return true;
         },
@@ -500,8 +506,9 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
             with_binding(query, fh::kListBindLifetimeWords, ProbeLiveCapture, &probe);
             REXGPU_INFO(
                 "M4 capture audit: phys={:08X} lifetime={} status={} ranges={} inputs={} "
-                "last_space={} last_range={:08X} bytes={}",
+                "index_draws={} index_bytes={} last_space={} last_range={:08X} bytes={}",
                 b->phys, b->producer_lifetime, probe.status, probe.copied, probe.input_bytes,
+                probe.index_draws, probe.index_bytes,
                 probe.space == fl::ReplayPlan::AddressSpace::kVirtual ? "virtual" : "physical",
                 probe.address, probe.range_bytes);
           }

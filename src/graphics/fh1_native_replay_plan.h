@@ -25,12 +25,20 @@ class ReplayPlan {
     uint32_t first_word;
     uint32_t count;
     uint32_t input = UINT32_MAX;
+    uint32_t index_input = UINT32_MAX;
   };
 
   struct MemorySnapshot {
     uint32_t address;
     // Indirect operands in guest byte order.
     std::vector<uint32_t> guest_words;
+  };
+
+  struct IndexSnapshot {
+    uint32_t address;
+    uint32_t width;
+    uint32_t endian;
+    std::vector<std::byte> bytes;
   };
 
   struct Snapshot {
@@ -116,7 +124,8 @@ class ReplayPlan {
         return std::nullopt;
       return input;
     });
-    if (!plan || lease.ReadGeneration(binding.state_word) != generation) return std::nullopt;
+    if (!plan || !plan->CaptureIndices(lease) ||
+        lease.ReadGeneration(binding.state_word) != generation) return std::nullopt;
     plan->captured_generation_ = generation;
     return plan;
   }
@@ -126,6 +135,9 @@ class ReplayPlan {
   std::span<const uint32_t> guest_words() const { return words_; }
   std::span<const uint32_t> input_words(const Operation& op) const {
     return op.input == UINT32_MAX ? std::span<const uint32_t>{} : inputs_[op.input].guest_words;
+  }
+  const IndexSnapshot* index_input(const Operation& op) const {
+    return op.index_input == UINT32_MAX ? nullptr : &indices_[op.index_input];
   }
   auto body(const Operation& op) const {
     return guest_words().subspan(op.first_word, op.count) |
@@ -148,6 +160,31 @@ class ReplayPlan {
   static constexpr uint32_t kCommandChain = 116, kCommandPatch = 144, kHeaderPatchWords = 124;
 
   explicit ReplayPlan(std::vector<uint32_t> words) : words_(std::move(words)) {}
+
+  template <typename Lease>
+  bool CaptureIndices(Lease& lease) {
+    size_t remaining = kMaxWords * sizeof(uint32_t);
+    for (auto& op : operations_) {
+      if (op.kind != Kind::kType3 || ((op.header >> 8) & 0x7f) != 0x22) continue;
+      // Use the same VGT_DRAW_INITIATOR and VGT_DMA_SIZE interpretation as
+      // PrimitiveProcessor, including the DMA-count clamp and alignment.
+      const uint32_t initiator = __builtin_bswap32(words_[op.first_word + 1]);
+      const uint32_t width = (initiator & (1u << 11)) ? 4 : 2;
+      const uint32_t address = __builtin_bswap32(words_[op.first_word + 2]) & ~(width - 1);
+      const uint32_t dma_size = __builtin_bswap32(words_[op.first_word + 3]);
+      const uint32_t count = std::min(initiator >> 16, dma_size & 0xffffffu);
+      const uint32_t bytes = count * width;
+      if (!bytes) continue;
+      if (address >= kPhysicalBytes || bytes > kPhysicalBytes - address || bytes > remaining)
+        return false;
+      IndexSnapshot input{address, width, dma_size >> 30, std::vector<std::byte>(bytes)};
+      if (!lease.Copy(AddressSpace::kPhysical, address, input.bytes)) return false;
+      op.index_input = uint32_t(indices_.size());
+      indices_.push_back(std::move(input));
+      remaining -= bytes;
+    }
+    return true;
+  }
 
   template <typename ReadInput>
   static std::optional<ReplayPlan> Build(std::vector<uint32_t> words, ReadInput&& read_input) {
@@ -223,6 +260,7 @@ class ReplayPlan {
   std::vector<uint32_t> words_;
   std::vector<Operation> operations_;
   std::vector<MemorySnapshot> inputs_;
+  std::vector<IndexSnapshot> indices_;
   std::optional<uint32_t> captured_generation_;
 };
 
