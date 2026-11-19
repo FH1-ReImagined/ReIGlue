@@ -173,10 +173,10 @@ class ReplayPlan {
            publication_->incarnation == binding.incarnation && publication_->phys == binding.phys &&
            publication_->words == binding.words;
   }
-  bool IsCurrentPublication(Registry& registry) const {
-    if (!publication_) return false;
+  bool IsCurrentList(Registry& registry, uint32_t phys, uint32_t words) const {
+    if (!publication_ || publication_->phys != phys || publication_->words != words) return false;
     Skip skip;
-    const auto* binding = registry.Lookup(publication_->phys, publication_->words, &skip);
+    const auto* binding = registry.Lookup(phys, words, &skip);
     return binding && MatchesPublication(*binding) && binding->pool_valid &&
            publication_->generation == binding->pool_generation;
   }

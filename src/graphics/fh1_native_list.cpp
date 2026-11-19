@@ -139,7 +139,6 @@ struct CommandProcessor::Fh1Lists {
   bool retained_pixel_only = false;
   bool refused_replay_control = false;
   uint32_t pixel_parity_sampling_passes = 0;
-  std::shared_ptr<const fl::ReplayPlan> timed_plan;
 #endif
   uint32_t audit_attempts = 0;
   std::array<uint64_t, 16> audited_lifetimes{};
@@ -572,7 +571,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
   s.ns_packets += NowNs() - t0;
 }
 
-bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader) {
+bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader,
+                                    std::shared_ptr<const fl::ReplayPlan>& admitted) {
   auto& s = *fh1_lists_;
 #if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
   std::shared_ptr<const fl::ReplayPlan> bind_plan;
@@ -590,6 +590,7 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     }
   }
 #else
+  (void)admitted;
   constexpr bool measuring = true;
 #endif
   const uint64_t t0 = NowNs();
@@ -840,7 +841,9 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
         fl::Resolve(t, reinterpret_cast<const uint8_t*>(bind_plan->guest_words().data()),
                     sealed_pool.data());
         if (sealed_pool == s.fresh_pool) {
-          s.timed_plan = std::move(bind_plan);
+          // The existing benchmark phase check admitted this capture. An ordinary
+          // run needs its own ordered phase witness before it can produce a plan here.
+          admitted = std::move(bind_plan);
         }
       }
     } else {
@@ -855,12 +858,12 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   return true;
 }
 
-bool CommandProcessor::TryFh1ReplayOwnedList(bool& success) {
+bool CommandProcessor::TryFh1ReplayOwnedList(std::shared_ptr<const fl::ReplayPlan> plan,
+                                            uint32_t phys, uint32_t words, bool& success) {
 #if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
   auto& s = *fh1_lists_;
-  const auto plan = std::exchange(s.timed_plan, {});
   if (!plan || fh1_stereo_state_ != Fh1StereoState::kOff || Fh1StereoWanted() ||
-      !plan->IsCurrentPublication(s.registry)) return false;
+      !plan->IsCurrentList(s.registry, phys, words)) return false;
   const auto lifetime = plan->producer_lifetime();
   if (!std::exchange(s.refused_replay_control, true)) {
     REXGPU_INFO("M4 timed list fallback: lifetime={} reason=control", lifetime);
@@ -884,6 +887,9 @@ bool CommandProcessor::TryFh1ReplayOwnedList(bool& success) {
   }
   return true;
 #else
+  (void)plan;
+  (void)phys;
+  (void)words;
   (void)success;
   return false;
 #endif
@@ -1036,7 +1042,6 @@ bool CommandProcessor::Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t
 void CommandProcessor::Fh1ListEnd() {
   auto& s = *fh1_lists_;
 #if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
-  s.timed_plan.reset();
   if (auto* vk_cp = std::exchange(s.index_audit_cp, nullptr)) {
     RecordCall([vk_cp] { vk_cp->EndFh1IndexAudit(); });
   }

@@ -936,12 +936,23 @@ void TestCaptureFromLease() {
 
     CHECK(owned->MatchesPublication(binding) && owned->producer_lifetime() == id);
     auto* current = registry.Lookup(binding.phys, binding.words, &skip);
-    CHECK(current && !owned->IsCurrentPublication(registry));
+    CHECK(current && !owned->IsCurrentList(registry, binding.phys, binding.words));
     current->pool_valid = true;
     current->pool_generation = 4;
-    CHECK(!owned->IsCurrentPublication(registry));
+    CHECK(!owned->IsCurrentList(registry, binding.phys, binding.words));
     current->pool_generation = 2;
-    CHECK(owned->IsCurrentPublication(registry));
+    CHECK(owned->IsCurrentList(registry, binding.phys, binding.words));
+    // Another current list in the same registry cannot consume this admission.
+    auto other = binding;
+    other.phys += 0x4000;
+    other.producer_lifetime += 100;
+    CHECK(registry.Bind(other) == fl::BindResult::kNew);
+    auto* other_current = registry.Lookup(other.phys, other.words, &skip);
+    CHECK(other_current);
+    other_current->pool_valid = true;
+    other_current->pool_generation = 2;
+    CHECK(!owned->IsCurrentList(registry, other.phys, binding.words));
+    CHECK(!owned->IsCurrentList(registry, binding.phys, binding.words - 1));
     auto legacy = binding;
     legacy.producer_lifetime = 0;
     auto legacy_lease = lease;
@@ -1002,7 +1013,7 @@ void TestCaptureFromLease() {
     const auto* recycled = registry.Lookup(binding.phys, binding.words, &skip);
     CHECK(recycled && recycled->incarnation != binding.incarnation);
     CHECK(!owned->MatchesPublication(*recycled));
-    CHECK(!owned->IsCurrentPublication(registry));
+    CHECK(!owned->IsCurrentList(registry, binding.phys, binding.words));
 
     lease.ranges.clear();
     size_t input_index = 0;
