@@ -521,26 +521,47 @@ int Memory::MapViewsMac() {
 }
 #endif  // REX_PLATFORM_MAC
 
-bool Memory::CopyPhysicalForReplay(uint32_t physical, uint8_t* destination, size_t size) {
+Memory::ReplayPhysicalWrite::ReplayPhysicalWrite() {
+#if REX_PLATFORM_WIN32
+  detail::physical_replay_gate.EnterWrite();
+#endif
+}
+
+Memory::ReplayPhysicalWrite::~ReplayPhysicalWrite() {
+#if REX_PLATFORM_WIN32
+  detail::physical_replay_gate.LeaveWrite();
+#endif
+}
+
+bool Memory::WithReplayPhysicalCapture(bool (*capture)(void*, const ReplayPhysicalCapture&),
+                                       void* context) {
+#if REX_PLATFORM_WIN32
+  if (!capture || rex::memory::page_size() != 4096) return false;
+  return detail::WithReplayCaptureLocks(detail::physical_replay_gate,
+                                       rex::thread::global_critical_region::mutex(), [&] {
+    return virtual_membase_ && physical_membase_ && capture(context, ReplayPhysicalCapture(*this));
+  });
+#else
+  (void)capture;
+  (void)context;
+  return false;
+#endif
+}
+
+bool Memory::ReplayPhysicalCapture::Copy(uint32_t physical, uint8_t* destination, size_t size) const {
 #if REX_PLATFORM_WIN32
   constexpr uint64_t kBackingBase = UINT64_C(0x100000000);
   constexpr uint64_t kPhysicalSize = UINT64_C(0x20000000);
   constexpr size_t kPageSize = 4096;
   constexpr size_t kMaxReplayBytes = 65536 * sizeof(uint32_t);
   if (!destination || !size || size > kMaxReplayBytes || physical >= kPhysicalSize ||
-      size > kPhysicalSize - physical || rex::memory::page_size() != kPageSize) {
+      size > kPhysicalSize - physical) {
     return false;
   }
-  auto writers_closed = detail::physical_replay_gate.TryCapture();
-  if (!writers_closed) return false;
-  // A writer may enter while holding the global region. Never wait for it
-  // here while holding the replay gate.
-  auto lock = std::unique_lock(rex::thread::global_critical_region::mutex(), std::try_to_lock);
-  if (!lock || !virtual_membase_ || !physical_membase_) return false;
 
   const uintptr_t output = reinterpret_cast<uintptr_t>(destination);
-  const uintptr_t guest = reinterpret_cast<uintptr_t>(virtual_membase_);
-  const uintptr_t guest_end = reinterpret_cast<uintptr_t>(physical_membase_) + kPhysicalSize;
+  const uintptr_t guest = reinterpret_cast<uintptr_t>(memory_.virtual_membase_);
+  const uintptr_t guest_end = reinterpret_cast<uintptr_t>(memory_.physical_membase_) + kPhysicalSize;
   if (size > UINTPTR_MAX - output || (output < guest_end && output + size > guest))
     return false;
 
@@ -548,7 +569,7 @@ bool Memory::CopyPhysicalForReplay(uint32_t physical, uint8_t* destination, size
   const size_t offset = physical - page;
   const size_t span = (offset + size + kPageSize - 1) & ~(kPageSize - 1);
   HeapAllocationInfo allocation{};
-  if (!heaps_.physical.QueryRegionInfo(page, &allocation) ||
+  if (!memory_.heaps_.physical.QueryRegionInfo(page, &allocation) ||
       !(allocation.state & kMemoryAllocationCommit) || span > allocation.region_size) {
     return false;
   }
@@ -563,11 +584,11 @@ bool Memory::CopyPhysicalForReplay(uint32_t physical, uint8_t* destination, size
     const uint64_t begin = view.target_address & offset_mask;
     const uint64_t end = begin + (view.virtual_address_end - view.virtual_address_start + 1);
     if (last <= begin || first >= end) continue;
-    if (first < begin || last > end || count == aliases.size() || !views_.all_views[i])
+    if (first < begin || last > end || count == aliases.size() || !memory_.views_.all_views[i])
       return false;
-    aliases[count++] = views_.all_views[i] + (first - begin);
+    aliases[count++] = memory_.views_.all_views[i] + (first - begin);
   }
-  if (count != aliases.size() || aliases.back() != physical_membase_ + page) return false;
+  if (count != aliases.size() || aliases.back() != memory_.physical_membase_ + page) return false;
   return detail::CopyFrozenReplayAliases(aliases, span, offset, {destination, size});
 #else
   (void)physical;

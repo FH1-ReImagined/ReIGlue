@@ -2671,6 +2671,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
     if (!pSampleCounts) {
       return true;
     }
+#if REX_PLATFORM_WIN32
+    memory::Memory::ReplayPhysicalWrite write;
+#endif
     // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
     // and used to detect a finished query.
     bool is_end_via_z_pass =

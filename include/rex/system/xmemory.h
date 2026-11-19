@@ -442,10 +442,33 @@ class Memory {
   // Base address of physical memory in the host address space.
   // This is often something like 0x200000000.
   inline uint8_t* physical_membase() const { return physical_membase_; }
-  // Copy command bytes from one committed physical allocation into private
-  // host storage. The caller still supplies the current binding and its
-  // native write/free guard. Unsupported mappings return false.
-  bool CopyPhysicalForReplay(uint32_t physical, uint8_t* destination, size_t size);
+  class ReplayPhysicalCapture {
+   public:
+    ReplayPhysicalCapture(const ReplayPhysicalCapture&) = delete;
+    ReplayPhysicalCapture& operator=(const ReplayPhysicalCapture&) = delete;
+    bool Copy(uint32_t physical, uint8_t* destination, size_t size) const;
+
+   private:
+    friend class Memory;
+    explicit ReplayPhysicalCapture(Memory& memory) : memory_(memory) {}
+    Memory& memory_;
+  };
+
+  // Keep the allocator and cooperating runtime writers out across all
+  // reads in the callback. The caller supplies the current producer binding
+  // and excludes its other write/free paths. The copy token is callback-local.
+  bool WithReplayPhysicalCapture(bool (*capture)(void*, const ReplayPhysicalCapture&),
+                                 void* context);
+
+  // Cooperating direct stores (including renderer DLLs) use the gate owned
+  // by rexruntime. The scope never keeps the mutex held during the store.
+  class ReplayPhysicalWrite {
+   public:
+    ReplayPhysicalWrite();
+    ~ReplayPhysicalWrite();
+    ReplayPhysicalWrite(const ReplayPhysicalWrite&) = delete;
+    ReplayPhysicalWrite& operator=(const ReplayPhysicalWrite&) = delete;
+  };
 
   // Translates a guest physical address to a host address that can be accessed
   // as a normal pointer.

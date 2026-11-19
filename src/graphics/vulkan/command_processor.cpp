@@ -9448,6 +9448,9 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   }
   // A counter snapshot: the guest subtracts 32-bit values, so wrap, don't clamp.
   uint32_t clamped = uint32_t(samples);
+#if REX_PLATFORM_WIN32
+  memory::Memory::ReplayPhysicalWrite write;
+#endif
   sample_counts->Total_A = clamped;
   sample_counts->Total_B = 0;
   sample_counts->ZPass_A = clamped;
