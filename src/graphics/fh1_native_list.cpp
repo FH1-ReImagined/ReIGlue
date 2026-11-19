@@ -45,6 +45,9 @@
 
 #if REX_PLATFORM_WIN32
 #include <Windows.h>
+#if REX_HAS_VULKAN
+#include <rex/graphics/vulkan/command_processor.h>
+#endif
 #endif
 #include "fh1_native_list.h"
 #include "fh1_command_cursor.h"
@@ -116,6 +119,7 @@ struct CommandProcessor::Fh1Lists {
 #if REX_PLATFORM_WIN32
   bool audit_binding = false;
   bool audit_capture = false;
+  bool audit_upload = false;
   uint32_t audit_attempts = 0;
   std::array<uint64_t, 16> audited_lifetimes{};
 #endif
@@ -153,6 +157,7 @@ struct LiveCaptureProbe {
   size_t index_bytes = 0, index_draws = 0;
   fl::ReplayPlan::AddressSpace space = fl::ReplayPlan::AddressSpace::kVirtual;
   bool refused_range = false;
+  std::optional<fl::ReplayPlan> plan;
 };
 
 struct LiveCaptureLease {
@@ -190,14 +195,14 @@ bool ProbeLiveCapture(void* context, uint32_t generation) noexcept {
         [](void* context, const memory::Memory::ReplayPhysicalCapture& capture) {
           auto& probe = *static_cast<LiveCaptureProbe*>(context);
           LiveCaptureLease lease{probe, capture};
-          const auto plan = fl::ReplayPlan::Capture(probe.registered, probe.binding, lease);
-          if (!plan) {
+          probe.plan = fl::ReplayPlan::Capture(probe.registered, probe.binding, lease);
+          if (!probe.plan) {
             probe.status = probe.refused_range ? "range-refused" : "plan-refused";
             return false;
           }
-          for (const auto& op : plan->operations()) {
-            probe.input_bytes += plan->input_words(op).size_bytes();
-            if (const auto* index = plan->index_input(op)) {
+          for (const auto& op : probe.plan->operations()) {
+            probe.input_bytes += probe.plan->input_words(op).size_bytes();
+            if (const auto* index = probe.plan->index_input(op)) {
               ++probe.index_draws;
               probe.index_bytes += index->bytes.size();
             }
@@ -304,7 +309,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
     fh1_lists_ = new Fh1Lists;
 #if REX_PLATFORM_WIN32
     if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT")) {
-      fh1_lists_->audit_capture = std::strcmp(e, "capture") == 0;
+      fh1_lists_->audit_upload = std::strcmp(e, "upload") == 0;
+      fh1_lists_->audit_capture = fh1_lists_->audit_upload || std::strcmp(e, "capture") == 0;
       fh1_lists_->audit_binding = fh1_lists_->audit_capture || std::strcmp(e, "1") == 0;
     }
 #endif
@@ -503,7 +509,8 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
           *unused = b->producer_lifetime;
           if (s.audit_capture) {
             LiveCaptureProbe probe{*memory_, *b, *tmpl};
-            with_binding(query, fh::kListBindLifetimeWords, ProbeLiveCapture, &probe);
+            const bool captured =
+                with_binding(query, fh::kListBindLifetimeWords, ProbeLiveCapture, &probe);
             REXGPU_INFO(
                 "M4 capture audit: phys={:08X} lifetime={} status={} ranges={} inputs={} "
                 "index_draws={} index_bytes={} last_space={} last_range={:08X} bytes={}",
@@ -511,6 +518,18 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
                 probe.index_draws, probe.index_bytes,
                 probe.space == fl::ReplayPlan::AddressSpace::kVirtual ? "virtual" : "physical",
                 probe.address, probe.range_bytes);
+#if REX_HAS_VULKAN
+            if (captured && s.audit_upload) {
+              if (auto* vk_cp = dynamic_cast<vulkan::VulkanCommandProcessor*>(this)) {
+                RecordCall([vk_cp, plan = std::move(*probe.plan),
+                            lifetime = b->producer_lifetime] {
+                  vk_cp->AuditFh1OwnedIndices(plan, lifetime);
+                });
+              }
+            }
+#else
+            (void)captured;
+#endif
           }
           query[13] ^= 0x80000000u;
           const bool wrong = with_binding(query, fh::kListBindLifetimeWords, capture, &generation);

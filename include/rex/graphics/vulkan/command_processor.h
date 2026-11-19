@@ -203,6 +203,7 @@ class VulkanCommandProcessor : public CommandProcessor {
                         VkPipelineStageFlags wait_stage_mask);
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
+  void AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan, uint64_t lifetime);
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
   // Submission must be open to insert barriers. If no pipeline stages access

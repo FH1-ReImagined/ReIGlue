@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 
 #include <rex/assert.h>
@@ -23,6 +24,7 @@
 
 #include "fh1_device_memory.h"
 #include "fh1_upload_stats.h"
+#include "../fh1_native_replay_plan.h"
 
 REXCVAR_DEFINE_BOOL(vulkan_force_expand_point_sprites_in_vs, false, "GPU/Vulkan",
                     "Force Vulkan point sprite expansion in the vertex shader, even when geometry "
@@ -39,6 +41,28 @@ REXCVAR_DEFINE_BOOL(vulkan_force_convert_quad_lists_to_triangle_lists, false, "G
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::graphics::vulkan {
+
+void VulkanCommandProcessor::AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan,
+                                                  uint64_t lifetime) {
+  if (!submission_open_ || !frame_open_ || !primitive_processor_) {
+    REXGPU_INFO("M4 index upload audit: lifetime={} skipped=no-frame", lifetime);
+    return;
+  }
+  size_t uploads = 0, bytes = 0, refused = 0;
+  for (const auto& op : plan.operations()) {
+    const auto* index = plan.index_input(op);
+    if (!index) continue;
+    const auto [buffer, offset] = primitive_processor_->StageCapturedIndex(index->bytes, index->width);
+    if (buffer == VK_NULL_HANDLE || offset % index->width) {
+      ++refused;
+      continue;
+    }
+    ++uploads;
+    bytes += index->bytes.size();
+  }
+  REXGPU_INFO("M4 index upload audit: lifetime={} frame={} submission={} uploads={} bytes={} refused={}",
+              lifetime, GetCurrentFrame(), GetCurrentSubmission(), uploads, bytes, refused);
+}
 
 VulkanPrimitiveProcessor::~VulkanPrimitiveProcessor() {
   Shutdown(true);
@@ -147,6 +171,19 @@ void VulkanPrimitiveProcessor::EndSubmission() {
 void VulkanPrimitiveProcessor::EndFrame() {
   ClearPerFrameCache();
   frame_index_buffers_.clear();
+}
+
+std::pair<VkBuffer, VkDeviceSize> VulkanPrimitiveProcessor::StageCapturedIndex(
+    std::span<const std::byte> bytes, uint32_t width) {
+  if ((width != 2 && width != 4) || bytes.empty() || bytes.size() % width ||
+      bytes.size() / width > UINT16_MAX) return {};
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceSize offset = 0;
+  uint8_t* mapping = frame_index_buffer_pool_->Request(
+      command_processor_.GetCurrentFrame(), bytes.size(), width, buffer, offset);
+  if (!mapping) return {};
+  std::memcpy(mapping, bytes.data(), bytes.size());
+  return {buffer, offset};
 }
 
 bool VulkanPrimitiveProcessor::InitializeBuiltinIndexBuffer(

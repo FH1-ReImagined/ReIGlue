@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <span>
 #include <utility>
 
 #include <rex/assert.h>
@@ -47,6 +48,10 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   std::pair<VkBuffer, VkDeviceSize> GetConvertedIndexBuffer(size_t handle) const {
     return frame_index_buffers_[handle];
   }
+  // Allocate in the same frame-owned pool used for converted draws. The
+  // caller supplies the final bytes for the index format it will bind.
+  std::pair<VkBuffer, VkDeviceSize> StageCapturedIndex(std::span<const std::byte> bytes,
+                                                      uint32_t width);
 
  protected:
   bool InitializeBuiltinIndexBuffer(size_t size_bytes,
