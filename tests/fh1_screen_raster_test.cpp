@@ -1,10 +1,26 @@
 #include <rex/graphics/vulkan/fh1_screen_raster.h>
+#include <rex/graphics/vulkan/fh1_hud_seed.h>
 
 #include <cstdio>
 #include <initializer_list>
 
 int main() {
   using namespace rex::graphics::vulkan::fh1;
+  constexpr HudSeedSurface color{2560, 1536, 64, true, true, true};
+  constexpr auto admits = [=](HudSeedSurface src, HudSeedSurface dst, int sx, int sy,
+                              int dx, int dy, bool distinct = true) {
+    return CanCopyHudSeed(src, dst, sx, sy, dx, dy, distinct, 64);
+  };
+  static_assert(admits(color, color, 2560, 1440, 2560, 1440));
+  static_assert(!admits(color, color, 959, 539, 1280, 720));
+  static_assert(!admits(color, color, 2560, 1440, 2560, 1440, false));
+  static_assert(!admits({2560, 1440, 37, true, true, true},
+                        {2560, 1440, 37, true, true, true}, 2560, 1440, 2560, 1440));
+  static_assert(!admits({2560,1439,64,true,true,true}, color, 2560,1440,2560,1440));
+  static_assert(!admits(color, {2560,1440,37,true,true,true}, 2560,1440,2560,1440));
+  static_assert(!admits(color, {2560,1440,64,true,true,false}, 2560,1440,2560,1440));
+  static_assert(!admits({2560,1440,64,true,false,true}, color, 2560,1440,2560,1440));
+  static_assert(!admits({2560,1440,64,false,true,true}, color, 2560,1440,2560,1440));
   unsigned failures = 0;
   auto check = [&](bool result) { failures += !result; };
   // Actual cockpit producer and downsample chain, with either viewport Y sign.
