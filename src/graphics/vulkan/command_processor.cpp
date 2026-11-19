@@ -75,6 +75,7 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include "../fh1_replay_benchmark.h"
 #include <rex/graphics/util/fh1_jitter.h>
 #include <rex/graphics/vulkan/fh1_dlss.h>
 #include <rex/graphics/vulkan/fh1_fsr3.h>
@@ -7797,8 +7798,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (replay_vertex_window[1] &&
       (!pipeline_configured || pipeline_is_placeholder || pipeline == VK_NULL_HANDLE ||
        pipeline_layout_provider == nullptr)) {
-    REXGPU_INFO("M4 vertex bind audit: frame={} submission={} stock-pipeline-fallback",
-                GetCurrentFrame(), GetCurrentSubmission());
+    if (!fh1_list::SustainedReplayRequested()) {
+      REXGPU_INFO("M4 vertex bind audit: frame={} submission={} stock-pipeline-fallback",
+                  GetCurrentFrame(), GetCurrentSubmission());
+    }
     pipeline_configured = select_stock_vertex() && configure_pipeline();
   }
   if (!pipeline_configured) return draw_fail("configure_pipeline");
@@ -8143,9 +8146,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkPushConstants(
         current_guest_graphics_pipeline_layout_->GetPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT,
         0, sizeof(replay_vertex_window), replay_vertex_window.data());
-    REXGPU_INFO("M4 vertex bind audit: frame={} submission={} address={:08X} bytes={} vs={:016X}",
-                GetCurrentFrame(), GetCurrentSubmission(), region.srcOffset, size,
-                vertex_shader->ucode_data_hash());
+    if (!fh1_list::SustainedReplayRequested()) {
+      REXGPU_INFO("M4 vertex bind audit: frame={} submission={} address={:08X} bytes={} vs={:016X}",
+                  GetCurrentFrame(), GetCurrentSubmission(), region.srcOffset, size,
+                  vertex_shader->ucode_data_hash());
+    }
   }
 
   ReplayPixelComparison replay_comparison;

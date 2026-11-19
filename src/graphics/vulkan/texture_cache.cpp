@@ -31,6 +31,7 @@
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #include <rex/graphics/vulkan/texture_cache.h>
+#include "../fh1_replay_benchmark.h"
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/mem_alloc.h>
@@ -790,8 +791,10 @@ VkImageView VulkanTextureCache::GetFh1ReplayTextureView(uint32_t fetch_constant_
   const VkImageView stock =
       GetActiveBindingOrNullImageView(fetch_constant_index, dimension, is_signed);
   const auto fallback = [&](const char* reason) {
-    REXGPU_INFO("M4 texture fallback audit: submission={} fetch={} reason={}",
-                command_processor_.GetCurrentSubmission(), fetch_constant_index, reason);
+    if (!fh1_list::SustainedReplayRequested()) {
+      REXGPU_INFO("M4 texture fallback audit: submission={} fetch={} reason={}",
+                  command_processor_.GetCurrentSubmission(), fetch_constant_index, reason);
+    }
     return stock;
   };
   if (!stock || dimension != xenos::FetchOpDimension::k2D) {
@@ -904,11 +907,13 @@ VkImageView VulkanTextureCache::GetFh1ReplayTextureView(uint32_t fetch_constant_
   slot->last_submission = command_processor_.GetCurrentSubmission();
   slot->source_this_draw = stock;
   if (owned_views) ++*owned_views;
-  REXGPU_INFO("M4 texture bind audit: submission={} fetch={} {}x{} mips={} format={} reused={} "
-              "source_pages={:05X}/{:05X} slot={}",
-              slot->last_submission, fetch_constant_index, width, height, mip_count,
-              uint32_t(format), matching != nullptr, uint32_t(source->key().base_page),
-              uint32_t(source->key().mip_page), slot - replay_texture_slots_.data());
+  if (!fh1_list::SustainedReplayRequested()) {
+    REXGPU_INFO("M4 texture bind audit: submission={} fetch={} {}x{} mips={} format={} reused={} "
+                "source_pages={:05X}/{:05X} slot={}",
+                slot->last_submission, fetch_constant_index, width, height, mip_count,
+                uint32_t(format), matching != nullptr, uint32_t(source->key().base_page),
+                uint32_t(source->key().mip_page), slot - replay_texture_slots_.data());
+  }
   return slot->view;
 }
 

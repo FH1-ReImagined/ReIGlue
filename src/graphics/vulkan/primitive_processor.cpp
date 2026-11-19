@@ -19,6 +19,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
+#include "../fh1_replay_benchmark.h"
 #include <rex/logging.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -182,9 +183,11 @@ std::pair<VkBuffer, VkDeviceSize> VulkanCommandProcessor::TakeFh1IndexAudit(
                             VK_ACCESS_INDEX_READ_BIT);
   }
   ++audit.bound;
-  REXGPU_INFO("M4 index bind audit: lifetime={} packet={} owned bytes={} source={}",
-              audit.lifetime, entry->packet, index.bytes.size(),
-              audit.witnessed ? "matched-upload" : "resident-gpu-copy");
+  if (!fh1_list::SustainedReplayRequested()) {
+    REXGPU_INFO("M4 index bind audit: lifetime={} packet={} owned bytes={} source={}",
+                audit.lifetime, entry->packet, index.bytes.size(),
+                audit.witnessed ? "matched-upload" : "resident-gpu-copy");
+  }
   if (!audit.witnessed) return {replay_index, bias};
   return entry->slice;
 }
@@ -192,8 +195,10 @@ std::pair<VkBuffer, VkDeviceSize> VulkanCommandProcessor::TakeFh1IndexAudit(
 void VulkanCommandProcessor::EndFh1IndexAudit() {
   auto& audit = fh1_index_audit;
   if (audit.owner != this) return;
-  REXGPU_INFO("M4 index bind summary: lifetime={} staged={} owned={} forced={}",
-              audit.lifetime, audit.entries.size(), audit.bound, audit.forced);
+  if (!fh1_list::SustainedReplayRequested()) {
+    REXGPU_INFO("M4 index bind summary: lifetime={} staged={} owned={} forced={}",
+                audit.lifetime, audit.entries.size(), audit.bound, audit.forced);
+  }
   audit = {};
 }
 

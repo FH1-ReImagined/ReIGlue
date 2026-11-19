@@ -54,6 +54,7 @@
 #include "fh1_native_list.h"
 #include "fh1_command_cursor.h"
 #include "fh1_native_replay_plan.h"
+#include "fh1_replay_benchmark.h"
 
 namespace rex::graphics {
 
@@ -147,9 +148,27 @@ struct CommandProcessor::Fh1Lists {
   std::array<uint8_t, 16> capture_visits{};
   uint32_t capture_visit_cap = 64;
   bool repeat_capture = false;
+  bool sustained_replay = false;
+  bool sustained_checked_lifetime = false;
+  std::array<uint32_t, 16> sustained_phys{};
+  uint64_t sustained_capture_ns = 0;
+  uint64_t sustained_captured = 0, sustained_reused = 0;
+  uint64_t sustained_lists = 0, sustained_failed = 0, sustained_operations = 0;
+  uint64_t sustained_first_ns = 0, sustained_last_ns = 0;
   bool reuse_snapshot = false;
   std::optional<uint64_t> repeat_capture_frame;
   uint32_t repeat_captures_this_frame = 0;
+
+  void RetireSustainedBinding(uint32_t phys, uint64_t lifetime = 0) {
+    if (!sustained_replay) return;
+    for (size_t i = 0; i < audited_lifetimes.size(); ++i) {
+      if (audited_lifetimes[i] && sustained_phys[i] == phys &&
+          (!lifetime || audited_lifetimes[i] == lifetime)) {
+        audited_lifetimes[i] = 0;
+        retained_replays[i] = {};
+      }
+    }
+  }
 #endif
   uint64_t draw_fields[fl::kFieldCount] = {}, end_fields[fl::kFieldCount] = {};
   uint64_t ns_begin = 0, ns_draw = 0, ns_end = 0, ns_packets = 0;
@@ -271,6 +290,15 @@ bool ProbeLiveCapture(void* context, uint32_t generation) noexcept {
 #endif
 
 void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t frames) {
+#if REX_PLATFORM_WIN32
+  if (s.sustained_replay) {
+    REXGPU_INFO("M4 sustained replay: frames={} attempts={} captured={} reused={} "
+                "lists={} failed={} ops={} guard_ns={} active_ns={}",
+                frames, s.audit_attempts, s.sustained_captured, s.sustained_reused,
+                s.sustained_lists, s.sustained_failed, s.sustained_operations,
+                s.sustained_capture_ns, s.sustained_last_ns - s.sustained_first_ns);
+  }
+#endif
   auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
   GroupCounts all;
   for (const GroupCounts& g : s.groups) {
@@ -367,6 +395,7 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
       fh1_lists_->repeat_capture = fh1_lists_->timed_replay && reuse &&
                                   (std::strcmp(reuse, "0") == 0 || std::strcmp(reuse, "1") == 0);
       fh1_lists_->reuse_snapshot = fh1_lists_->repeat_capture && reuse[0] == '1';
+      fh1_lists_->sustained_replay = fl::SustainedReplayRequested();
       const char* parity = std::getenv("FH1_M4_REPLAY_PIXEL_PARITY");
       fh1_lists_->timed_texture_parity =
           fh1_lists_->timed_replay && parity && std::strcmp(parity, "texture") == 0;
@@ -498,6 +527,9 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
           break;
         case fl::BindResult::kReplaced:
           ++s.bind_replaced;
+#if REX_PLATFORM_WIN32
+          s.RetireSustainedBinding(b.phys);
+#endif
           break;
         case fl::BindResult::kStale:
           ++s.stale_binds;
@@ -516,10 +548,15 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
         ++s.malformed;
         break;
       }
-      if (s.registry.Drop(words[2] & 0x1FFFFFFFu, lifetime))
+      const uint32_t phys = words[2] & 0x1FFFFFFFu;
+      if (s.registry.Drop(phys, lifetime)) {
         ++s.drops;
-      else
+#if REX_PLATFORM_WIN32
+        s.RetireSustainedBinding(phys, lifetime);
+#endif
+      } else {
         ++s.drop_unknown;  // already dropped (a replayed packet) or never bound
+      }
       break;
     }
     default:
@@ -535,7 +572,7 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   std::shared_ptr<const fl::ReplayPlan> bind_plan;
   const bool timed_replay = s.timed_replay;
   bool measuring = !timed_replay;
-  if (timed_replay && s.audit_attempts < 64) {
+  if (timed_replay && (s.sustained_replay || s.audit_attempts < 64)) {
     using Measuring = bool (*)() noexcept;
     static const auto race_measuring = reinterpret_cast<Measuring>(
         GetProcAddress(GetModuleHandleW(nullptr), "ForzaM4BenchmarkMeasuringV1"));
@@ -583,14 +620,15 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     s.repeat_capture_frame = s.frames;
     s.repeat_captures_this_frame = 0;
   }
-  if (s.audit_binding && measuring && s.audit_attempts < 64 && b->producer_lifetime &&
-      (!s.repeat_capture || s.repeat_captures_this_frame < 3)) {
+  if (s.audit_binding && measuring && (s.sustained_replay || s.audit_attempts < 64) &&
+      b->producer_lifetime && (!s.repeat_capture || s.repeat_captures_this_frame < 3)) {
     auto& tested = s.audited_lifetimes;
     const auto previous = std::ranges::find(tested, b->producer_lifetime);
     const auto slot = previous == tested.end() ? std::ranges::find(tested, 0) : previous;
     if (slot != tested.end() &&
         (previous == tested.end() ||
-         (s.repeat_capture && s.capture_visits[slot - tested.begin()] < s.capture_visit_cap))) {
+         (s.repeat_capture && (s.sustained_replay ||
+                               s.capture_visits[slot - tested.begin()] < s.capture_visit_cap)))) {
       if (s.repeat_capture) ++s.repeat_captures_this_frame;
       using Visit = bool (*)(void*, uint32_t) noexcept;
       using WithBinding = bool (*)(const uint32_t*, uint32_t, Visit, void*) noexcept;
@@ -609,22 +647,33 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
         };
         if (with_binding(query, fh::kListBindLifetimeWords, capture, &generation)) {
           *slot = b->producer_lifetime;
-          ++s.capture_visits[slot - tested.begin()];
+          const size_t slot_index = slot - tested.begin();
+          if (s.sustained_replay) {
+            s.sustained_phys[slot_index] = b->phys;
+          } else {
+            ++s.capture_visits[slot_index];
+          }
           if (s.audit_capture) {
             LiveCaptureProbe probe{*memory_, *b, *tmpl};
-            if (s.reuse_snapshot) probe.retained = &s.retained_replays[slot - tested.begin()];
+            if (s.reuse_snapshot) probe.retained = &s.retained_replays[slot_index];
             const uint64_t started = NowNs();
             const bool captured =
                 with_binding(query, fh::kListBindLifetimeWords, ProbeLiveCapture, &probe);
             const uint64_t duration = NowNs() - started;
-            REXGPU_INFO(
-                "M4 capture audit: phys={:08X} lifetime={} status={} ranges={} inputs={} "
-                "index_draws={} index_bytes={} last_space={} last_range={:08X} bytes={} "
-                "compared_bytes={} duration_ns={}",
-                b->phys, b->producer_lifetime, probe.status, probe.copied, probe.input_bytes,
-                probe.index_draws, probe.index_bytes,
-                probe.space == fl::ReplayPlan::AddressSpace::kVirtual ? "virtual" : "physical",
-                probe.address, probe.range_bytes, probe.compared_bytes, duration);
+            if (s.sustained_replay) {
+              s.sustained_capture_ns += duration;
+              s.sustained_reused += captured && probe.retained_hit;
+              s.sustained_captured += captured && !probe.retained_hit;
+            } else {
+              REXGPU_INFO(
+                  "M4 capture audit: phys={:08X} lifetime={} status={} ranges={} inputs={} "
+                  "index_draws={} index_bytes={} last_space={} last_range={:08X} bytes={} "
+                  "compared_bytes={} duration_ns={}",
+                  b->phys, b->producer_lifetime, probe.status, probe.copied, probe.input_bytes,
+                  probe.index_draws, probe.index_bytes,
+                  probe.space == fl::ReplayPlan::AddressSpace::kVirtual ? "virtual" : "physical",
+                  probe.address, probe.range_bytes, probe.compared_bytes, duration);
+            }
 #if REX_HAS_VULKAN
             // A fresh plan can populate the cache without consuming a
             // retained-only pixel comparison on that first execution.
@@ -644,10 +693,12 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
             (void)captured;
 #endif
           }
-          query[13] ^= 0x80000000u;
-          const bool wrong = with_binding(query, fh::kListBindLifetimeWords, capture, &generation);
-          REXGPU_INFO("M4 binding audit: phys={:08X} lifetime={} generation={} wrong_lifetime={}",
-                      b->phys, b->producer_lifetime, generation, wrong);
+          if (!s.sustained_replay || !std::exchange(s.sustained_checked_lifetime, true)) {
+            query[13] ^= 0x80000000u;
+            const bool wrong = with_binding(query, fh::kListBindLifetimeWords, capture, &generation);
+            REXGPU_INFO("M4 binding audit: phys={:08X} lifetime={} generation={} wrong_lifetime={}",
+                        b->phys, b->producer_lifetime, generation, wrong);
+          }
         }
       }
     }
@@ -814,9 +865,17 @@ bool CommandProcessor::TryFh1ReplayOwnedList(bool& success) {
   RecordCall([vk_cp, plan, lifetime] { vk_cp->AuditFh1OwnedIndices(*plan, lifetime, true); });
   const uint64_t started = NowNs();
   success = Fh1RecordOwnedList(*plan);
-  REXGPU_INFO("M4 timed list replay: lifetime={} generation={} operations={} success={} dispatch_ns={}",
-              lifetime, *plan->captured_generation(), plan->operations().size(), success,
-              NowNs() - started);
+  if (s.sustained_replay) {
+    if (!s.sustained_first_ns) s.sustained_first_ns = started;
+    s.sustained_last_ns = NowNs();
+    s.sustained_lists += success;
+    s.sustained_failed += !success;
+    if (success) s.sustained_operations += plan->operations().size();
+  } else {
+    REXGPU_INFO("M4 timed list replay: lifetime={} generation={} operations={} success={} dispatch_ns={}",
+                lifetime, *plan->captured_generation(), plan->operations().size(), success,
+                NowNs() - started);
+  }
   return true;
 #else
   (void)success;
