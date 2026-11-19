@@ -1910,6 +1910,9 @@ bool VulkanCommandProcessor::SetupContext() {
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
   const char* replay_audit = std::getenv("FH1_M4_BINDING_AUDIT");
+  if (replay_audit && std::strcmp(replay_audit, "timed-replay") == 0) {
+    primitive_processor_->InitializeReplayIndexBuffer();
+  }
   if (replay_audit && (std::strcmp(replay_audit, "bind-vertex") == 0 ||
                        std::strcmp(replay_audit, "bind-texture") == 0 ||
                        std::strcmp(replay_audit, "timed-replay") == 0) &&
@@ -7863,6 +7866,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
 
+  std::pair<VkBuffer, VkDeviceSize> replay_index;
+  if (primitive_processing_result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+      !shader_32bit_index_dma && !memexport_writes_possible) {
+    replay_index = TakeFh1IndexAudit(
+        primitive_processing_result.guest_index_base,
+        primitive_processing_result.host_draw_vertex_count,
+        primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4,
+        uint32_t(regs.Get<reg::VGT_DMA_SIZE>().swap_mode));
+  }
+
   if (replay_vertex_window[1]) {
     const VkBuffer replay_vertex = primitive_processor_->replay_vertex_buffer();
     const VkDeviceSize size = VkDeviceSize(replay_vertex_window[1]) * sizeof(uint32_t);
@@ -7938,18 +7952,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         if (guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE) {
           index_buffer.first = guest_dma_index_scratch_buffer.buffer();
           index_buffer.second = 0;
+        } else if (replay_index.first != VK_NULL_HANDLE) {
+          index_buffer = replay_index;
         } else {
-          index_buffer = {};
-          if (!memexport_writes_possible) {
-            index_buffer = TakeFh1IndexAudit(
-                primitive_processing_result.guest_index_base,
-                primitive_processing_result.host_draw_vertex_count,
-                primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4,
-                uint32_t(regs.Get<reg::VGT_DMA_SIZE>().swap_mode));
-          }
-          if (index_buffer.first == VK_NULL_HANDLE) {
-            index_buffer = {shared_memory_->buffer(), primitive_processing_result.guest_index_base};
-          }
+          index_buffer = {shared_memory_->buffer(), primitive_processing_result.guest_index_base};
         }
         break;
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:

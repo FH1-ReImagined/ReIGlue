@@ -43,6 +43,8 @@ REXCVAR_DEFINE_BOOL(vulkan_force_convert_quad_lists_to_triangle_lists, false, "G
 namespace rex::graphics::vulkan {
 
 namespace {
+constexpr VkDeviceSize kReplayIndexCapacity = 256 * 1024;
+
 struct Fh1IndexAuditEntry {
   uint32_t packet;
   fh1_list::ReplayPlan::IndexSnapshot index;
@@ -57,6 +59,7 @@ struct Fh1IndexAudit {
   std::vector<Fh1IndexAuditEntry> entries;
   const Fh1IndexAuditEntry* selected = nullptr;
   bool witnessed = false;
+  bool upload_seen = false;
   size_t bound = 0;
   size_t forced = 0;
 };
@@ -101,6 +104,7 @@ void VulkanCommandProcessor::SelectFh1IndexAuditDraw(uint32_t packet_offset) {
   if (audit.owner != this) return;
   audit.selected = nullptr;
   audit.witnessed = false;
+  audit.upload_seen = false;
   for (const auto& entry : audit.entries) {
     if (entry.packet == packet_offset) {
       audit.selected = &entry;
@@ -124,6 +128,7 @@ void VulkanCommandProcessor::ObserveFh1IndexAuditUpload(uint32_t address,
   const uint64_t upload_end = uint64_t(address) + bytes.size();
   const uint64_t index_end = uint64_t(index.address) + index.bytes.size();
   if (upload_end <= index.address || index_end <= address) return;
+  audit.upload_seen = true;
   // A later overlapping transfer supersedes any earlier witness.
   audit.witnessed = address <= index.address && index_end <= upload_end &&
                     std::memcmp(bytes.data() + (index.address - address), index.bytes.data(),
@@ -135,21 +140,52 @@ std::pair<VkBuffer, VkDeviceSize> VulkanCommandProcessor::TakeFh1IndexAudit(
   auto& audit = fh1_index_audit;
   if (audit.owner != this) return {};
   const auto* entry = std::exchange(audit.selected, nullptr);
-  if (!entry || !audit.witnessed || !frame_open_ || !submission_open_ ||
+  if (!entry || !frame_open_ || !submission_open_ ||
       audit.frame != GetCurrentFrame() || audit.submission != GetCurrentSubmission()) return {};
   const auto& index = entry->index;
   if (index.address != address || index.width != width || index.endian != endian ||
       index.bytes.size() != uint64_t(count) * width ||
       shared_memory_->IsRangeGpuWritten(address, uint32_t(index.bytes.size()))) return {};
+  const VkBuffer replay_index = primitive_processor_->replay_index_buffer();
+  VkBufferCopy resident_copy = {};
+  const uint32_t bias = address & 3;
+  if (!audit.witnessed) {
+    // A resident copy starts from the GPU bytes the stock draw would read. An
+    // observed nonmatching upload is a disagreement and stays on the stock path.
+    if (audit.upload_seen || replay_index == VK_NULL_HANDLE) return {};
+    resident_copy.srcOffset = address - bias;
+    resident_copy.size = (VkDeviceSize(bias) + index.bytes.size() + 3) & ~VkDeviceSize(3);
+    if (resident_copy.size > kReplayIndexCapacity ||
+        resident_copy.srcOffset + resident_copy.size > SharedMemory::kBufferSize) return {};
+    const auto lock = thread::global_critical_region::AcquireDirect();
+    if (!shared_memory_->IsRangeValid(uint32_t(resident_copy.srcOffset),
+                                      uint32_t(resident_copy.size))) return {};
+  }
   if (!std::exchange(fh1_index_audit_forced_fallback, true)) {
     ++audit.forced;
     REXGPU_INFO("M4 index bind audit: lifetime={} packet={} forced-stock bytes={}",
                 audit.lifetime, entry->packet, index.bytes.size());
     return {};
   }
+  if (!audit.witnessed) {
+    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+    PushBufferMemoryBarrier(replay_index, 0, resident_copy.size,
+                            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT);
+    SubmitBarriers(true);
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), replay_index, 1,
+                                             &resident_copy);
+    PushBufferMemoryBarrier(replay_index, 0, resident_copy.size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_INDEX_READ_BIT);
+  }
   ++audit.bound;
-  REXGPU_INFO("M4 index bind audit: lifetime={} packet={} owned bytes={}",
-              audit.lifetime, entry->packet, index.bytes.size());
+  REXGPU_INFO("M4 index bind audit: lifetime={} packet={} owned bytes={} source={}",
+              audit.lifetime, entry->packet, index.bytes.size(),
+              audit.witnessed ? "matched-upload" : "resident-gpu-copy");
+  if (!audit.witnessed) return {replay_index, bias};
   return entry->slice;
 }
 
@@ -210,6 +246,8 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
   frame_index_buffer_pool_.reset();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, replay_vertex_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, replay_vertex_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, replay_index_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, replay_index_memory_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, builtin_index_buffer_upload_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
                                          builtin_index_buffer_upload_memory_);
@@ -226,6 +264,13 @@ void VulkanPrimitiveProcessor::InitializeReplayVertexBuffer() {
       command_processor_.GetVulkanDevice(), SpirvShaderTranslator::kFh1ReplayVertexCapacity,
       VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
       ui::vulkan::util::MemoryPurpose::kDeviceLocal, replay_vertex_buffer_, replay_vertex_memory_);
+}
+
+void VulkanPrimitiveProcessor::InitializeReplayIndexBuffer() {
+  ui::vulkan::util::CreateDedicatedAllocationBuffer(
+      command_processor_.GetVulkanDevice(), kReplayIndexCapacity,
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+      ui::vulkan::util::MemoryPurpose::kDeviceLocal, replay_index_buffer_, replay_index_memory_);
 }
 
 void VulkanPrimitiveProcessor::CompletedSubmissionUpdated() {

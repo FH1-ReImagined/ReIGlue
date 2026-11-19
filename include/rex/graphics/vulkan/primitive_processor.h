@@ -54,6 +54,8 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
                                                       uint32_t width);
   void InitializeReplayVertexBuffer();
   VkBuffer replay_vertex_buffer() const { return replay_vertex_buffer_; }
+  void InitializeReplayIndexBuffer();
+  VkBuffer replay_index_buffer() const { return replay_index_buffer_; }
 
  protected:
   bool InitializeBuiltinIndexBuffer(size_t size_bytes,
@@ -84,6 +86,8 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   std::deque<std::pair<VkBuffer, VkDeviceSize>> frame_index_buffers_;
   VkBuffer replay_vertex_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory replay_vertex_memory_ = VK_NULL_HANDLE;
+  VkBuffer replay_index_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory replay_index_memory_ = VK_NULL_HANDLE;
 };
 
 }  // namespace rex::graphics::vulkan
