@@ -9,6 +9,7 @@
 #include <cstring>
 #include <exception>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace rex::memory {
@@ -32,6 +33,7 @@ class FrozenReplayPages {
 
  private:
   friend class ::rex::memory::Memory;
+  friend struct FrozenReplayPagesTestAccess;
   // Memory derives these aliases from its original file-backed views.
   explicit FrozenReplayPages(bool query_resident_pages)
       : query_resident_pages_(query_resident_pages) {}
@@ -56,8 +58,36 @@ class FrozenReplayPages {
   bool Observe(uintptr_t page, uintptr_t limit, Region& region, bool& used_fallback);
   bool ObserveResident(uintptr_t page, uintptr_t limit, Region& region) const;
   bool query_resident_pages_ = false;
-  std::vector<Restore> restore_;
-  std::vector<Span> sealed_;
+  // Common captures use four spans across four aliases. Additional entries
+  // stay in the original vector types and are discarded with this transaction.
+  template <typename T>
+  struct Journal {
+    static constexpr size_t kInlineCount = 16;
+    T entries[kInlineCount];
+    size_t inline_count = 0;
+    std::vector<T> overflow;
+
+    __forceinline Journal() = default;
+    __forceinline ~Journal() = default;
+    __forceinline size_t size() const { return inline_count + overflow.size(); }
+    __forceinline T& operator[](size_t i) {
+      return i < kInlineCount ? entries[i] : overflow[i - kInlineCount];
+    }
+    __forceinline void push_back(T entry) {
+      if (inline_count < kInlineCount) {
+        entries[inline_count++] = entry;
+      } else {
+        overflow.push_back(std::move(entry));
+      }
+    }
+    // Restore the exact journal length saved before preflight.
+    __forceinline void truncate(size_t kept) {
+      overflow.resize(kept > kInlineCount ? kept - kInlineCount : 0);
+      inline_count = (std::min)(inline_count, kept);
+    }
+  };
+  Journal<Restore> restore_;
+  Journal<Span> sealed_;
   // Cache only observations made in this locked transaction. A sealed
   // subrange supersedes the observed protection until restoration.
   std::array<Region, 32> observed_{};
@@ -144,7 +174,8 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
     for (uintptr_t base = start; base < end;) {
       uintptr_t verified_end = base;
       uintptr_t next_sealed = end;
-      for (const auto& span : sealed_) {
+      for (size_t j = 0; j < sealed_.size(); ++j) {
+        const auto& span = sealed_[j];
         if (base >= span.start && base < span.end) verified_end = (std::max)(verified_end, span.end);
         if (span.start > base) next_sealed = (std::min)(next_sealed, span.start);
       }
@@ -156,7 +187,7 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
       Region region;
       bool used_fallback = false;
       if (!Observe(base, next_sealed, region, used_fallback)) {
-        restore_.resize(first_restore);
+        restore_.truncate(first_restore);
         return false;
       }
       if (used_fallback && !warm[i]) {
@@ -187,9 +218,15 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
   }
   for (auto* page : pages) {
     const auto start = reinterpret_cast<uintptr_t>(page);
-    if (std::none_of(sealed_.begin(), sealed_.end(), [&](const Span& span) {
-          return span.start <= start && span.end >= start + span_bytes;
-        })) {
+    bool contained = false;
+    for (size_t j = 0; j < sealed_.size(); ++j) {
+      const auto& span = sealed_[j];
+      if (span.start <= start && span.end >= start + span_bytes) {
+        contained = true;
+        break;
+      }
+    }
+    if (!contained) {
       sealed_.push_back({start, start + span_bytes});
     }
   }
@@ -204,10 +241,11 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
 }
 
 inline FrozenReplayPages::~FrozenReplayPages() {
-  for (auto it = restore_.rbegin(); it != restore_.rend(); ++it) {
-    if (!it->applied) continue;
+  for (size_t i = restore_.size(); i > 0; --i) {
+    const auto& run = restore_[i - 1];
+    if (!run.applied) continue;
     DWORD previous = 0;
-    if (!VirtualProtect(it->page, it->bytes, it->protection, &previous) ||
+    if (!VirtualProtect(run.page, run.bytes, run.protection, &previous) ||
         previous != PAGE_READONLY) {
       std::terminate();
     }
