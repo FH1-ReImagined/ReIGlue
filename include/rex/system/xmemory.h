@@ -456,12 +456,16 @@ class Memory {
     bool MatchesPhysicalAlias(uint32_t guest, const uint8_t* expected, size_t size,
                               uint64_t stamp) const;
 
+    // Guard the entire alias range and compare all but one aligned 32-bit word.
+    bool MatchesPhysicalAliasExceptWord(uint32_t guest, const uint8_t* expected, size_t size,
+                                       uint64_t stamp, size_t offset) const;
+
    private:
     friend class Memory;
     ReplayPhysicalCapture(Memory& memory, detail::FrozenReplayPages& pages)
         : memory_(memory), pages_(pages) {}
     bool Access(uint32_t physical, const uint8_t* bytes, size_t size, uint8_t* destination,
-                uint64_t stamp) const;
+                uint64_t stamp, size_t ignored_word = SIZE_MAX) const;
     bool ResolveAlias(uint32_t guest, size_t size, uint32_t& physical) const;
     Memory& memory_;
     detail::FrozenReplayPages& pages_;

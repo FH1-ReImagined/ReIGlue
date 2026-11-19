@@ -134,7 +134,12 @@ class ReplayPlan {
     return plan;
   }
 
-  // Recheck precisely the same byte spans Capture owned. The caller still
+  // RunCommandBuffer (TU4 82446F10–82446F7C) owns the command buffer's
+  // last-run stamp and performs its side effects before the decoder sees this
+  // list. Neither the replay plan nor the live key consumes that stamp.
+  static constexpr size_t kLastRunStampOffset = 8;
+
+  // Guard precisely the same spans Capture owned. The caller still
   // holds the original producer lease and the physical capture transaction.
   template <typename Lease>
   bool Revalidate(const Binding& binding, Lease& lease) const {
@@ -145,7 +150,8 @@ class ReplayPlan {
       auto bytes = std::as_bytes(std::span(data));
       return bytes.empty() || lease.MatchBytes(space, address, bytes);
     };
-    if (!match(AddressSpace::kVirtual, binding.cb, header_) ||
+    if (!lease.MatchCommandHeader(binding.cb, std::as_bytes(std::span(header_)),
+                                  kLastRunStampOffset) ||
         !match(AddressSpace::kVirtual, chain_, link_) ||
         !match(AddressSpace::kVirtual, binding.patch, patch_) ||
         !match(AddressSpace::kPhysical, binding.phys, words_)) return false;

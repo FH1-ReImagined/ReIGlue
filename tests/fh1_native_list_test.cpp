@@ -825,6 +825,18 @@ void TestCaptureFromLease() {
       std::memcpy(bytes.data(), range->second.data(), bytes.size());
       return true;
     }
+    bool MatchCommandHeader(uint32_t address, std::span<const std::byte> bytes, size_t ignored) {
+      ++comparisons;
+      CHECK(ignored == 8 && bytes.size() == fl::kHeaderBytes);
+      const auto range = ranges.find({Space::kVirtual, address, bytes.size()});
+      if (range == ranges.end()) return false;
+      const auto* expected = reinterpret_cast<const uint8_t*>(bytes.data());
+      const auto& live = range->second;
+      for (size_t i = 0; i < bytes.size(); ++i) {
+        if ((i < ignored || i >= ignored + 4) && expected[i] != live[i]) return false;
+      }
+      return true;
+    }
     bool MatchBytes(Space space, uint32_t address, std::span<const std::byte> bytes) {
       ++comparisons;
       const auto range = ranges.find({space, address, bytes.size()});
@@ -933,7 +945,16 @@ void TestCaptureFromLease() {
       CHECK(!owned->Revalidate(binding, changed));
       CHECK(changed.reads == 0);
     }
+    const auto header_range = std::tuple{Space::kVirtual, binding.cb, size_t(fl::kHeaderBytes)};
+    for (size_t byte = 0; byte < fl::kHeaderBytes; ++byte) {
+      auto changed = lease;
+      changed.ranges.at(header_range)[byte] ^= 1;
+      CHECK(owned->Revalidate(binding, changed) == (byte >= 8 && byte < 12));
+    }
     auto changed = lease;
+    changed.ranges.erase(header_range);
+    CHECK(!owned->Revalidate(binding, changed));
+    changed = lease;
     changed.generation = 4;
     CHECK(!owned->Revalidate(binding, changed) && changed.comparisons == 0);
     changed = lease;

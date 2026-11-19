@@ -591,7 +591,8 @@ bool Memory::ReplayPhysicalCapture::Matches(uint32_t physical, const uint8_t* ex
 }
 
 bool Memory::ReplayPhysicalCapture::Access(uint32_t physical, const uint8_t* bytes, size_t size,
-                                           uint8_t* destination, uint64_t stamp) const {
+                                           uint8_t* destination, uint64_t stamp,
+                                           size_t ignored_word) const {
 #if REX_PLATFORM_WIN32
   constexpr uint64_t kBackingBase = UINT64_C(0x100000000);
   constexpr uint64_t kPhysicalSize = UINT64_C(0x20000000);
@@ -635,13 +636,14 @@ bool Memory::ReplayPhysicalCapture::Access(uint32_t physical, const uint8_t* byt
   }
   if (count != aliases.size() || aliases.back() != memory_.physical_membase_ + page) return false;
   if (destination) return pages_.Copy(aliases, span, offset, {destination, size});
-  return pages_.Matches(aliases, span, offset, {bytes, size});
+  return pages_.Matches(aliases, span, offset, {bytes, size}, ignored_word);
 #else
   (void)physical;
   (void)bytes;
   (void)size;
   (void)destination;
   (void)stamp;
+  (void)ignored_word;
   return false;
 #endif
 }
@@ -656,6 +658,13 @@ bool Memory::ReplayPhysicalCapture::MatchesPhysicalAlias(uint32_t guest, const u
                                                          size_t size, uint64_t stamp) const {
   uint32_t physical;
   return ResolveAlias(guest, size, physical) && Matches(physical, expected, size, stamp);
+}
+
+bool Memory::ReplayPhysicalCapture::MatchesPhysicalAliasExceptWord(
+    uint32_t guest, const uint8_t* expected, size_t size, uint64_t stamp, size_t offset) const {
+  uint32_t physical;
+  return stamp && ResolveAlias(guest, size, physical) &&
+         Access(physical, expected, size, nullptr, stamp, offset);
 }
 
 bool Memory::ReplayPhysicalCapture::ResolveAlias(uint32_t guest, size_t size,

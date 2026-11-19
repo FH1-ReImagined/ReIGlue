@@ -28,7 +28,7 @@ class FrozenReplayPages {
   bool Copy(const std::array<uint8_t*, 4>& pages, size_t span_bytes, size_t offset,
             std::span<uint8_t> destination);
   bool Matches(const std::array<uint8_t*, 4>& pages, size_t span_bytes, size_t offset,
-               std::span<const uint8_t> expected);
+               std::span<const uint8_t> expected, size_t ignored_word = SIZE_MAX);
 
  private:
   friend class ::rex::memory::Memory;
@@ -226,9 +226,22 @@ inline bool FrozenReplayPages::Copy(const std::array<uint8_t*, 4>& pages, size_t
 }
 
 inline bool FrozenReplayPages::Matches(const std::array<uint8_t*, 4>& pages, size_t span_bytes,
-                                       size_t offset, std::span<const uint8_t> expected) {
-  return FreezeForAccess(pages, span_bytes, offset, expected) &&
-         std::memcmp(expected.data(), pages.back() + offset, expected.size()) == 0;
+                                       size_t offset, std::span<const uint8_t> expected,
+                                       size_t ignored_word) {
+  if (ignored_word != SIZE_MAX &&
+      ((ignored_word % sizeof(uint32_t)) || ignored_word > expected.size() ||
+       expected.size() - ignored_word < sizeof(uint32_t))) {
+    return false;
+  }
+  if (!FreezeForAccess(pages, span_bytes, offset, expected)) return false;
+
+  const uint8_t* live = pages.back() + offset;
+  if (ignored_word == SIZE_MAX)
+    return std::memcmp(expected.data(), live, expected.size()) == 0;
+
+  const size_t suffix = ignored_word + sizeof(uint32_t);
+  return std::memcmp(expected.data(), live, ignored_word) == 0 &&
+         std::memcmp(expected.data() + suffix, live + suffix, expected.size() - suffix) == 0;
 }
 
 }  // namespace rex::memory::detail

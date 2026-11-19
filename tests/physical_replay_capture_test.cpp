@@ -78,6 +78,25 @@ int main() {
     rex::memory::detail::FrozenReplayPages next;
     CHECK(!next.Matches(at(2), 4 * kPage, 0, expected));
   }
+  {
+    // The ignored word is the last word of the first page. Both pages
+    // must still be sealed, and a change outside the ignored word must fail.
+    constexpr size_t offset = kPage - 4;
+    std::array<uint8_t, 8> header{};
+    std::memcpy(header.data(), at(6)[3] + offset, header.size());
+    at(6)[0][offset] ^= 1;
+    rex::memory::detail::FrozenReplayPages next;
+    CHECK(!next.Matches(at(6), 2 * kPage, offset, header, 1));
+    CHECK(!next.Matches(at(6), 2 * kPage, offset, header, header.size()));
+    CHECK(next.Matches(at(6), 2 * kPage, offset, header, 0));
+    CHECK(!next.Matches(at(6), 2 * kPage, offset, header, 4));
+    for (size_t page : {6u, 7u})
+      for (auto* address : at(page)) CHECK(Protection(address) == PAGE_READONLY);
+    // The skipped word lies on an inaccessible alias. The guard must
+    // refuse the entire range even though its other bytes match.
+    std::memcpy(header.data(), at(8)[3] + offset, header.size());
+    CHECK(!next.Matches(at(8), 2 * kPage, offset, header, 0));
+  }
   for (auto* alias : aliases) CHECK(UnmapViewOfFile(alias));
   CHECK(CloseHandle(section));
 }

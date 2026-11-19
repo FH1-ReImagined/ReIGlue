@@ -222,6 +222,13 @@ struct LiveCaptureLease {
         __builtin_bswap32(std::atomic_ref<uint32_t>(*word).load(std::memory_order_acquire));
     return generation == probe.generation ? std::optional{generation} : std::nullopt;
   }
+  bool MatchCommandHeader(uint32_t address, std::span<const std::byte> bytes,
+                          size_t ignored_word) {
+    probe.compared_bytes += bytes.size();
+    return capture.MatchesPhysicalAliasExceptWord(
+        address, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+        probe.retained->allocation_stamp, ignored_word);
+  }
   bool MatchBytes(fl::ReplayPlan::AddressSpace space, uint32_t address,
                   std::span<const std::byte> bytes) {
     const auto* expected = reinterpret_cast<const uint8_t*>(bytes.data());
