@@ -143,6 +143,8 @@ struct CommandProcessor::Fh1Lists {
   uint32_t audit_attempts = 0;
   std::array<uint64_t, 16> audited_lifetimes{};
   std::array<RetainedReplay, 16> retained_replays{};
+  std::array<uint8_t, 16> capture_visits{};
+  uint32_t capture_visit_cap = 64;
   bool repeat_capture = false;
   bool reuse_snapshot = false;
   std::optional<uint64_t> repeat_capture_frame;
@@ -368,6 +370,9 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
       fh1_lists_->timed_pixel_parity =
           fh1_lists_->timed_texture_parity ||
           (fh1_lists_->timed_replay && parity && std::strcmp(parity, "1") == 0);
+      // Let the pixel audit see several bindings rather than spending the
+      // whole sample on one repeating attachment configuration.
+      if (fh1_lists_->timed_pixel_parity) fh1_lists_->capture_visit_cap = 3;
 #endif
       fh1_lists_->audit_bind =
           std::strcmp(e, "bind") == 0 || std::strcmp(e, "bind-vertex") == 0 ||
@@ -576,7 +581,9 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     auto& tested = s.audited_lifetimes;
     const auto previous = std::ranges::find(tested, b->producer_lifetime);
     const auto slot = previous == tested.end() ? std::ranges::find(tested, 0) : previous;
-    if (slot != tested.end() && (previous == tested.end() || s.repeat_capture)) {
+    if (slot != tested.end() &&
+        (previous == tested.end() ||
+         (s.repeat_capture && s.capture_visits[slot - tested.begin()] < s.capture_visit_cap))) {
       if (s.repeat_capture) ++s.repeat_captures_this_frame;
       using Visit = bool (*)(void*, uint32_t) noexcept;
       using WithBinding = bool (*)(const uint32_t*, uint32_t, Visit, void*) noexcept;
@@ -595,6 +602,7 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
         };
         if (with_binding(query, fh::kListBindLifetimeWords, capture, &generation)) {
           *slot = b->producer_lifetime;
+          ++s.capture_visits[slot - tested.begin()];
           if (s.audit_capture) {
             LiveCaptureProbe probe{*memory_, *b, *tmpl};
             if (s.reuse_snapshot) probe.retained = &s.retained_replays[slot - tested.begin()];
@@ -996,6 +1004,7 @@ void CommandProcessor::Fh1ListsSwap() {
     s.audit_attempts = 0;
     s.audited_lifetimes.fill(0);
     s.retained_replays.fill({});
+    s.capture_visits.fill(0);
     ++s.pixel_parity_sampling_passes;
   }
 #endif
