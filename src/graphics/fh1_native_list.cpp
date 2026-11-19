@@ -136,6 +136,7 @@ struct CommandProcessor::Fh1Lists {
   bool timed_replay = false;
   bool timed_pixel_parity = false;
   bool timed_texture_parity = false;
+  bool retained_pixel_only = false;
   bool refused_replay_control = false;
   uint32_t pixel_parity_sampling_passes = 0;
   std::shared_ptr<const fl::ReplayPlan> timed_plan;
@@ -187,6 +188,7 @@ struct LiveCaptureProbe {
   std::shared_ptr<const fl::ReplayPlan> plan;
   RetainedReplay* retained = nullptr;
   size_t compared_bytes = 0;
+  bool retained_hit = false;
 };
 
 struct LiveCaptureLease {
@@ -236,6 +238,7 @@ bool ProbeLiveCapture(void* context, uint32_t generation) noexcept {
           if (probe.retained && probe.retained->incarnation == probe.binding.incarnation &&
               probe.retained->plan && probe.retained->plan->Revalidate(probe.binding, lease)) {
             probe.plan = probe.retained->plan;
+            probe.retained_hit = true;
             probe.status = "reused";
             return true;
           }
@@ -373,6 +376,10 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
       // Let the pixel audit see several bindings rather than spending the
       // whole sample on one repeating attachment configuration.
       if (fh1_lists_->timed_pixel_parity) fh1_lists_->capture_visit_cap = 3;
+      const char* retained = std::getenv("FH1_M4_PIXEL_RETAINED_ONLY");
+      fh1_lists_->retained_pixel_only = fh1_lists_->timed_texture_parity &&
+                                        fh1_lists_->reuse_snapshot && retained &&
+                                        std::strcmp(retained, "1") == 0;
 #endif
       fh1_lists_->audit_bind =
           std::strcmp(e, "bind") == 0 || std::strcmp(e, "bind-vertex") == 0 ||
@@ -619,7 +626,9 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
                 probe.space == fl::ReplayPlan::AddressSpace::kVirtual ? "virtual" : "physical",
                 probe.address, probe.range_bytes, probe.compared_bytes, duration);
 #if REX_HAS_VULKAN
-            if (captured && s.audit_upload) {
+            // A fresh plan can populate the cache without consuming a
+            // retained-only pixel comparison on that first execution.
+            if (captured && s.audit_upload && (!s.retained_pixel_only || probe.retained_hit)) {
               if (auto* vk_cp = dynamic_cast<vulkan::VulkanCommandProcessor*>(this)) {
                 if (s.audit_bind) {
                   bind_plan = std::move(probe.plan);
