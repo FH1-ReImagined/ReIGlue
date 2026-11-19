@@ -79,7 +79,7 @@ class ReplayPlan {
   template <typename Lease>
   static std::optional<ReplayPlan> Capture(const Template& registered, const Binding& binding,
                                            Lease& lease) {
-    if (!binding.incarnation || !binding.state_word || !binding.cb ||
+    if (!binding.producer_lifetime || !binding.incarnation || !binding.state_word || !binding.cb ||
         (binding.cb & 3) || (binding.state_word & 3) || (binding.patch & 3) ||
         binding.patch_words > kMaxWords || (binding.patch_words && !binding.patch) ||
         !binding.words || binding.words > kMaxWords || (binding.phys & 3) ||
@@ -126,7 +126,8 @@ class ReplayPlan {
     });
     if (!plan || !plan->CaptureIndices(lease) ||
         lease.ReadGeneration(binding.state_word) != generation) return std::nullopt;
-    plan->captured_generation_ = generation;
+    plan->publication_ = Publication{binding.producer_lifetime, binding.incarnation, binding.phys,
+                                     binding.words, *generation};
     plan->header_ = header;
     plan->link_ = link;
     plan->chain_ = chain;
@@ -143,8 +144,8 @@ class ReplayPlan {
   // holds the original producer lease and the physical capture transaction.
   template <typename Lease>
   bool Revalidate(const Binding& binding, Lease& lease) const {
-    if (!captured_generation_ || !lease.Matches(binding) ||
-        lease.ReadGeneration(binding.state_word) != captured_generation_) return false;
+    if (!MatchesPublication(binding) || !lease.Matches(binding) ||
+        lease.ReadGeneration(binding.state_word) != captured_generation()) return false;
 
     const auto match = [&](AddressSpace space, uint32_t address, const auto& data) {
       auto bytes = std::as_bytes(std::span(data));
@@ -162,10 +163,28 @@ class ReplayPlan {
     for (const auto& input : indices_) {
       if (!match(AddressSpace::kPhysical, input.address, input.bytes)) return false;
     }
-    return lease.ReadGeneration(binding.state_word) == captured_generation_;
+    return lease.ReadGeneration(binding.state_word) == captured_generation();
   }
 
-  std::optional<uint32_t> captured_generation() const { return captured_generation_; }
+  // Registry::Bind changes incarnation whenever a wire identity field changes.
+  // Plain Compile has no title lease and cannot mint an owned publication.
+  bool MatchesPublication(const Binding& binding) const {
+    return publication_ && publication_->lifetime == binding.producer_lifetime &&
+           publication_->incarnation == binding.incarnation && publication_->phys == binding.phys &&
+           publication_->words == binding.words;
+  }
+  bool IsCurrentPublication(Registry& registry) const {
+    if (!publication_) return false;
+    Skip skip;
+    const auto* binding = registry.Lookup(publication_->phys, publication_->words, &skip);
+    return binding && MatchesPublication(*binding) && binding->pool_valid &&
+           publication_->generation == binding->pool_generation;
+  }
+  uint64_t producer_lifetime() const { return publication_ ? publication_->lifetime : 0; }
+  std::optional<uint32_t> captured_generation() const {
+    if (!publication_) return std::nullopt;
+    return publication_->generation;
+  }
   std::span<const Operation> operations() const { return operations_; }
   std::span<const uint32_t> guest_words() const { return words_; }
   std::span<const uint32_t> input_words(const Operation& op) const {
@@ -296,7 +315,11 @@ class ReplayPlan {
   std::vector<Operation> operations_;
   std::vector<MemorySnapshot> inputs_;
   std::vector<IndexSnapshot> indices_;
-  std::optional<uint32_t> captured_generation_;
+  struct Publication {
+    uint64_t lifetime, incarnation;
+    uint32_t phys, words, generation;
+  };
+  std::optional<Publication> publication_;
   std::array<uint8_t, kHeaderBytes> header_{};
   std::array<uint8_t, 16> link_{};
   uint32_t chain_ = 0;

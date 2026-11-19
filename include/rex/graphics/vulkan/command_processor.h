@@ -204,7 +204,7 @@ class VulkanCommandProcessor : public CommandProcessor {
                         VkPipelineStageFlags wait_stage_mask);
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
-  void AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan, uint64_t lifetime, bool bind);
+  void AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan, bool bind);
   void SelectFh1IndexAuditDraw(uint32_t packet_offset);
   void EndFh1IndexAudit();
   void ObserveFh1IndexAuditUpload(uint32_t address, std::span<const uint8_t> bytes);

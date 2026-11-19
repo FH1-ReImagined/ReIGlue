@@ -91,7 +91,6 @@ uint64_t NowNs() {
 
 #if REX_PLATFORM_WIN32
 struct RetainedReplay {
-  uint64_t incarnation = 0;
   uint64_t allocation_stamp = 0;
   std::shared_ptr<const fl::ReplayPlan> plan;
 };
@@ -261,8 +260,8 @@ bool ProbeLiveCapture(void* context, uint32_t generation) noexcept {
         [](void* context, const memory::Memory::ReplayPhysicalCapture& capture) {
           auto& probe = *static_cast<LiveCaptureProbe*>(context);
           LiveCaptureLease lease{probe, capture};
-          if (probe.retained && probe.retained->incarnation == probe.binding.incarnation &&
-              probe.retained->plan && probe.retained->plan->Revalidate(probe.binding, lease)) {
+          if (probe.retained && probe.retained->plan &&
+              probe.retained->plan->Revalidate(probe.binding, lease)) {
             probe.plan = probe.retained->plan;
             probe.retained_hit = true;
             probe.status = "reused";
@@ -276,7 +275,7 @@ bool ProbeLiveCapture(void* context, uint32_t generation) noexcept {
           }
           probe.plan = std::make_shared<const fl::ReplayPlan>(std::move(*plan));
           if (probe.retained) {
-            *probe.retained = {probe.binding.incarnation, capture.AllocationStamp(), probe.plan};
+            *probe.retained = {capture.AllocationStamp(), probe.plan};
           }
           for (const auto& op : probe.plan->operations()) {
             probe.input_bytes += probe.plan->input_words(op).size_bytes();
@@ -689,9 +688,8 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
                 if (s.audit_bind) {
                   bind_plan = std::move(probe.plan);
                 } else {
-                  RecordCall([vk_cp, plan = std::move(probe.plan),
-                              lifetime = b->producer_lifetime] {
-                    vk_cp->AuditFh1OwnedIndices(*plan, lifetime, false);
+                  RecordCall([vk_cp, plan = std::move(probe.plan)] {
+                    vk_cp->AuditFh1OwnedIndices(*plan, false);
                   });
                 }
               }
@@ -847,8 +845,8 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
       }
     } else {
       s.index_audit_cp = vk_cp;
-      RecordCall([vk_cp, plan = std::move(bind_plan), lifetime = b->producer_lifetime] {
-        vk_cp->AuditFh1OwnedIndices(*plan, lifetime, true);
+      RecordCall([vk_cp, plan = std::move(bind_plan)] {
+        vk_cp->AuditFh1OwnedIndices(*plan, true);
       });
     }
   }
@@ -861,15 +859,16 @@ bool CommandProcessor::TryFh1ReplayOwnedList(bool& success) {
 #if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
   auto& s = *fh1_lists_;
   const auto plan = std::exchange(s.timed_plan, {});
-  if (!plan || fh1_stereo_state_ != Fh1StereoState::kOff || Fh1StereoWanted()) return false;
-  const auto lifetime = s.binding->producer_lifetime;
+  if (!plan || fh1_stereo_state_ != Fh1StereoState::kOff || Fh1StereoWanted() ||
+      !plan->IsCurrentPublication(s.registry)) return false;
+  const auto lifetime = plan->producer_lifetime();
   if (!std::exchange(s.refused_replay_control, true)) {
     REXGPU_INFO("M4 timed list fallback: lifetime={} reason=control", lifetime);
     return false;
   }
   auto* vk_cp = static_cast<vulkan::VulkanCommandProcessor*>(this);
   s.index_audit_cp = vk_cp;
-  RecordCall([vk_cp, plan, lifetime] { vk_cp->AuditFh1OwnedIndices(*plan, lifetime, true); });
+  RecordCall([vk_cp, plan] { vk_cp->AuditFh1OwnedIndices(*plan, true); });
   const uint64_t started = NowNs();
   success = Fh1RecordOwnedList(*plan);
   if (s.sustained_replay) {

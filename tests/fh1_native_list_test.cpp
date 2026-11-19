@@ -856,6 +856,7 @@ void TestCaptureFromLease() {
     CHECK(registry.Define(id, fixture.tmpl.data(), fixture.tmpl.size()) == fl::DefineResult::kNew);
     fl::Binding binding;
     binding.template_id = id;
+    binding.producer_lifetime = id;
     binding.phys = 0x10000000 + id * 0x10000;
     binding.words = uint32_t(fixture.pm4.size());
     binding.cb = 0x40000000 + id * 0x10000;
@@ -933,6 +934,38 @@ void TestCaptureFromLease() {
     auto owned = pending.Take(registry, binding.phys, binding.words, 2);
     CHECK(owned && std::memcmp(owned->guest_words().data(), pm4.data(), pm4.size()) == 0);
 
+    CHECK(owned->MatchesPublication(binding) && owned->producer_lifetime() == id);
+    auto* current = registry.Lookup(binding.phys, binding.words, &skip);
+    CHECK(current && !owned->IsCurrentPublication(registry));
+    current->pool_valid = true;
+    current->pool_generation = 4;
+    CHECK(!owned->IsCurrentPublication(registry));
+    current->pool_generation = 2;
+    CHECK(owned->IsCurrentPublication(registry));
+    auto legacy = binding;
+    legacy.producer_lifetime = 0;
+    auto legacy_lease = lease;
+    legacy_lease.identity = legacy;
+    legacy_lease.samples = legacy_lease.reads = 0;
+    CHECK(!fl::ReplayPlan::Capture(*registry.FindTemplate(id), legacy, legacy_lease));
+    CHECK(!legacy_lease.samples && !legacy_lease.reads);
+    auto plain = fl::ReplayPlan::Compile(*registry.FindTemplate(id), snapshot);
+    CHECK(plain && !plain->MatchesPublication(binding) && !plain->producer_lifetime());
+    // Replacements may preserve every backing byte and the same even generation.
+    for (unsigned field = 0; field < 4; ++field) {
+      auto successor = binding;
+      if (field == 0) ++successor.producer_lifetime;
+      if (field == 1) ++successor.incarnation;
+      if (field == 2) successor.phys += 4;
+      if (field == 3) ++successor.words;
+      auto successor_lease = lease;
+      successor_lease.identity = successor;
+      successor_lease.samples = successor_lease.reads = 0;
+      CHECK(!owned->MatchesPublication(successor));
+      CHECK(!owned->Revalidate(successor, successor_lease));
+      CHECK(!successor_lease.samples && !successor_lease.reads && !successor_lease.comparisons);
+    }
+
     lease.samples = lease.reads = 0;
     auto valid = lease;
     CHECK(owned->Revalidate(binding, valid));
@@ -963,6 +996,14 @@ void TestCaptureFromLease() {
     changed = lease;
     changed.identity.incarnation++;
     CHECK(!owned->Revalidate(binding, changed) && changed.samples == 0);
+    CHECK(registry.Drop(binding.phys, binding.producer_lifetime));
+    CHECK(!registry.Lookup(binding.phys, binding.words, &skip));
+    CHECK(registry.Bind(binding) == fl::BindResult::kNew);
+    const auto* recycled = registry.Lookup(binding.phys, binding.words, &skip);
+    CHECK(recycled && recycled->incarnation != binding.incarnation);
+    CHECK(!owned->MatchesPublication(*recycled));
+    CHECK(!owned->IsCurrentPublication(registry));
+
     lease.ranges.clear();
     size_t input_index = 0;
     size_t index_draw = 0;

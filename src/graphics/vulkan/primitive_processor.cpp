@@ -70,14 +70,16 @@ thread_local bool fh1_index_audit_forced_fallback = false;
 }  // namespace
 
 void VulkanCommandProcessor::AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan,
-                                                  uint64_t lifetime, bool bind) {
+                                                  bool bind) {
+  auto& audit = fh1_index_audit;
+  if (bind) audit = {};
+  const uint64_t lifetime = plan.producer_lifetime();
+  if (!lifetime) return;
   if (!submission_open_ || !frame_open_ || !primitive_processor_) {
     REXGPU_INFO("M4 index upload audit: lifetime={} skipped=no-frame", lifetime);
     return;
   }
-  auto& audit = fh1_index_audit;
   if (bind) {
-    audit = {};
     audit.owner = this;
     audit.lifetime = lifetime;
     audit.frame = GetCurrentFrame();
