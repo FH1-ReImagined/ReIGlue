@@ -395,6 +395,7 @@ class CommandProcessor {
   void Fh1ListPacket(const uint32_t* words, uint32_t count);
   bool Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader);
   bool Fh1RecordOwnedList(const fh1_list::ReplayPlan& plan);
+  bool TryFh1ReplayOwnedList(bool& success);
   void Fh1ListDraw(uint32_t packet_offset, bool executed);
   void Fh1ListEnd();
   // A register write the decoder makes (its write paths' entries): told to the run being

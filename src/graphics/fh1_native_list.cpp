@@ -125,6 +125,9 @@ struct CommandProcessor::Fh1Lists {
   bool audit_bind = false;
 #if REX_HAS_VULKAN
   vulkan::VulkanCommandProcessor* index_audit_cp = nullptr;
+  bool timed_replay = false;
+  bool refused_replay_control = false;
+  std::shared_ptr<const fl::ReplayPlan> timed_plan;
 #endif
   uint32_t audit_attempts = 0;
   std::array<uint64_t, 16> audited_lifetimes{};
@@ -315,9 +318,12 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
     fh1_lists_ = new Fh1Lists;
 #if REX_PLATFORM_WIN32
     if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT")) {
+#if REX_HAS_VULKAN
+      fh1_lists_->timed_replay = std::strcmp(e, "timed-replay") == 0;
+#endif
       fh1_lists_->audit_bind =
           std::strcmp(e, "bind") == 0 || std::strcmp(e, "bind-vertex") == 0 ||
-          std::strcmp(e, "bind-texture") == 0;
+          std::strcmp(e, "bind-texture") == 0 || std::strcmp(e, "timed-replay") == 0;
       fh1_lists_->audit_upload = fh1_lists_->audit_bind || std::strcmp(e, "upload") == 0;
       fh1_lists_->audit_capture = fh1_lists_->audit_upload || std::strcmp(e, "capture") == 0;
       fh1_lists_->audit_binding = fh1_lists_->audit_capture || std::strcmp(e, "1") == 0;
@@ -467,6 +473,16 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   auto& s = *fh1_lists_;
 #if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
   std::optional<fl::ReplayPlan> bind_plan;
+  const bool timed_replay = s.timed_replay;
+  bool measuring = !timed_replay;
+  if (timed_replay && s.audit_attempts < 64) {
+    using Measuring = bool (*)() noexcept;
+    static const auto race_measuring = reinterpret_cast<Measuring>(
+        GetProcAddress(GetModuleHandleW(nullptr), "ForzaM4BenchmarkMeasuringV1"));
+    measuring = race_measuring && race_measuring();
+  }
+#else
+  constexpr bool measuring = true;
 #endif
   const uint64_t t0 = NowNs();
   fl::Skip skip;
@@ -498,7 +514,7 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   if (!tmpl)
     return no(fl::Skip::kNoTemplate);
 #if REX_PLATFORM_WIN32
-  if (s.audit_binding && s.audit_attempts < 64 && b->producer_lifetime) {
+  if (s.audit_binding && measuring && s.audit_attempts < 64 && b->producer_lifetime) {
     auto& tested = s.audited_lifetimes;
     const auto unused = std::ranges::find(tested, 0);
     if (unused != tested.end() && std::ranges::find(tested, b->producer_lifetime) == tested.end()) {
@@ -680,14 +696,51 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
 #if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
   if (bind_plan) {
     auto* vk_cp = static_cast<vulkan::VulkanCommandProcessor*>(this);
-    s.index_audit_cp = vk_cp;
-    RecordCall([vk_cp, plan = std::move(*bind_plan), lifetime = b->producer_lifetime] {
-      vk_cp->AuditFh1OwnedIndices(plan, lifetime, true);
-    });
+    if (timed_replay) {
+      if (bind_plan->captured_generation() == generation && s.pool == s.fresh_pool &&
+          !s.perturb_every && !s.perturb_tile_every && !s.perturb_slot_every) {
+        std::vector<uint32_t> sealed_pool(pool_words);
+        fl::Resolve(t, reinterpret_cast<const uint8_t*>(bind_plan->guest_words().data()),
+                    sealed_pool.data());
+        if (sealed_pool == s.fresh_pool) {
+          s.timed_plan = std::make_shared<const fl::ReplayPlan>(std::move(*bind_plan));
+        }
+      }
+    } else {
+      s.index_audit_cp = vk_cp;
+      RecordCall([vk_cp, plan = std::move(*bind_plan), lifetime = b->producer_lifetime] {
+        vk_cp->AuditFh1OwnedIndices(plan, lifetime, true);
+      });
+    }
   }
 #endif
   s.ns_begin += NowNs() - t0;
   return true;
+}
+
+bool CommandProcessor::TryFh1ReplayOwnedList(bool& success) {
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  auto& s = *fh1_lists_;
+  const auto plan = std::exchange(s.timed_plan, {});
+  if (!plan || fh1_stereo_state_ != Fh1StereoState::kOff || Fh1StereoWanted()) return false;
+  const auto lifetime = s.binding->producer_lifetime;
+  if (!std::exchange(s.refused_replay_control, true)) {
+    REXGPU_INFO("M4 timed list fallback: lifetime={} reason=control", lifetime);
+    return false;
+  }
+  auto* vk_cp = static_cast<vulkan::VulkanCommandProcessor*>(this);
+  s.index_audit_cp = vk_cp;
+  RecordCall([vk_cp, plan, lifetime] { vk_cp->AuditFh1OwnedIndices(*plan, lifetime, true); });
+  const uint64_t started = NowNs();
+  success = Fh1RecordOwnedList(*plan);
+  REXGPU_INFO("M4 timed list replay: lifetime={} generation={} operations={} success={} dispatch_ns={}",
+              lifetime, *plan->captured_generation(), plan->operations().size(), success,
+              NowNs() - started);
+  return true;
+#else
+  (void)success;
+  return false;
+#endif
 }
 
 bool CommandProcessor::Fh1RecordOwnedList(const fl::ReplayPlan& plan) {
@@ -698,14 +751,18 @@ bool CommandProcessor::Fh1RecordOwnedList(const fl::ReplayPlan& plan) {
   memory::RingBuffer reader(data, words.size_bytes());
   reader.set_write_offset(words.size_bytes());
   fh1_command_cursor::Scope cursor_scope(&reader);
+  auto* const stock_reader = std::exchange(fh1_list_reader_, &reader);
   for (const auto& op : plan.operations()) {
     reader.set_read_offset_within(op.first_word * sizeof(uint32_t));
     const auto input = plan.input_words(op);
     bool ok = true;
-    if (input.empty()) {
-      ok = op.kind == fl::ReplayPlan::Kind::kType3 ? ExecutePacketType3(&reader, op.header)
-                                                 : ExecutePacketType0(&reader, op.header);
-    } else if (((op.header >> 8) & 0x7f) == 0x27) {  // IM_LOAD
+    const uint32_t opcode = (op.header >> 8) & 0x7f;
+    if (op.kind != fl::ReplayPlan::Kind::kType3) {
+      ok = ExecutePacketType0(&reader, op.header);
+    } else if ((op.header & 1) && !(bin_select_ & bin_mask_)) {
+      if (opcode == 0x22) Fh1ListDraw(op.first_word * sizeof(uint32_t), false);
+      reader.AdvanceRead(op.count * sizeof(uint32_t));
+    } else if (opcode == 0x27 && !input.empty()) {  // IM_LOAD
       const uint32_t addr_type = reader.ReadAndSwap<uint32_t>();
       const uint32_t start_size = reader.ReadAndSwap<uint32_t>();
       const auto shader_type = static_cast<xenos::ShaderType>(addr_type & 3);
@@ -723,22 +780,47 @@ bool CommandProcessor::Fh1RecordOwnedList(const fl::ReplayPlan& plan) {
         (shader_type == xenos::ShaderType::kVertex ? active_vertex_shader_ : active_pixel_shader_) =
             shader;
       }
-    } else {
+    } else if (opcode == 0x2f && !input.empty()) {
       // LOAD_ALU_CONSTANT. Preparation checks the literal count and ALU type.
       reader.AdvanceRead(sizeof(uint32_t));
       const uint32_t index = reader.ReadAndSwap<uint32_t>() & 0x7ff;
       reader.AdvanceRead(sizeof(uint32_t));
       PacketWriteRegistersFromMem(fh::kAluFirstRegister + index, input.data(),
                                   uint32_t(input.size()));
+    } else {
+      switch (opcode) {
+        case 0x10:  // NOP without a host packet.
+          reader.AdvanceRead(op.count * sizeof(uint32_t));
+          break;
+        case 0x22:  // DRAW_INDX.
+          Fh1ListDraw(op.first_word * sizeof(uint32_t), true);
+          ok = ExecutePacketType3_DRAW_INDX(&reader, op.header, op.count);
+          break;
+        case 0x2d:  // The sealed tile-window register bundle.
+          ok = ExecutePacketType3_SET_CONSTANT(&reader, op.header, op.count);
+          break;
+        case 0x60:
+          bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | reader.ReadAndSwap<uint32_t>();
+          break;
+        case 0x61:
+          bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) |
+                      (uint64_t(reader.ReadAndSwap<uint32_t>()) << 32);
+          break;
+        default:
+          ok = false;
+          break;
+      }
     }
     // Dispatch has started and may have changed emulated state. The caller
     // reports an execution failure instead of restarting on the stock path.
     const size_t end = (op.first_word + op.count) * sizeof(uint32_t);
     const size_t next = end == words.size_bytes() ? 0 : end;
     if (!ok || reader.read_offset() != next) {
+      fh1_list_reader_ = stock_reader;
       return false;
     }
   }
+  fh1_list_reader_ = stock_reader;
   return true;
 }
 
@@ -808,6 +890,7 @@ bool CommandProcessor::Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t
 void CommandProcessor::Fh1ListEnd() {
   auto& s = *fh1_lists_;
 #if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  s.timed_plan.reset();
   if (auto* vk_cp = std::exchange(s.index_audit_cp, nullptr)) {
     RecordCall([vk_cp] { vk_cp->EndFh1IndexAudit(); });
   }

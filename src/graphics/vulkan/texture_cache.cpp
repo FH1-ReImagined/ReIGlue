@@ -2607,7 +2607,7 @@ VulkanTextureCache::VulkanTextureCache(const RegisterFile& register_file,
       command_processor_(command_processor),
       guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {
   const char* mode = std::getenv("FH1_M4_BINDING_AUDIT");
-  if (mode && std::strcmp(mode, "bind-texture") == 0) {
+  if (mode && (std::strcmp(mode, "bind-texture") == 0 || std::strcmp(mode, "timed-replay") == 0)) {
     const auto* device = command_processor_.GetVulkanDevice();
     replay_copy_image_ = reinterpret_cast<PFN_vkCmdCopyImage>(
         device->vulkan_instance()->functions().vkGetDeviceProcAddr(device->device(),

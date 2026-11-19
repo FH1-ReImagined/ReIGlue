@@ -1535,6 +1535,10 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
+namespace fh1_frame_trace {
+extern FILE* file;
+}
+
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
@@ -1567,6 +1571,22 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 #endif
   // FH1 (0650): a model list the game registered is compared with its template as it runs.
   const bool fh1_list = fh1_lists_ && Fh1ListBegin(ptr, count, &reader);
+  bool replay_success;
+  const bool tracing = fh1_frame_trace::file
+#if REX_FH1_PM4_TRACE
+                       || fh1_trace_depth.on
+#endif
+#if REX_FH1_LIST_TRACE
+                       || fh1_list_trace::g_on
+#endif
+      ;
+  if (fh1_list && !tracing && TryFh1ReplayOwnedList(replay_success)) {
+    Fh1ListEnd();
+    if (!replay_success) {
+      REXGPU_ERROR("M4 typed dispatch failed after entering admitted list {:08X}", ptr);
+    }
+    return;
+  }
   do {
     if (!ExecutePacket(&reader)) {
       // Return up a level if we encounter a bad packet.

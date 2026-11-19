@@ -1911,7 +1911,8 @@ bool VulkanCommandProcessor::SetupContext() {
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
   const char* replay_audit = std::getenv("FH1_M4_BINDING_AUDIT");
   if (replay_audit && (std::strcmp(replay_audit, "bind-vertex") == 0 ||
-                       std::strcmp(replay_audit, "bind-texture") == 0) &&
+                       std::strcmp(replay_audit, "bind-texture") == 0 ||
+                       std::strcmp(replay_audit, "timed-replay") == 0) &&
       !edram_fragment_shader_interlock && shared_memory_binding_count < 4 &&
       shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers) {
     primitive_processor_->InitializeReplayVertexBuffer();
