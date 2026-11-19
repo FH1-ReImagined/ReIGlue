@@ -448,6 +448,7 @@ class Memory {
     ReplayPhysicalCapture(const ReplayPhysicalCapture&) = delete;
     ReplayPhysicalCapture& operator=(const ReplayPhysicalCapture&) = delete;
     bool Copy(uint32_t physical, uint8_t* destination, size_t size) const;
+    bool CopyPhysicalAlias(uint32_t guest, uint8_t* destination, size_t size) const;
 
    private:
     friend class Memory;

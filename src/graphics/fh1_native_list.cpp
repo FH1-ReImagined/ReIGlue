@@ -115,6 +115,7 @@ struct CommandProcessor::Fh1Lists {
   uint64_t stale_binds = 0;
 #if REX_PLATFORM_WIN32
   bool audit_binding = false;
+  bool audit_capture = false;
   uint32_t audit_attempts = 0;
   std::array<uint64_t, 16> audited_lifetimes{};
 #endif
@@ -140,6 +141,71 @@ const uint8_t* Physical(void* context, uint32_t address) {
   return static_cast<const uint8_t*>(
       static_cast<memory::Memory*>(context)->TranslatePhysical(address));
 }
+
+#if REX_PLATFORM_WIN32
+struct LiveCaptureProbe {
+  memory::Memory& memory;
+  const fl::Binding& binding;
+  const fl::Template& registered;
+  const char* status = "binding-busy";
+  uint32_t generation = 0, address = 0;
+  size_t input_bytes = 0, range_bytes = 0, copied = 0;
+  fl::ReplayPlan::AddressSpace space = fl::ReplayPlan::AddressSpace::kVirtual;
+  bool refused_range = false;
+};
+
+struct LiveCaptureLease {
+  LiveCaptureProbe& probe;
+  const memory::Memory::ReplayPhysicalCapture& capture;
+
+  bool Matches(const fl::Binding& binding) const { return &binding == &probe.binding; }
+  std::optional<uint32_t> ReadGeneration(uint32_t address) const {
+    if (address != probe.binding.state_word) return std::nullopt;
+    auto* word = probe.memory.TranslateVirtual<uint32_t*>(address);
+    const uint32_t generation =
+        __builtin_bswap32(std::atomic_ref<uint32_t>(*word).load(std::memory_order_acquire));
+    return generation == probe.generation ? std::optional{generation} : std::nullopt;
+  }
+  bool Copy(fl::ReplayPlan::AddressSpace space, uint32_t address, std::span<std::byte> bytes) {
+    probe.space = space;
+    probe.address = address;
+    probe.range_bytes = bytes.size();
+    auto* out = reinterpret_cast<uint8_t*>(bytes.data());
+    const bool copied = space == fl::ReplayPlan::AddressSpace::kVirtual
+                            ? capture.CopyPhysicalAlias(address, out, bytes.size())
+                            : capture.Copy(address, out, bytes.size());
+    probe.refused_range = !copied;
+    probe.copied += copied;
+    return copied;
+  }
+};
+
+bool ProbeLiveCapture(void* context, uint32_t generation) noexcept {
+  auto& probe = *static_cast<LiveCaptureProbe*>(context);
+  probe.generation = generation;
+  probe.status = "runtime-busy";
+  try {
+    return probe.memory.WithReplayPhysicalCapture(
+        [](void* context, const memory::Memory::ReplayPhysicalCapture& capture) {
+          auto& probe = *static_cast<LiveCaptureProbe*>(context);
+          LiveCaptureLease lease{probe, capture};
+          const auto plan = fl::ReplayPlan::Capture(probe.registered, probe.binding, lease);
+          if (!plan) {
+            probe.status = probe.refused_range ? "range-refused" : "plan-refused";
+            return false;
+          }
+          for (const auto& op : plan->operations())
+            probe.input_bytes += plan->input_words(op).size_bytes();
+          probe.status = "captured";
+          return true;
+        },
+        &probe);
+  } catch (...) {
+    probe.status = "capture-error";
+    return false;
+  }
+}
+#endif
 
 void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t frames) {
   auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
@@ -231,8 +297,10 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
   if (!fh1_lists_) {
     fh1_lists_ = new Fh1Lists;
 #if REX_PLATFORM_WIN32
-    if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT"))
-      fh1_lists_->audit_binding = std::strcmp(e, "1") == 0;
+    if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT")) {
+      fh1_lists_->audit_capture = std::strcmp(e, "capture") == 0;
+      fh1_lists_->audit_binding = fh1_lists_->audit_capture || std::strcmp(e, "1") == 0;
+    }
 #endif
     if (const char* e = std::getenv("FH1_NATIVE_LISTS_PERTURB"))
       fh1_lists_->perturb_every = std::strtoull(e, nullptr, 10);
@@ -402,6 +470,9 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     ++s.refusals[std::min<uint32_t>(b->refusal, kRefusals - 1)];
     return no(fl::Skip::kRefused);
   }
+  const fl::Template* tmpl = s.registry.FindTemplate(b->template_id);
+  if (!tmpl)
+    return no(fl::Skip::kNoTemplate);
 #if REX_PLATFORM_WIN32
   if (s.audit_binding && s.audit_attempts < 64 && b->producer_lifetime) {
     auto& tested = s.audited_lifetimes;
@@ -424,6 +495,16 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
         };
         if (with_binding(query, fh::kListBindLifetimeWords, capture, &generation)) {
           *unused = b->producer_lifetime;
+          if (s.audit_capture) {
+            LiveCaptureProbe probe{*memory_, *b, *tmpl};
+            with_binding(query, fh::kListBindLifetimeWords, ProbeLiveCapture, &probe);
+            REXGPU_INFO(
+                "M4 capture audit: phys={:08X} lifetime={} status={} ranges={} inputs={} "
+                "last_space={} last_range={:08X} bytes={}",
+                b->phys, b->producer_lifetime, probe.status, probe.copied, probe.input_bytes,
+                probe.space == fl::ReplayPlan::AddressSpace::kVirtual ? "virtual" : "physical",
+                probe.address, probe.range_bytes);
+          }
           query[13] ^= 0x80000000u;
           const bool wrong = with_binding(query, fh::kListBindLifetimeWords, capture, &generation);
           REXGPU_INFO("M4 binding audit: phys={:08X} lifetime={} generation={} wrong_lifetime={}",
@@ -433,9 +514,6 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
     }
   }
 #endif
-  const fl::Template* tmpl = s.registry.FindTemplate(b->template_id);
-  if (!tmpl)
-    return no(fl::Skip::kNoTemplate);
   const uint32_t* t = tmpl->words.data();
   constexpr auto generation_alignment = std::atomic_ref<uint32_t>::required_alignment;
   auto* state = Plausible(b->state_word)

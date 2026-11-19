@@ -24,9 +24,10 @@ class FrozenReplayPages {
 
  private:
   struct Restore {
-    uint8_t* page = nullptr;
-    size_t bytes = 0;
-    DWORD protection = 0;
+    uint8_t* page;
+    size_t bytes;
+    DWORD protection;
+    bool applied = false;
   };
   bool Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes);
   std::vector<Restore> restore_;
@@ -36,8 +37,7 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
   constexpr size_t kPageSize = 4096;
   if (!span_bytes || span_bytes % kPageSize) return false;
 
-  std::array<DWORD, 4> protect{};
-  size_t writable = 0;
+  const size_t first_restore = restore_.size();
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto start = reinterpret_cast<uintptr_t>(pages[i]);
     if (!start || start % kPageSize || span_bytes > UINTPTR_MAX - start) return false;
@@ -45,38 +45,41 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
       const auto other = reinterpret_cast<uintptr_t>(pages[previous]);
       if (start < other + span_bytes && other < start + span_bytes) return false;
     }
-    MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(pages[i], &info, sizeof(info)) || info.State != MEM_COMMIT ||
-        info.Type != MEM_MAPPED ||
-        (info.Protect != PAGE_READONLY && info.Protect != PAGE_READWRITE)) {
-      return false;
+    // An earlier copy may already have sealed a prefix of this span. Keep
+    // those pages and seal only the remaining writable runs.
+    const uintptr_t end = start + span_bytes;
+    for (uintptr_t base = start; base < end;) {
+      MEMORY_BASIC_INFORMATION info{};
+      auto* address = reinterpret_cast<uint8_t*>(base);
+      if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+          info.Type != MEM_MAPPED ||
+          (info.Protect != PAGE_READONLY && info.Protect != PAGE_READWRITE)) return false;
+      const auto region = reinterpret_cast<uintptr_t>(info.BaseAddress);
+      if (region > base || base - region >= info.RegionSize) return false;
+      const size_t remaining = info.RegionSize - (base - region);
+      const size_t bytes = remaining < end - base ? remaining : end - base;
+      if (info.Protect == PAGE_READWRITE)
+        restore_.push_back({address, bytes, PAGE_READWRITE});
+      base += bytes;
     }
-    const auto region = reinterpret_cast<uintptr_t>(info.BaseAddress);
-    if (region > start || start - region > info.RegionSize ||
-        span_bytes > info.RegionSize - (start - region)) {
-      return false;
-    }
-    protect[i] = info.Protect;
-    writable += info.Protect == PAGE_READWRITE;
   }
 
-  // Each span has one uniform protection, so protect it with one system
-  // call. Remember exactly the regions this operation changed.
-  size_t next = restore_.size();
-  restore_.resize(next + writable);
-  for (size_t i = 0; i < pages.size(); ++i) {
-    if (protect[i] == PAGE_READONLY) continue;
+  // Preflight and allocate the complete restoration list before changing
+  // any protection for this copy.
+  for (size_t i = first_restore; i < restore_.size(); ++i) {
+    auto& run = restore_[i];
     DWORD previous = 0;
-    if (!VirtualProtect(pages[i], span_bytes, PAGE_READONLY, &previous)) return false;
-    restore_[next++] = {pages[i], span_bytes, previous};
-    if (previous != protect[i]) return false;
+    if (!VirtualProtect(run.page, run.bytes, PAGE_READONLY, &previous)) return false;
+    run.protection = previous;
+    run.applied = true;
+    if (previous != PAGE_READWRITE) return false;
   }
   return true;
 }
 
 inline FrozenReplayPages::~FrozenReplayPages() {
   for (auto it = restore_.rbegin(); it != restore_.rend(); ++it) {
-    if (!it->page) continue;
+    if (!it->applied) continue;
     DWORD previous = 0;
     if (!VirtualProtect(it->page, it->bytes, it->protection, &previous) ||
         previous != PAGE_READONLY) {

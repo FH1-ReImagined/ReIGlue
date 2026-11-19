@@ -600,6 +600,18 @@ bool Memory::ReplayPhysicalCapture::Copy(uint32_t physical, uint8_t* destination
 #endif
 }
 
+bool Memory::ReplayPhysicalCapture::CopyPhysicalAlias(uint32_t guest, uint8_t* destination,
+                                                     size_t size) const {
+  if (!size || size - 1 > UINT32_MAX - guest) return false;
+  const uint32_t last = guest + uint32_t(size - 1);
+  const BaseHeap* heap = memory_.LookupHeap(guest);
+  if (!heap || heap != memory_.LookupHeap(last) || heap->heap_type() != HeapType::kGuestPhysical)
+    return false;
+  const uint32_t physical = memory_.GetPhysicalAddress(guest);
+  if (uint64_t(physical) + size - 1 != memory_.GetPhysicalAddress(last)) return false;
+  return Copy(physical, destination, size);
+}
+
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
