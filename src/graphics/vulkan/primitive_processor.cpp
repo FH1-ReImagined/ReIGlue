@@ -96,8 +96,10 @@ void VulkanCommandProcessor::AuditFh1OwnedIndices(const fh1_list::ReplayPlan& pl
     bytes += index->bytes.size();
     if (bind) audit.entries.push_back({op.first_word * 4, *index, {buffer, offset}});
   }
-  REXGPU_INFO("M4 index upload audit: lifetime={} frame={} submission={} uploads={} bytes={} refused={}",
-              lifetime, GetCurrentFrame(), GetCurrentSubmission(), uploads, bytes, refused);
+  if (refused || !fh1_list::SustainedReplayRequested()) {
+    REXGPU_INFO("M4 index upload audit: lifetime={} frame={} submission={} uploads={} bytes={} refused={}",
+                lifetime, GetCurrentFrame(), GetCurrentSubmission(), uploads, bytes, refused);
+  }
 }
 
 void VulkanCommandProcessor::SelectFh1IndexAuditDraw(uint32_t packet_offset) {
