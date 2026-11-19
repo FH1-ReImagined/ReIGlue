@@ -42,7 +42,7 @@ class FrozenReplayPages {
     DWORD protection;
     bool applied = false;
   };
-  bool Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes);
+  bool Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes, size_t offset);
   bool FreezeForAccess(const std::array<uint8_t*, 4>& pages, size_t span_bytes, size_t offset,
                        std::span<const uint8_t> bytes);
   struct Span {
@@ -53,7 +53,7 @@ class FrozenReplayPages {
     Span span;
     DWORD protection;
   };
-  bool Observe(uintptr_t page, uintptr_t limit, Region& region);
+  bool Observe(uintptr_t page, uintptr_t limit, Region& region, bool& used_fallback);
   bool ObserveResident(uintptr_t page, uintptr_t limit, Region& region) const;
   bool query_resident_pages_ = false;
   std::vector<Restore> restore_;
@@ -96,7 +96,8 @@ inline bool FrozenReplayPages::ObserveResident(uintptr_t page, uintptr_t limit,
   return true;
 }
 
-inline bool FrozenReplayPages::Observe(uintptr_t page, uintptr_t limit, Region& region) {
+inline bool FrozenReplayPages::Observe(uintptr_t page, uintptr_t limit, Region& region,
+                                       bool& used_fallback) {
   for (size_t i = 0; i < observed_count_; ++i) {
     const auto& observed = observed_[i];
     if (page >= observed.span.start && page < observed.span.end) {
@@ -117,15 +118,18 @@ inline bool FrozenReplayPages::Observe(uintptr_t page, uintptr_t limit, Region& 
   if (start > page || page - start >= info.RegionSize || info.RegionSize > UINTPTR_MAX - start)
     return false;
 
+  used_fallback = query_resident_pages_;
   region = {{page, start + info.RegionSize}, info.Protect};
   if (observed_count_ < observed_.size()) observed_[observed_count_++] = region;
   return true;
 }
 
-inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes) {
+inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes,
+                                      size_t offset) {
   constexpr size_t kPageSize = 4096;
   if (failed_ || !span_bytes || span_bytes % kPageSize) return false;
 
+  std::array<const volatile uint8_t*, 4> warm{};
   const size_t first_restore = restore_.size();
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto start = reinterpret_cast<uintptr_t>(pages[i]);
@@ -150,9 +154,13 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
       }
 
       Region region;
-      if (!Observe(base, next_sealed, region)) {
+      bool used_fallback = false;
+      if (!Observe(base, next_sealed, region, used_fallback)) {
         restore_.resize(first_restore);
         return false;
+      }
+      if (used_fallback && !warm[i]) {
+        warm[i] = reinterpret_cast<const volatile uint8_t*>(base == start ? base + offset : base);
       }
       const uintptr_t next = (std::min)(region.span.end, next_sealed);
       if (region.protection == PAGE_READWRITE)
@@ -185,6 +193,13 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
       sealed_.push_back({start, start + span_bytes});
     }
   }
+
+  // Fault one byte of the requested span into each cold view only after all
+  // views are sealed. A future transaction still observes its protections;
+  // Windows can evict this view and make that transaction fall back again.
+  for (const auto* address : warm) {
+    if (address) (void)*address;
+  }
   return true;
 }
 
@@ -215,7 +230,7 @@ inline bool FrozenReplayPages::FreezeForAccess(const std::array<uint8_t*, 4>& pa
       return false;
     }
   }
-  return Freeze(pages, span_bytes);
+  return Freeze(pages, span_bytes, offset);
 }
 
 inline bool FrozenReplayPages::Copy(const std::array<uint8_t*, 4>& pages, size_t span_bytes,
