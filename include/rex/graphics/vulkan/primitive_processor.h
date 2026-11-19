@@ -11,6 +11,8 @@
  */
 
 #include <memory>
+#include <array>
+#include <span>
 #include <utility>
 
 #include <rex/assert.h>
@@ -47,6 +49,34 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   std::pair<VkBuffer, VkDeviceSize> GetConvertedIndexBuffer(size_t handle) const {
     return frame_index_buffers_[handle];
   }
+  // Allocate in the same frame-owned pool used for converted draws. The
+  // caller supplies the final bytes for the index format it will bind.
+  std::pair<VkBuffer, VkDeviceSize> StageCapturedIndex(std::span<const std::byte> bytes,
+                                                      uint32_t width);
+  void InitializeReplayVertexBuffer();
+  VkBuffer replay_vertex_buffer() const { return replay_vertex_buffer_; }
+  void InitializeReplayIndexBuffer();
+  VkBuffer replay_index_buffer() const { return replay_index_buffer_; }
+  struct ReplayPixelPlane {
+    VkImageAspectFlags aspect;
+    uint32_t pixel_bytes;
+    VkDeviceSize offset;
+    bool depth24;
+  };
+  struct ReplayPixelReadback {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint64_t submission = 0;
+    uint32_t memory_type = 0;
+    VkRect2D rect{};
+    std::array<ReplayPixelPlane, 3> planes{};
+    uint32_t plane_count = 0;
+    VkDeviceSize stride = 0;
+    bool complete = false;
+  };
+  ReplayPixelReadback* AllocateReplayPixelReadback(
+      VkRect2D rect, VkFormat depth_format, VkFormat color_format);
+  bool CanSampleReplayPixels(bool color) const { return replay_pixel_samples_[color] < 4; }
 
  protected:
   bool InitializeBuiltinIndexBuffer(size_t size_bytes,
@@ -75,6 +105,13 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> frame_index_buffer_pool_;
   // Indexed by the backend handles.
   std::deque<std::pair<VkBuffer, VkDeviceSize>> frame_index_buffers_;
+  VkBuffer replay_vertex_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory replay_vertex_memory_ = VK_NULL_HANDLE;
+  VkBuffer replay_index_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory replay_index_memory_ = VK_NULL_HANDLE;
+  void LandReplayPixelReadbacks(uint64_t completed, bool discard = false);
+  std::array<ReplayPixelReadback, 8> replay_pixel_readbacks_{};
+  uint32_t replay_pixel_samples_[2]{};
 };
 
 }  // namespace rex::graphics::vulkan

@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -1901,6 +1902,40 @@ bool VulkanRenderTargetCache::PredictRenderPassKey(BindingPrediction& prediction
   return true;
 }
 
+bool VulkanRenderTargetCache::ReplayParityEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("FH1_M4_REPLAY_PIXEL_PARITY");
+    return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "texture") == 0);
+  }();
+  return enabled;
+}
+
+bool VulkanRenderTargetCache::GetReplayParityTargets(
+    std::array<ReplayParityTarget, 2>& targets) const {
+  const auto key = last_update_render_pass_key_;
+  if (GetPath() != Path::kHostRenderTargets || key.msaa_samples != xenos::MsaaSamples::k1X ||
+      !key.depth_and_color_used || (key.depth_and_color_used & ~3u) ||
+      key.color_rts_use_transfer_formats || !last_update_framebuffer_) return false;
+  RenderTarget* const* rts = last_update_accumulated_render_targets();
+  for (uint32_t i = 0; i < targets.size(); ++i) {
+    if (!(key.depth_and_color_used & (1u << i))) continue;
+    const auto* rt = static_cast<const VulkanRenderTarget*>(rts[i]);
+    if (!rt || !rt->replay_parity_transfer || rt->key().msaa_samples != xenos::MsaaSamples::k1X) {
+      return false;
+    }
+    auto& out = targets[i];
+    out.image = rt->image();
+    out.format = i ? GetColorVulkanFormat(rt->key().GetColorFormat())
+                   : GetDepthVulkanFormat(rt->key().GetDepthFormat());
+    if (i && out.format != GetColorVulkanFormat(key.color_0_view_format)) return false;
+    out.aspects = i ? VK_IMAGE_ASPECT_COLOR_BIT
+                    : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    rt->GetDrawUsage(&out.stages, &out.access, &out.layout);
+    if (rt->current_layout() != out.layout) return false;
+  }
+  return true;
+}
+
 void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     VkRenderingAttachmentInfo* color_attachments, uint32_t* color_attachment_count_out,
     VkRenderingAttachmentInfo* depth_attachment,
@@ -2312,13 +2347,30 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
                  key.is_depth ? "depth" : "color", static_cast<uint32_t>(key.resource_format));
     return nullptr;
   }
+  const VkImageUsageFlags stock_usage = image_create_info.usage;
+  if (ReplayParityEnabled() && key.msaa_samples == xenos::MsaaSamples::k1X) {
+    VkFormatProperties properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), image_create_info.format, &properties);
+    if (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) {
+      image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
+  }
   VkImage image;
   VkDeviceMemory memory;
   VkDeviceSize memory_size = 0;
   // FH1 (#268): on integrated GPUs, system memory once device-local memory is nearly full.
-  if (!fh1_device_memory::CreateDedicatedImage(vulkan_device, image_create_info,
-                                               fh1_device_memory::Use::kRenderTarget, image, memory,
-                                               &memory_size)) {
+  auto allocate = [&] {
+    return fh1_device_memory::CreateDedicatedImage(
+        vulkan_device, image_create_info, fh1_device_memory::Use::kRenderTarget, image, memory,
+        &memory_size);
+  };
+  bool allocated = allocate();
+  if (!allocated && image_create_info.usage != stock_usage) {
+    image_create_info.usage = stock_usage;
+    allocated = allocate();
+  }
+  if (!allocated) {
     render_target_allocation_failed_ = true;
     REXGPU_ERROR(
         "VulkanRenderTarget: Failed to create a {}x{} {}xMSAA {} render target "
@@ -2491,6 +2543,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       key, *this, image, memory, view_depth_color, view_depth_stencil, view_stencil, view_srgb,
       view_color_transfer_separate, descriptor_set_index_transfer_source);
   render_target->memory_size_ = memory_size;
+  render_target->replay_parity_transfer =
+      (image_create_info.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
   render_target_memory_bytes_ += memory_size;
   cost.render_target_bytes += memory_size;
   ++render_target_count_;

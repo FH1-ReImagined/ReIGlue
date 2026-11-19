@@ -15,6 +15,7 @@
 
 #include <rex/assert.h>
 #include <rex/dbg.h>
+#include <rex/logging.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
@@ -106,6 +107,24 @@ VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buf
         blit(command_buffer, args.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, args.dst,
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &args.region, VK_FILTER_LINEAR);
       } break;
+      case Command::kFh1ReplayCopyImage: {
+        const auto& args = *reinterpret_cast<const ArgsFh1ReplayCopyImage*>(stream);
+        args.copy(command_buffer, args.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, args.dst,
+                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &args.region);
+      } break;
+      case Command::kFh1ReplayReadImage: {
+        const auto& args = *reinterpret_cast<const ArgsFh1ReplayReadImage*>(stream);
+        const auto* device = command_processor_.GetVulkanDevice();
+        const auto read = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(
+            device->vulkan_instance()->functions().vkGetDeviceProcAddr(device->device(),
+                                                                       "vkCmdCopyImageToBuffer"));
+        assert_not_null(read);
+        read(command_buffer, args.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+             args.dst, 1, &args.region);
+      } break;
+      case Command::kFh1ReplayParityCheckpoint:
+        REXGPU_INFO("M4 parity deferred: {}", *reinterpret_cast<const char* const*>(stream));
+        break;
       case Command::kVkBeginRenderPass: {
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);

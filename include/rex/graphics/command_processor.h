@@ -37,6 +37,9 @@ class ByteStream;
 }  // namespace rex::stream
 
 namespace rex::graphics {
+namespace fh1_list {
+class ReplayPlan;
+}
 
 class SharedMemory;
 
@@ -390,7 +393,11 @@ class CommandProcessor {
   // The indirect buffer whose list is being compared (its draw packets are reported).
   memory::RingBuffer* fh1_list_reader_ = nullptr;
   void Fh1ListPacket(const uint32_t* words, uint32_t count);
-  bool Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader);
+  bool Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader,
+                    std::shared_ptr<const fh1_list::ReplayPlan>& admitted);
+  bool Fh1RecordOwnedList(const fh1_list::ReplayPlan& plan);
+  bool TryFh1ReplayOwnedList(std::shared_ptr<const fh1_list::ReplayPlan> plan, uint32_t phys,
+                             uint32_t words, bool& success);
   void Fh1ListDraw(uint32_t packet_offset, bool executed);
   void Fh1ListEnd();
   // A register write the decoder makes (its write paths' entries): told to the run being

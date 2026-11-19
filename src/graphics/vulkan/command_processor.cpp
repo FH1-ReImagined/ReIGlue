@@ -75,6 +75,7 @@ REXCVAR_DECLARE(double, forza_ultrawide_hud_offset_y);
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include "../fh1_replay_benchmark.h"
 #include <rex/graphics/util/fh1_jitter.h>
 #include <rex/graphics/vulkan/fh1_dlss.h>
 #include <rex/graphics/vulkan/fh1_fsr3.h>
@@ -1909,6 +1910,18 @@ bool VulkanCommandProcessor::SetupContext() {
   // Shared memory and EDRAM descriptor set layout.
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  const char* replay_audit = std::getenv("FH1_M4_BINDING_AUDIT");
+  if (replay_audit && std::strcmp(replay_audit, "timed-replay") == 0) {
+    primitive_processor_->InitializeReplayIndexBuffer();
+  }
+  if (replay_audit && (std::strcmp(replay_audit, "bind-vertex") == 0 ||
+                       std::strcmp(replay_audit, "bind-texture") == 0 ||
+                       std::strcmp(replay_audit, "timed-replay") == 0) &&
+      !edram_fragment_shader_interlock && shared_memory_binding_count < 4 &&
+      shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers) {
+    primitive_processor_->InitializeReplayVertexBuffer();
+  }
+  const VkBuffer replay_vertex_buffer = primitive_processor_->replay_vertex_buffer();
   VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[2];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
@@ -1937,6 +1950,12 @@ bool VulkanCommandProcessor::SetupContext() {
   } else {
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
   }
+  if (replay_vertex_buffer != VK_NULL_HANDLE) {
+    shared_memory_and_edram_descriptor_set_layout_bindings[1] = {
+        SpirvShaderTranslator::kFh1ReplayVertexBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+        VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    ++shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount;
+  }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1953,7 +1972,8 @@ bool VulkanCommandProcessor::SetupContext() {
   VkDescriptorPoolSize descriptor_pool_sizes[1];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
-      shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
+      shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock) +
+      uint32_t(replay_vertex_buffer != VK_NULL_HANDLE);
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
@@ -2021,7 +2041,17 @@ bool VulkanCommandProcessor::SetupContext() {
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
   }
-  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
+  const VkDescriptorBufferInfo replay_vertex_info{
+      replay_vertex_buffer, 0, SpirvShaderTranslator::kFh1ReplayVertexCapacity};
+  if (replay_vertex_buffer != VK_NULL_HANDLE) {
+    write_descriptor_sets[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                                shared_memory_and_edram_descriptor_set_,
+                                SpirvShaderTranslator::kFh1ReplayVertexBinding, 0, 1,
+                                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &replay_vertex_info,
+                                nullptr};
+  }
+  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock) +
+                                         uint32_t(replay_vertex_buffer != VK_NULL_HANDLE),
                              write_descriptor_sets, 0, nullptr);
 
   // Swap objects.
@@ -6593,8 +6623,10 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
   pipeline_layout_create_info.flags = 0;
   pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(descriptor_set_layouts));
   pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
-  pipeline_layout_create_info.pushConstantRangeCount = 0;
-  pipeline_layout_create_info.pPushConstantRanges = nullptr;
+  const bool replay_vertex = primitive_processor_->replay_vertex_buffer() != VK_NULL_HANDLE;
+  const VkPushConstantRange replay_vertex_window{VK_SHADER_STAGE_VERTEX_BIT, 0, 2 * sizeof(uint32_t)};
+  pipeline_layout_create_info.pushConstantRangeCount = uint32_t(replay_vertex);
+  pipeline_layout_create_info.pPushConstantRanges = replay_vertex ? &replay_vertex_window : nullptr;
   VkPipelineLayout pipeline_layout;
   if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr, &pipeline_layout) !=
       VK_SUCCESS) {
@@ -7011,6 +7043,253 @@ void VulkanCommandProcessor::Fh1SelectNativeHud(bool native_hud) {
   current_graphics_descriptor_sets_bound_up_to_date_ = 0;
 }
 
+void VulkanCommandProcessor::ReadFh1ReplayPixels(
+    ReplayPixelComparison& comparison, uint32_t arm, const std::array<VkImage, 2>& images) {
+  auto& readback = *comparison.readback;
+  for (uint32_t i = 0; i < readback.plane_count; ++i) {
+    const auto& plane = readback.planes[i];
+    VkBufferImageCopy region = {};
+    region.bufferOffset = readback.stride * arm + plane.offset;
+    region.imageSubresource = {plane.aspect, 0, 0, 1};
+    region.imageOffset = {readback.rect.offset.x, readback.rect.offset.y, 0};
+    region.imageExtent = {readback.rect.extent.width, readback.rect.extent.height, 1};
+    deferred_command_buffer_.CmdFh1ReplayReadImage(
+        images[plane.aspect == VK_IMAGE_ASPECT_COLOR_BIT], readback.buffer, region);
+  }
+}
+
+VulkanCommandProcessor::ReplayPixelComparison VulkanCommandProcessor::BeginFh1ReplayPixelComparison(
+    const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+    const std::array<uint32_t, 2>& vertex_window,
+    const PrimitiveProcessor::ProcessingResult& indices, uint32_t owned_texture_views) {
+  ReplayPixelComparison result;
+  if (active_occlusion_query_.valid || !REXCVAR_GET(vulkan_dynamic_rendering) ||
+      !GetVulkanDevice()->properties().dynamicRendering ||
+      !render_target_cache_->GetReplayParityTargets(result.targets)) {
+    const auto key = render_target_cache_->last_update_render_pass_key();
+    REXGPU_INFO("M4 pixel parity skipped: query={} samples={} attachments={} transfer_formats={}",
+                active_occlusion_query_.valid, uint32_t(key.msaa_samples),
+                uint32_t(key.depth_and_color_used), bool(key.color_rts_use_transfer_formats));
+    return {};
+  }
+  if (!primitive_processor_->CanSampleReplayPixels(result.targets[1].image != VK_NULL_HANDLE)) {
+    return {};
+  }
+  static const bool texture_only = [] {
+    const char* mode = std::getenv("FH1_M4_REPLAY_PIXEL_PARITY");
+    return mode && std::strcmp(mode, "texture") == 0;
+  }();
+  if (texture_only && (!result.targets[1].image || !owned_texture_views)) {
+    REXGPU_INFO("M4 texture parity skipped: color_format={} owned_texture_views={}",
+                uint32_t(result.targets[1].format), owned_texture_views);
+    return {};
+  }
+  const auto extent = render_target_cache_->last_update_framebuffer()->host_extent;
+  const VkRect2D rect = dynamic_scissor_;
+  if (rect.offset.x < 0 || rect.offset.y < 0 || !rect.extent.width || !rect.extent.height ||
+      uint64_t(rect.offset.x) + rect.extent.width > extent.width ||
+      uint64_t(rect.offset.y) + rect.extent.height > extent.height ||
+      uint64_t(extent.width) * extent.height > 1280u * 2048u) return {};
+  const auto* device = GetVulkanDevice();
+  const auto& dfn = device->functions();
+  const auto copy = reinterpret_cast<PFN_vkCmdCopyImage>(
+      device->vulkan_instance()->functions().vkGetDeviceProcAddr(device->device(), "vkCmdCopyImage"));
+  const auto read_image = device->vulkan_instance()->functions().vkGetDeviceProcAddr(
+      device->device(), "vkCmdCopyImageToBuffer");
+  if (!copy || !read_image) return {};
+  const auto submission = GetCurrentSubmission();
+  std::array<VkImage, 2> clones{};
+  std::array<VkImageView, 2> clone_views{};
+  for (uint32_t i = 0; i < result.targets.size(); ++i) {
+    const auto& target = result.targets[i];
+    if (!target.image) continue;
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = target.format;
+    info.extent = {extent.width, extent.height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 (i ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, clones[i], memory)) return {};
+    destroy_images_.emplace_back(submission, clones[i]);
+    destroy_memory_.emplace_back(submission, memory);
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = clones[i];
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = target.format;
+    view.subresourceRange = ui::vulkan::util::InitializeSubresourceRange(target.aspects, 0, 1, 0, 1);
+    if (dfn.vkCreateImageView(device->device(), &view, nullptr, &clone_views[i]) != VK_SUCCESS) return {};
+    destroy_image_views_.emplace_back(submission, clone_views[i]);
+  }
+  result.readback = primitive_processor_->AllocateReplayPixelReadback(
+      rect, result.targets[0].format, result.targets[1].format);
+  if (!result.readback) return {};
+
+  EndRenderPass();
+  std::array<VkRenderingAttachmentInfo, xenos::kMaxColorRenderTargets> color{};
+  VkRenderingAttachmentInfo depth{}, stencil{};
+  uint32_t color_count = 0;
+  render_target_cache_->GetLastUpdateRenderingAttachments(color.data(), &color_count, &depth,
+                                                          &stencil);
+  if (color_count) color[0].imageView = clone_views[1];
+  depth.imageView = stencil.imageView = clone_views[0];
+  VkRenderingInfo rendering{};
+  rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  rendering.renderArea.extent = extent;
+  rendering.layerCount = 1;
+  rendering.colorAttachmentCount = color_count;
+  rendering.pColorAttachments = color_count ? color.data() : nullptr;
+  rendering.pDepthAttachment = clones[0] ? &depth : nullptr;
+  rendering.pStencilAttachment = clones[0] ? &stencil : nullptr;
+
+  // Take has consumed this draw's replay marker. Rebinding therefore builds
+  // exactly the stock texture sets, while the saved replay sets stay alive.
+  std::array<VkDescriptorSet, SpirvShaderTranslator::kDescriptorSetCount> replay_sets;
+  std::copy(std::begin(current_graphics_descriptor_sets_), std::end(current_graphics_descriptor_sets_),
+            replay_sets.begin());
+  const auto replay_values = current_graphics_descriptor_set_values_up_to_date_;
+  const auto replay_bound = current_graphics_descriptor_sets_bound_up_to_date_;
+  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount> replay_offsets{};
+  if (dynamic_uniform_constants_) {
+    for (uint32_t i = 0; i < replay_offsets.size(); ++i) {
+      assert_true(current_constant_buffer_infos_[i].offset <= UINT32_MAX);
+      replay_offsets[i] = uint32_t(current_constant_buffer_infos_[i].offset);
+    }
+  }
+  const bool stock_ready = UpdateBindings(vertex_shader, pixel_shader);
+  const auto layout = current_guest_graphics_pipeline_layout_->GetPipelineLayout();
+  auto restore_replay = [&] {
+    for (uint32_t i = 0; i < replay_sets.size(); ++i) {
+      if ((replay_bound & (1u << i)) && replay_sets[i]) {
+        const bool dynamic = dynamic_uniform_constants_ &&
+                             i == SpirvShaderTranslator::kDescriptorSetConstants;
+        deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+            layout, i, 1, &replay_sets[i], dynamic ? uint32_t(replay_offsets.size()) : 0,
+            dynamic ? replay_offsets.data() : nullptr);
+      }
+    }
+    std::copy(replay_sets.begin(), replay_sets.end(), std::begin(current_graphics_descriptor_sets_));
+    current_graphics_descriptor_set_values_up_to_date_ = replay_values;
+    current_graphics_descriptor_sets_bound_up_to_date_ = replay_bound;
+  };
+  if (!stock_ready) {
+    restore_replay();
+    return {};
+  }
+  constexpr auto src_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  constexpr auto dst_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  constexpr auto read = VK_ACCESS_TRANSFER_READ_BIT;
+  constexpr auto write = VK_ACCESS_TRANSFER_WRITE_BIT;
+  auto change = [&](uint32_t index, VkImage image, VkPipelineStageFlags from,
+                    VkPipelineStageFlags to, VkAccessFlags previous, VkAccessFlags next,
+                    VkImageLayout old_layout, VkImageLayout new_layout) {
+    const auto range = ui::vulkan::util::InitializeSubresourceRange(
+        result.targets[index].aspects, 0, 1, 0, 1);
+    PushImageMemoryBarrier(image, range, from, to, previous, next, old_layout, new_layout);
+  };
+  std::array<VkImage, 2> live{};
+  for (uint32_t i = 0; i < result.targets.size(); ++i) {
+    const auto& target = result.targets[i];
+    live[i] = target.image;
+    if (!target.image) continue;
+    change(i, target.image, target.stages, transfer, target.access, read, target.layout, src_layout);
+    change(i, clones[i], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, transfer, 0, write,
+           VK_IMAGE_LAYOUT_UNDEFINED, dst_layout);
+  }
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("initial attachment barriers");
+  SubmitBarriers(true);
+  ReadFh1ReplayPixels(result, 0, live);
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("initial readback recorded");
+  for (uint32_t i = 0; i < result.readback->plane_count; ++i) {
+    const auto aspect = result.readback->planes[i].aspect;
+    const uint32_t target = aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageCopy copy_region{};
+    copy_region.srcSubresource = {aspect, 0, 0, 1};
+    copy_region.dstSubresource = copy_region.srcSubresource;
+    copy_region.srcOffset = {rect.offset.x, rect.offset.y, 0};
+    copy_region.dstOffset = copy_region.srcOffset;
+    copy_region.extent = {rect.extent.width, rect.extent.height, 1};
+    deferred_command_buffer_.CmdFh1ReplayCopyImage(copy, live[target], clones[target], copy_region);
+  }
+  for (uint32_t i = 0; i < result.targets.size(); ++i) {
+    const auto& target = result.targets[i];
+    if (!target.image) continue;
+    change(i, live[i], transfer, target.stages, read, target.access, src_layout, target.layout);
+    change(i, clones[i], transfer, target.stages, write, target.access, dst_layout, target.layout);
+  }
+  SubmitBarriers(true);
+  if (vertex_window[1]) {
+    const std::array<uint32_t, 2> empty{};
+    deferred_command_buffer_.CmdVkPushConstants(layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                                 sizeof(empty), empty.data());
+  }
+  deferred_command_buffer_.CmdVkBindIndexBuffer(
+      shared_memory_->buffer(), indices.guest_index_base,
+      indices.host_index_format == xenos::IndexFormat::kInt16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("stock reference render begin");
+  deferred_command_buffer_.CmdVkBeginRendering(&rendering);
+  deferred_command_buffer_.CmdVkDrawIndexed(indices.host_draw_vertex_count, 1, 0, 0, 0);
+  deferred_command_buffer_.CmdVkEndRendering();
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("stock reference render end");
+  for (uint32_t i = 0; i < result.targets.size(); ++i) {
+    const auto& target = result.targets[i];
+    if (target.image) {
+      change(i, clones[i], target.stages, transfer, target.access, read, target.layout, src_layout);
+    }
+  }
+  SubmitBarriers(true);
+  ReadFh1ReplayPixels(result, 1, clones);
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("stock readback recorded");
+  restore_replay();
+  if (vertex_window[1]) {
+    deferred_command_buffer_.CmdVkPushConstants(layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                                 sizeof(vertex_window), vertex_window.data());
+  }
+  REXGPU_INFO("M4 pixel parity draw: submission={} index_count={} vertex={} color={} depth={} "
+              "owned_texture_views={} color_format={}",
+              submission, indices.host_draw_vertex_count, vertex_window[1] != 0,
+              live[1] != VK_NULL_HANDLE, live[0] != VK_NULL_HANDLE, owned_texture_views,
+              uint32_t(result.targets[1].format));
+  return result;
+}
+
+void VulkanCommandProcessor::EndFh1ReplayPixelComparison(ReplayPixelComparison& comparison) {
+  auto& rb = *comparison.readback;
+  std::array<VkImage, 2> images{};
+  auto barrier = [&](bool restore) {
+    for (uint32_t i = 0; i < comparison.targets.size(); ++i) {
+      const auto& target = comparison.targets[i];
+      images[i] = target.image;
+      if (!target.image) continue;
+      const auto range = ui::vulkan::util::InitializeSubresourceRange(target.aspects, 0, 1, 0, 1);
+      constexpr auto src = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      constexpr VkPipelineStageFlags transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      constexpr VkAccessFlags read = VK_ACCESS_TRANSFER_READ_BIT;
+      PushImageMemoryBarrier(target.image, range, restore ? transfer : target.stages,
+          restore ? target.stages : transfer, restore ? read : target.access,
+          restore ? target.access : read, restore ? src : target.layout, restore ? target.layout : src);
+    }
+  };
+  barrier(false);
+  SubmitBarriers(true);
+  ReadFh1ReplayPixels(comparison, 2, images);
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("replay readback recorded");
+  barrier(true);
+  PushBufferMemoryBarrier(rb.buffer, 0, rb.stride * 3, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+  rb.complete = true;
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -7147,6 +7426,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  std::array<uint32_t, 2> replay_vertex_window = {};
+  auto select_stock_vertex = [&]() {
+    replay_vertex_window = {};
+    vertex_shader_modification.value &= ~SpirvShaderTranslator::kFh1ReplayVertex;
+    vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+        vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+    return pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+                                                     pixel_shader_translation);
+  };
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -7248,6 +7536,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                              : SpirvShaderTranslator::Modification(0);
     VulkanPipelineCache::ApplyFh1DirtSeamModification(pixel_shader, vertex_shader_modification,
                                                       pixel_shader_modification);
+    replay_vertex_window = {};
+    if (primitive_processor_->replay_vertex_buffer() != VK_NULL_HANDLE &&
+        host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
+        !memexport_writes_possible && Fh1ReplayDrawSelected()) {
+      const auto& fetch_map = vertex_shader->constant_register_map().vertex_fetch_bitmap;
+      uint32_t fetch_index = UINT32_MAX;
+      for (uint32_t i = 0; i < rex::countof(fetch_map); ++i) {
+        if (!fetch_map[i]) continue;
+        if (fetch_index != UINT32_MAX || (fetch_map[i] & (fetch_map[i] - 1))) {
+          fetch_index = UINT32_MAX;
+          break;
+        }
+        uint32_t bit;
+        rex::bit_scan_forward(fetch_map[i], &bit);
+        fetch_index = i * 32 + bit;
+      }
+      if (fetch_index != UINT32_MAX) {
+        const auto fetch = regs.GetVertexFetch(fetch_index);
+        const uint32_t max_dwords = SharedMemory::kBufferSize / sizeof(uint32_t);
+        if (fetch.type == xenos::FetchConstantType::kVertex && fetch.size &&
+            fetch.size <= SpirvShaderTranslator::kFh1ReplayVertexCapacity / sizeof(uint32_t) &&
+            fetch.address < max_dwords && fetch.size <= max_dwords - fetch.address) {
+          replay_vertex_window = {fetch.address, fetch.size};
+          vertex_shader_modification.value |= SpirvShaderTranslator::kFh1ReplayVertex;
+        }
+      }
+    }
 
     // Translate the shaders now to obtain the sampler bindings.
     vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
@@ -7257,7 +7572,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                      : nullptr;
     if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
-                                                  pixel_shader_translation)) {
+                                                  pixel_shader_translation) &&
+        (!replay_vertex_window[1] || !select_stock_vertex())) {
       return draw_fail("shader_translation");
     }
 
@@ -7462,20 +7778,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
-  VkPipeline pipeline;
+  VkPipeline pipeline = VK_NULL_HANDLE;
   void* pipeline_handle = nullptr;
-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
-                                          primitive_processing_result, normalized_depth_control,
-                                          normalized_color_mask,
-                                          render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
-    return draw_fail("configure_pipeline");
-  }
   bool pipeline_is_placeholder = false;
-  // Reload the current handle state to observe async hot-swap completions that
-  // may happen between pipeline configuration and binding.
-  pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
-                                                &pipeline_is_placeholder);
+  auto configure_pipeline = [&]() {
+    if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+                                            primitive_processing_result, normalized_depth_control,
+                                            normalized_color_mask,
+                                            render_target_cache_->last_update_render_pass_key(),
+                                            pipeline, pipeline_layout_provider, &pipeline_handle)) {
+      return false;
+    }
+    // Observe hot-swap completion between configuration and binding.
+    pipeline_cache_->GetPipelineAndLayoutByHandle(
+        pipeline_handle, pipeline, pipeline_layout_provider, &pipeline_is_placeholder);
+    return true;
+  };
+  bool pipeline_configured = configure_pipeline();
+  if (replay_vertex_window[1] &&
+      (!pipeline_configured || pipeline_is_placeholder || pipeline == VK_NULL_HANDLE ||
+       pipeline_layout_provider == nullptr)) {
+    if (!fh1_list::SustainedReplayRequested()) {
+      REXGPU_INFO("M4 vertex bind audit: frame={} submission={} stock-pipeline-fallback",
+                  GetCurrentFrame(), GetCurrentSubmission());
+    }
+    pipeline_configured = select_stock_vertex() && configure_pipeline();
+  }
+  if (!pipeline_configured) return draw_fail("configure_pipeline");
   if (pipeline_is_placeholder && REXCVAR_GET(async_shader_compilation) &&
       REXCVAR_GET(sync_pipeline_creation)) {
     // A render that is made once (a car's picture) cannot lose this draw: wait for the
@@ -7652,7 +7981,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
+  uint32_t owned_texture_views = 0;
+  if (!UpdateBindings(vertex_shader, pixel_shader, &owned_texture_views)) {
     return draw_fail("update_bindings");
   }
 
@@ -7787,6 +8117,54 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
 
+  std::pair<VkBuffer, VkDeviceSize> replay_index;
+  if (primitive_processing_result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+      !shader_32bit_index_dma && !memexport_writes_possible) {
+    replay_index = TakeFh1IndexAudit(
+        primitive_processing_result.guest_index_base,
+        primitive_processing_result.host_draw_vertex_count,
+        primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4,
+        uint32_t(regs.Get<reg::VGT_DMA_SIZE>().swap_mode));
+  }
+
+  if (replay_vertex_window[1]) {
+    const VkBuffer replay_vertex = primitive_processor_->replay_vertex_buffer();
+    const uint32_t address = replay_vertex_window[0] * sizeof(uint32_t);
+    const uint32_t size = replay_vertex_window[1] * sizeof(uint32_t);
+    const bool reuse = shared_memory_->CanReuseFh1ReplayVertexCopy(replay_vertex, address, size);
+    if (!reuse) {
+      EndRenderPass();
+      PushBufferMemoryBarrier(replay_vertex, 0, size,
+                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_TRANSFER_WRITE_BIT);
+      SubmitBarriers(true);
+      const VkBufferCopy region{address, 0, size};
+      deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), replay_vertex, 1, &region);
+      PushBufferMemoryBarrier(replay_vertex, 0, size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT);
+      shared_memory_->RememberFh1ReplayVertexCopy(replay_vertex, address, size);
+    }
+    deferred_command_buffer_.CmdVkPushConstants(
+        current_guest_graphics_pipeline_layout_->GetPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT,
+        0, sizeof(replay_vertex_window), replay_vertex_window.data());
+    if (!fh1_list::SustainedReplayRequested()) {
+      REXGPU_INFO("M4 vertex bind audit: frame={} submission={} address={:08X} bytes={} vs={:016X} reused={}",
+                  GetCurrentFrame(), GetCurrentSubmission(), address, size,
+                  vertex_shader->ucode_data_hash(), reuse);
+    }
+  }
+
+  ReplayPixelComparison replay_comparison;
+  if (replay_index.first && VulkanRenderTargetCache::ReplayParityEnabled()) {
+    replay_comparison = BeginFh1ReplayPixelComparison(
+        vertex_shader, pixel_shader, replay_vertex_window, primitive_processing_result,
+        owned_texture_views);
+  }
+
   // FH1 (#640): the draw's render pass (and pixel shader) as its zone.
   if (deferred_command_buffer_.fh1_gpu_profiling()) {
     Fh1SetDrawGpuZone(pixel_shader ? pixel_shader->ucode_data_hash() : 0);
@@ -7839,9 +8217,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         if (guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE) {
           index_buffer.first = guest_dma_index_scratch_buffer.buffer();
           index_buffer.second = 0;
+        } else if (replay_index.first != VK_NULL_HANDLE) {
+          index_buffer = replay_index;
         } else {
-          index_buffer.first = shared_memory_->buffer();
-          index_buffer.second = primitive_processing_result.guest_index_base;
+          index_buffer = {shared_memory_->buffer(), primitive_processing_result.guest_index_base};
         }
         break;
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
@@ -7865,6 +8244,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  if (replay_comparison.readback) EndFh1ReplayPixelComparison(replay_comparison);
   // FH1 (#551): the draw's number, written by the GPU once issued and once finished.
   if (fh1_breadcrumbs_on) {
     deferred_command_buffer_.CmdFh1Breadcrumb(fh1_trail.Record(
@@ -9448,6 +9828,9 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   }
   // A counter snapshot: the guest subtracts 32-bit values, so wrap, don't clamp.
   uint32_t clamped = uint32_t(samples);
+#if REX_PLATFORM_WIN32
+  memory::Memory::ReplayPhysicalWrite write;
+#endif
   sample_counts->Total_A = clamped;
   sample_counts->Total_B = 0;
   sample_counts->ZPass_A = clamped;
@@ -9796,6 +10179,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    if (shared_memory_) shared_memory_->InvalidateFh1ReplayVertexCopy();
     if (deferred_command_buffer_.fh1_gpu_profiling()) {
       fh1_gpu_profile.BeginSubmission(deferred_command_buffer_, GetCurrentSubmission(),
                                       frame_current_);
@@ -11314,7 +11698,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 }
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
-                                            const VulkanShader* pixel_shader) {
+                                             const VulkanShader* pixel_shader,
+                                             uint32_t* owned_texture_views) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -11554,13 +11939,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   descriptor_write_image_info_.reserve(
       (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
       (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+  const bool replay_textures = Fh1ReplayDrawSelected() && texture_cache_->BeginFh1ReplayTextureDraw();
+  auto texture_view = [&](const VulkanShader::TextureBinding& binding) {
+    if (replay_textures) {
+      return texture_cache_->GetFh1ReplayTextureView(binding.fetch_constant, binding.dimension,
+                                                     bool(binding.is_signed), owned_texture_views);
+    }
+    return texture_cache_->GetActiveBindingOrNullImageView(binding.fetch_constant, binding.dimension,
+                                                           bool(binding.is_signed));
+  };
   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
   if (write_vertex_textures && texture_count_vertex) {
     for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
+      descriptor_image_info.imageView = texture_view(texture_binding);
       descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
                                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                               : VK_IMAGE_LAYOUT_UNDEFINED;
@@ -11578,9 +11970,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   if (write_pixel_textures && texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
+      descriptor_image_info.imageView = texture_view(texture_binding);
       descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
                                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                               : VK_IMAGE_LAYOUT_UNDEFINED;

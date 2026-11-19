@@ -5138,6 +5138,9 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
     return;
   }
   uint32_t clamped = samples > uint64_t(UINT32_MAX) ? UINT32_MAX : uint32_t(samples);
+#if REX_PLATFORM_WIN32
+  memory::Memory::ReplayPhysicalWrite write;
+#endif
   sample_counts->Total_A = clamped;
   sample_counts->Total_B = 0;
   sample_counts->ZPass_A = clamped;

@@ -1535,6 +1535,10 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
+namespace fh1_frame_trace {
+extern FILE* file;
+}
+
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
@@ -1566,7 +1570,27 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   fh1_list_trace::IndirectScope fh1_list_scope(ptr, count, fh1_list_sources);
 #endif
   // FH1 (0650): a model list the game registered is compared with its template as it runs.
-  const bool fh1_list = fh1_lists_ && Fh1ListBegin(ptr, count, &reader);
+  // A prepared replacement belongs to this indirect-buffer invocation alone.
+  std::shared_ptr<const fh1_list::ReplayPlan> admitted;
+  const bool fh1_list = fh1_lists_ && Fh1ListBegin(ptr, count, &reader, admitted);
+  bool replay_success;
+  const bool tracing = fh1_frame_trace::file
+#if REX_FH1_PM4_TRACE
+                       || fh1_trace_depth.on
+#endif
+#if REX_FH1_LIST_TRACE
+                       || fh1_list_trace::g_on
+#endif
+      ;
+  if (fh1_list && !tracing &&
+      TryFh1ReplayOwnedList(std::move(admitted), ptr & 0x1FFFFFFFu, count, replay_success)) {
+    Fh1ListEnd();
+    if (!replay_success) {
+      REXGPU_ERROR("M4 typed dispatch failed after entering admitted list {:08X}", ptr);
+    }
+    return;
+  }
+  admitted.reset();  // Tracing runs stock, including any nested buffers.
   do {
     if (!ExecutePacket(&reader)) {
       // Return up a level if we encounter a bad packet.
@@ -2671,6 +2695,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
     if (!pSampleCounts) {
       return true;
     }
+#if REX_PLATFORM_WIN32
+    memory::Memory::ReplayPhysicalWrite write;
+#endif
     // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
     // and used to detect a finished query.
     bool is_end_via_z_pass =

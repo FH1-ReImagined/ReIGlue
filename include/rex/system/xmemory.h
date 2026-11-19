@@ -57,6 +57,7 @@ class ByteStream;
 #endif
 
 namespace rex::memory::detail {
+class FrozenReplayPages;
 
 /// Compensates for a 0xE0 physical view mapped short of its 4KB offset. The
 /// 0xE0 heap starts 0x1000 bytes into physical memory; where the backing file
@@ -253,6 +254,7 @@ class BaseHeap {
 
   // Queries information about the given region of pages.
   bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
+  bool IsCommittedReplayRange(uint32_t page_address, size_t bytes);
 
   // Queries the size of the region containing the given address.
   bool QuerySize(uint32_t address, uint32_t* out_size);
@@ -291,7 +293,8 @@ class BaseHeap {
   // heap_mutex_, which deadlocks.
   //
   // Returns an empty (unlocked) guard when guest pages are at least host page
-  // sized, since no reconcile happens then and the lock would be pure cost.
+  // sized, except for Windows physical heaps, where replay relies on the same
+  // lock to serialize allocation and protection changes across aliases.
   virtual std::unique_lock<std::recursive_mutex> AcquireHostPageReconcileLock() const;
 
   // Whether a host page is currently write-watched for guest invalidation.
@@ -442,6 +445,47 @@ class Memory {
   // Base address of physical memory in the host address space.
   // This is often something like 0x200000000.
   inline uint8_t* physical_membase() const { return physical_membase_; }
+  class ReplayPhysicalCapture {
+   public:
+    ReplayPhysicalCapture(const ReplayPhysicalCapture&) = delete;
+    ReplayPhysicalCapture& operator=(const ReplayPhysicalCapture&) = delete;
+    bool Copy(uint32_t physical, uint8_t* destination, size_t size) const;
+    bool CopyPhysicalAlias(uint32_t guest, uint8_t* destination, size_t size) const;
+    uint64_t AllocationStamp() const;
+    bool Matches(uint32_t physical, const uint8_t* expected, size_t size, uint64_t stamp) const;
+    bool MatchesPhysicalAlias(uint32_t guest, const uint8_t* expected, size_t size,
+                              uint64_t stamp) const;
+
+    // Guard the entire alias range and compare all but one aligned 32-bit word.
+    bool MatchesPhysicalAliasExceptWord(uint32_t guest, const uint8_t* expected, size_t size,
+                                       uint64_t stamp, size_t offset) const;
+
+   private:
+    friend class Memory;
+    ReplayPhysicalCapture(Memory& memory, detail::FrozenReplayPages& pages)
+        : memory_(memory), pages_(pages) {}
+    bool Access(uint32_t physical, const uint8_t* bytes, size_t size, uint8_t* destination,
+                uint64_t stamp, size_t ignored_word = SIZE_MAX) const;
+    bool ResolveAlias(uint32_t guest, size_t size, uint32_t& physical) const;
+    Memory& memory_;
+    detail::FrozenReplayPages& pages_;
+  };
+
+  // Keep the allocator and cooperating runtime writers out across all
+  // reads in the callback. The caller supplies the current producer binding
+  // and excludes its other write/free paths. The copy token is callback-local.
+  bool WithReplayPhysicalCapture(bool (*capture)(void*, const ReplayPhysicalCapture&),
+                                 void* context);
+
+  // Cooperating direct stores (including renderer DLLs) use the gate owned
+  // by rexruntime. The scope never keeps the mutex held during the store.
+  class ReplayPhysicalWrite {
+   public:
+    ReplayPhysicalWrite();
+    ~ReplayPhysicalWrite();
+    ReplayPhysicalWrite(const ReplayPhysicalWrite&) = delete;
+    ReplayPhysicalWrite& operator=(const ReplayPhysicalWrite&) = delete;
+  };
 
   // Translates a guest physical address to a host address that can be accessed
   // as a normal pointer.

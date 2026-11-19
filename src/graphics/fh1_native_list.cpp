@@ -38,12 +38,23 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
 
+#if REX_PLATFORM_WIN32
+#include <Windows.h>
+#if REX_HAS_VULKAN
+#include <rex/graphics/vulkan/command_processor.h>
+#endif
+#endif
 #include "fh1_native_list.h"
+#include "fh1_command_cursor.h"
+#include "fh1_native_replay_plan.h"
+#include "fh1_replay_benchmark.h"
 
 namespace rex::graphics {
 
@@ -78,6 +89,13 @@ uint64_t NowNs() {
                       .count());
 }
 
+#if REX_PLATFORM_WIN32
+struct RetainedReplay {
+  uint64_t allocation_stamp = 0;
+  std::shared_ptr<const fl::ReplayPlan> plan;
+};
+#endif
+
 }  // namespace
 
 struct CommandProcessor::Fh1Lists {
@@ -107,6 +125,49 @@ struct CommandProcessor::Fh1Lists {
            define_hash = 0, template_words = 0;
   uint64_t binds = 0, bind_same = 0, bind_replaced = 0, bind_no_template = 0, drops = 0,
            drop_unknown = 0, malformed = 0;
+  uint64_t stale_binds = 0;
+#if REX_PLATFORM_WIN32
+  bool audit_binding = false;
+  bool audit_capture = false;
+  bool audit_upload = false;
+  bool audit_bind = false;
+#if REX_HAS_VULKAN
+  vulkan::VulkanCommandProcessor* index_audit_cp = nullptr;
+  bool timed_replay = false;
+  bool timed_pixel_parity = false;
+  bool timed_texture_parity = false;
+  bool retained_pixel_only = false;
+  bool refused_replay_control = false;
+  uint32_t pixel_parity_sampling_passes = 0;
+#endif
+  uint32_t audit_attempts = 0;
+  std::array<uint64_t, 16> audited_lifetimes{};
+  std::array<RetainedReplay, 16> retained_replays{};
+  std::array<uint8_t, 16> capture_visits{};
+  uint32_t capture_visit_cap = 64;
+  bool repeat_capture = false;
+  bool sustained_replay = false;
+  bool sustained_checked_lifetime = false;
+  std::array<uint32_t, 16> sustained_phys{};
+  uint64_t sustained_capture_ns = 0;
+  uint64_t sustained_captured = 0, sustained_reused = 0;
+  uint64_t sustained_lists = 0, sustained_failed = 0, sustained_operations = 0;
+  uint64_t sustained_first_ns = 0, sustained_last_ns = 0;
+  bool reuse_snapshot = false;
+  std::optional<uint64_t> repeat_capture_frame;
+  uint32_t repeat_captures_this_frame = 0;
+
+  void RetireSustainedBinding(uint32_t phys, uint64_t lifetime = 0) {
+    if (!sustained_replay) return;
+    for (size_t i = 0; i < audited_lifetimes.size(); ++i) {
+      if (audited_lifetimes[i] && sustained_phys[i] == phys &&
+          (!lifetime || audited_lifetimes[i] == lifetime)) {
+        audited_lifetimes[i] = 0;
+        retained_replays[i] = {};
+      }
+    }
+  }
+#endif
   uint64_t draw_fields[fl::kFieldCount] = {}, end_fields[fl::kFieldCount] = {};
   uint64_t ns_begin = 0, ns_draw = 0, ns_end = 0, ns_packets = 0;
   uint32_t last_ack = 0;
@@ -130,7 +191,119 @@ const uint8_t* Physical(void* context, uint32_t address) {
       static_cast<memory::Memory*>(context)->TranslatePhysical(address));
 }
 
+#if REX_PLATFORM_WIN32
+struct LiveCaptureProbe {
+  memory::Memory& memory;
+  const fl::Binding& binding;
+  const fl::Template& registered;
+  const char* status = "binding-busy";
+  uint32_t generation = 0, address = 0;
+  size_t input_bytes = 0, range_bytes = 0, copied = 0;
+  size_t index_bytes = 0, index_draws = 0;
+  fl::ReplayPlan::AddressSpace space = fl::ReplayPlan::AddressSpace::kVirtual;
+  bool refused_range = false;
+  std::shared_ptr<const fl::ReplayPlan> plan;
+  RetainedReplay* retained = nullptr;
+  size_t compared_bytes = 0;
+  bool retained_hit = false;
+};
+
+struct LiveCaptureLease {
+  LiveCaptureProbe& probe;
+  const memory::Memory::ReplayPhysicalCapture& capture;
+
+  bool Matches(const fl::Binding& binding) const { return &binding == &probe.binding; }
+  std::optional<uint32_t> ReadGeneration(uint32_t address) const {
+    if (address != probe.binding.state_word) return std::nullopt;
+    auto* word = probe.memory.TranslateVirtual<uint32_t*>(address);
+    const uint32_t generation =
+        __builtin_bswap32(std::atomic_ref<uint32_t>(*word).load(std::memory_order_acquire));
+    return generation == probe.generation ? std::optional{generation} : std::nullopt;
+  }
+  bool MatchCommandHeader(uint32_t address, std::span<const std::byte> bytes,
+                          size_t ignored_word) {
+    probe.compared_bytes += bytes.size();
+    return capture.MatchesPhysicalAliasExceptWord(
+        address, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+        probe.retained->allocation_stamp, ignored_word);
+  }
+  bool MatchBytes(fl::ReplayPlan::AddressSpace space, uint32_t address,
+                  std::span<const std::byte> bytes) {
+    const auto* expected = reinterpret_cast<const uint8_t*>(bytes.data());
+    const uint64_t stamp = probe.retained->allocation_stamp;
+    probe.compared_bytes += bytes.size();
+    return space == fl::ReplayPlan::AddressSpace::kVirtual
+               ? capture.MatchesPhysicalAlias(address, expected, bytes.size(), stamp)
+               : capture.Matches(address, expected, bytes.size(), stamp);
+  }
+  bool Copy(fl::ReplayPlan::AddressSpace space, uint32_t address, std::span<std::byte> bytes) {
+    probe.space = space;
+    probe.address = address;
+    probe.range_bytes = bytes.size();
+    auto* out = reinterpret_cast<uint8_t*>(bytes.data());
+    const bool copied = space == fl::ReplayPlan::AddressSpace::kVirtual
+                            ? capture.CopyPhysicalAlias(address, out, bytes.size())
+                            : capture.Copy(address, out, bytes.size());
+    probe.refused_range = !copied;
+    probe.copied += copied;
+    return copied;
+  }
+};
+
+bool ProbeLiveCapture(void* context, uint32_t generation) noexcept {
+  auto& probe = *static_cast<LiveCaptureProbe*>(context);
+  probe.generation = generation;
+  probe.status = "runtime-busy";
+  try {
+    return probe.memory.WithReplayPhysicalCapture(
+        [](void* context, const memory::Memory::ReplayPhysicalCapture& capture) {
+          auto& probe = *static_cast<LiveCaptureProbe*>(context);
+          LiveCaptureLease lease{probe, capture};
+          if (probe.retained && probe.retained->plan &&
+              probe.retained->plan->Revalidate(probe.binding, lease)) {
+            probe.plan = probe.retained->plan;
+            probe.retained_hit = true;
+            probe.status = "reused";
+            return true;
+          }
+          if (probe.retained) *probe.retained = {};
+          auto plan = fl::ReplayPlan::Capture(probe.registered, probe.binding, lease);
+          if (!plan) {
+            probe.status = probe.refused_range ? "range-refused" : "plan-refused";
+            return false;
+          }
+          probe.plan = std::make_shared<const fl::ReplayPlan>(std::move(*plan));
+          if (probe.retained) {
+            *probe.retained = {capture.AllocationStamp(), probe.plan};
+          }
+          for (const auto& op : probe.plan->operations()) {
+            probe.input_bytes += probe.plan->input_words(op).size_bytes();
+            if (const auto* index = probe.plan->index_input(op)) {
+              ++probe.index_draws;
+              probe.index_bytes += index->bytes.size();
+            }
+          }
+          probe.status = "captured";
+          return true;
+        },
+        &probe);
+  } catch (...) {
+    probe.status = "capture-error";
+    return false;
+  }
+}
+#endif
+
 void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t frames) {
+#if REX_PLATFORM_WIN32
+  if (s.sustained_replay) {
+    REXGPU_INFO("M4 sustained replay: frames={} attempts={} captured={} reused={} "
+                "lists={} failed={} ops={} guard_ns={} active_ns={}",
+                frames, s.audit_attempts, s.sustained_captured, s.sustained_reused,
+                s.sustained_lists, s.sustained_failed, s.sustained_operations,
+                s.sustained_capture_ns, s.sustained_last_ns - s.sustained_first_ns);
+  }
+#endif
   auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
   GroupCounts all;
   for (const GroupCounts& g : s.groups) {
@@ -211,6 +384,7 @@ void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t fr
     groups += ";";
   }
   REXGPU_INFO("FH1 native lists by pass group:{}", groups.empty() ? " none" : groups);
+  if (s.stale_binds) REXGPU_INFO("FH1 native lists: {} stale binds ignored", s.stale_binds);
 }
 
 }  // namespace
@@ -218,6 +392,37 @@ void LogLists(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t fr
 void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
   if (!fh1_lists_) {
     fh1_lists_ = new Fh1Lists;
+#if REX_PLATFORM_WIN32
+    if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT")) {
+#if REX_HAS_VULKAN
+      fh1_lists_->timed_replay = std::strcmp(e, "timed-replay") == 0;
+      const char* reuse = std::getenv("FH1_M4_REUSE_SNAPSHOT");
+      fh1_lists_->repeat_capture = fh1_lists_->timed_replay && reuse &&
+                                  (std::strcmp(reuse, "0") == 0 || std::strcmp(reuse, "1") == 0);
+      fh1_lists_->reuse_snapshot = fh1_lists_->repeat_capture && reuse[0] == '1';
+      fh1_lists_->sustained_replay = fl::SustainedReplayRequested();
+      const char* parity = std::getenv("FH1_M4_REPLAY_PIXEL_PARITY");
+      fh1_lists_->timed_texture_parity =
+          fh1_lists_->timed_replay && parity && std::strcmp(parity, "texture") == 0;
+      fh1_lists_->timed_pixel_parity =
+          fh1_lists_->timed_texture_parity ||
+          (fh1_lists_->timed_replay && parity && std::strcmp(parity, "1") == 0);
+      // Let the pixel audit see several bindings rather than spending the
+      // whole sample on one repeating attachment configuration.
+      if (fh1_lists_->timed_pixel_parity) fh1_lists_->capture_visit_cap = 3;
+      const char* retained = std::getenv("FH1_M4_PIXEL_RETAINED_ONLY");
+      fh1_lists_->retained_pixel_only = fh1_lists_->timed_texture_parity &&
+                                        fh1_lists_->reuse_snapshot && retained &&
+                                        std::strcmp(retained, "1") == 0;
+#endif
+      fh1_lists_->audit_bind =
+          std::strcmp(e, "bind") == 0 || std::strcmp(e, "bind-vertex") == 0 ||
+          std::strcmp(e, "bind-texture") == 0 || std::strcmp(e, "timed-replay") == 0;
+      fh1_lists_->audit_upload = fh1_lists_->audit_bind || std::strcmp(e, "upload") == 0;
+      fh1_lists_->audit_capture = fh1_lists_->audit_upload || std::strcmp(e, "capture") == 0;
+      fh1_lists_->audit_binding = fh1_lists_->audit_capture || std::strcmp(e, "1") == 0;
+    }
+#endif
     if (const char* e = std::getenv("FH1_NATIVE_LISTS_PERTURB"))
       fh1_lists_->perturb_every = std::strtoull(e, nullptr, 10);
     if (const char* e = std::getenv("FH1_NATIVE_LISTS_PERTURB_TILE"))
@@ -314,6 +519,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
       b.patch_words = words[9];
       b.group = words[10];
       b.flags = words[11];
+      if (count == fh::kListBindLifetimeWords)
+        b.producer_lifetime = uint64_t(words[13]) << 32 | words[12];
       if (b.template_id != fh::kListRefused && !s.registry.FindTemplate(b.template_id))
         ++s.bind_no_template;
       switch (s.registry.Bind(b)) {
@@ -325,20 +532,38 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
           break;
         case fl::BindResult::kReplaced:
           ++s.bind_replaced;
+#if REX_PLATFORM_WIN32
+          s.RetireSustainedBinding(b.phys);
+#endif
+          break;
+        case fl::BindResult::kStale:
+          ++s.stale_binds;
           break;
       }
       break;
     }
-    case fh::kOpListDrop:
+    case fh::kOpListDrop: {
       if (count < fh::kListDropWords) {
         ++s.malformed;
         break;
       }
-      if (s.registry.Drop(words[2] & 0x1FFFFFFFu))
+      const uint64_t lifetime =
+          count == fh::kListDropLifetimeWords ? uint64_t(words[5]) << 32 | words[4] : 0;
+      if (count == fh::kListDropLifetimeWords && !lifetime) {
+        ++s.malformed;
+        break;
+      }
+      const uint32_t phys = words[2] & 0x1FFFFFFFu;
+      if (s.registry.Drop(phys, lifetime)) {
         ++s.drops;
-      else
+#if REX_PLATFORM_WIN32
+        s.RetireSustainedBinding(phys, lifetime);
+#endif
+      } else {
         ++s.drop_unknown;  // already dropped (a replayed packet) or never bound
+      }
       break;
+    }
     default:
       ++s.malformed;
       break;
@@ -346,8 +571,28 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
   s.ns_packets += NowNs() - t0;
 }
 
-bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader) {
+bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader,
+                                    std::shared_ptr<const fl::ReplayPlan>& admitted) {
   auto& s = *fh1_lists_;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  std::shared_ptr<const fl::ReplayPlan> bind_plan;
+  const bool timed_replay = s.timed_replay;
+  bool measuring = !timed_replay;
+  if (timed_replay && (s.sustained_replay || s.audit_attempts < 64)) {
+    using Measuring = bool (*)() noexcept;
+    static const auto race_measuring = reinterpret_cast<Measuring>(
+        GetProcAddress(GetModuleHandleW(nullptr), "ForzaM4BenchmarkMeasuringV1"));
+    measuring = race_measuring && race_measuring();
+    if (measuring && s.timed_texture_parity) {
+      const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;
+      measuring = regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth &&
+                  regs.Get<reg::RB_COLOR_MASK>().value != 0;
+    }
+  }
+#else
+  (void)admitted;
+  constexpr bool measuring = true;
+#endif
   const uint64_t t0 = NowNs();
   fl::Skip skip;
   fl::Binding* b = s.registry.Lookup(ptr & 0x1FFFFFFFu, count, &skip);
@@ -377,7 +622,114 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   const fl::Template* tmpl = s.registry.FindTemplate(b->template_id);
   if (!tmpl)
     return no(fl::Skip::kNoTemplate);
+#if REX_PLATFORM_WIN32
+  if (s.repeat_capture && s.repeat_capture_frame != s.frames) {
+    s.repeat_capture_frame = s.frames;
+    s.repeat_captures_this_frame = 0;
+  }
+  if (s.audit_binding && measuring && (s.sustained_replay || s.audit_attempts < 64) &&
+      b->producer_lifetime && (!s.repeat_capture || s.repeat_captures_this_frame < 3)) {
+    auto& tested = s.audited_lifetimes;
+    const auto previous = std::ranges::find(tested, b->producer_lifetime);
+    const auto slot = previous == tested.end() ? std::ranges::find(tested, 0) : previous;
+    if (slot != tested.end() &&
+        (previous == tested.end() ||
+         (s.repeat_capture && (s.sustained_replay ||
+                               s.capture_visits[slot - tested.begin()] < s.capture_visit_cap)))) {
+      if (s.repeat_capture) ++s.repeat_captures_this_frame;
+      using Visit = bool (*)(void*, uint32_t) noexcept;
+      using WithBinding = bool (*)(const uint32_t*, uint32_t, Visit, void*) noexcept;
+      static const auto with_binding = reinterpret_cast<WithBinding>(
+          GetProcAddress(GetModuleHandleW(nullptr), "ForzaM4WithBindingV1"));
+      ++s.audit_attempts;
+      if (with_binding) {
+        uint32_t query[fh::kListBindLifetimeWords] = {
+            fh::kMagic, fh::kOpListBind, b->phys, b->words, b->template_id, b->refusal,
+            b->state_word, b->cb, b->patch, b->patch_words, b->group, b->flags,
+            uint32_t(b->producer_lifetime), uint32_t(b->producer_lifetime >> 32)};
+        uint32_t generation = 0;
+        const auto capture = [](void* out, uint32_t value) noexcept {
+          *static_cast<uint32_t*>(out) = value;
+          return true;
+        };
+        if (with_binding(query, fh::kListBindLifetimeWords, capture, &generation)) {
+          *slot = b->producer_lifetime;
+          const size_t slot_index = slot - tested.begin();
+          if (s.sustained_replay) {
+            s.sustained_phys[slot_index] = b->phys;
+          } else {
+            ++s.capture_visits[slot_index];
+          }
+          if (s.audit_capture) {
+            LiveCaptureProbe probe{*memory_, *b, *tmpl};
+            if (s.reuse_snapshot) probe.retained = &s.retained_replays[slot_index];
+            const uint64_t started = NowNs();
+            const bool captured =
+                with_binding(query, fh::kListBindLifetimeWords, ProbeLiveCapture, &probe);
+            const uint64_t duration = NowNs() - started;
+            if (s.sustained_replay) {
+              s.sustained_capture_ns += duration;
+              s.sustained_reused += captured && probe.retained_hit;
+              s.sustained_captured += captured && !probe.retained_hit;
+            } else {
+              REXGPU_INFO(
+                  "M4 capture audit: phys={:08X} lifetime={} status={} ranges={} inputs={} "
+                  "index_draws={} index_bytes={} last_space={} last_range={:08X} bytes={} "
+                  "compared_bytes={} duration_ns={}",
+                  b->phys, b->producer_lifetime, probe.status, probe.copied, probe.input_bytes,
+                  probe.index_draws, probe.index_bytes,
+                  probe.space == fl::ReplayPlan::AddressSpace::kVirtual ? "virtual" : "physical",
+                  probe.address, probe.range_bytes, probe.compared_bytes, duration);
+            }
+#if REX_HAS_VULKAN
+            // A fresh plan can populate the cache without consuming a
+            // retained-only pixel comparison on that first execution.
+            if (captured && s.audit_upload && (!s.retained_pixel_only || probe.retained_hit)) {
+              if (auto* vk_cp = dynamic_cast<vulkan::VulkanCommandProcessor*>(this)) {
+                if (s.audit_bind) {
+                  bind_plan = std::move(probe.plan);
+                } else {
+                  RecordCall([vk_cp, plan = std::move(probe.plan)] {
+                    vk_cp->AuditFh1OwnedIndices(*plan, false);
+                  });
+                }
+              }
+            }
+#else
+            (void)captured;
+#endif
+          }
+          if (!s.sustained_replay || !std::exchange(s.sustained_checked_lifetime, true)) {
+            query[13] ^= 0x80000000u;
+            const bool wrong = with_binding(query, fh::kListBindLifetimeWords, capture, &generation);
+            REXGPU_INFO("M4 binding audit: phys={:08X} lifetime={} generation={} wrong_lifetime={}",
+                        b->phys, b->producer_lifetime, generation, wrong);
+          }
+        }
+      }
+    }
+  }
+#endif
   const uint32_t* t = tmpl->words.data();
+  constexpr auto generation_alignment = std::atomic_ref<uint32_t>::required_alignment;
+  auto* state = Plausible(b->state_word)
+                    ? memory_->TranslateVirtual<uint32_t*>(b->state_word)
+                    : nullptr;
+  if (state && reinterpret_cast<uintptr_t>(state) % generation_alignment)
+    return no(fl::Skip::kFixupInProgress);
+  const auto load_generation = [state]() {
+    return state ? __builtin_bswap32(std::atomic_ref<uint32_t>(*state).load(
+                       std::memory_order_acquire))
+                 : 0u;
+  };
+  const auto generation_changed = [&]() {
+    ++s.in_progress;
+    b->pool_valid = false;
+    return no(fl::Skip::kFixupInProgress);
+  };
+  const uint32_t generation = load_generation();
+  if (generation & 1) return generation_changed();
+
   // The command buffer still names this buffer (its first segment: +116 the chain, then the
   // count, the words and the physical address).
   if (!Plausible(b->cb) || !Plausible(b->patch) || b->patch_words > (1u << 16))
@@ -417,18 +769,12 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   // generation again; odd, or changed in between, is a fixup under way.
   const uint32_t pool_words = t[fl::kTPoolWords];
   s.fresh_pool.resize(pool_words);
-  const auto* state =
-      Plausible(b->state_word) ? memory_->TranslateVirtual<const uint8_t*>(b->state_word) : nullptr;
-  const uint32_t generation = state ? fl::Word(state, 0) : 0;
-  std::atomic_thread_fence(std::memory_order_acquire);
   fl::Resolve(t, pm4, s.fresh_pool.data());
   std::atomic_thread_fence(std::memory_order_acquire);
-  const uint32_t generation_after = state ? fl::Word(state, 0) : 0;
-  if ((generation & 1) || generation_after != generation) {
-    ++s.in_progress;
-    b->pool_valid = false;
+  const uint32_t generation_after = load_generation();
+  if (generation_after != generation) {
     // The rejected snapshot cannot establish agreement with the packet decoder.
-    return no(fl::Skip::kFixupInProgress);
+    return generation_changed();
   } else if (b->pool_valid && b->pool_generation == generation) {
     if (b->pool != s.fresh_pool)
       ++s.stale_pools;
@@ -485,12 +831,160 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   if (untiled)
     ++g.untiled_runs;
   fh1_list_reader_ = reader;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  if (bind_plan) {
+    auto* vk_cp = static_cast<vulkan::VulkanCommandProcessor*>(this);
+    if (timed_replay) {
+      if (bind_plan->captured_generation() == generation && s.pool == s.fresh_pool &&
+          !s.perturb_every && !s.perturb_tile_every && !s.perturb_slot_every) {
+        std::vector<uint32_t> sealed_pool(pool_words);
+        fl::Resolve(t, reinterpret_cast<const uint8_t*>(bind_plan->guest_words().data()),
+                    sealed_pool.data());
+        if (sealed_pool == s.fresh_pool) {
+          // The existing benchmark phase check admitted this capture. An ordinary
+          // run needs its own ordered phase witness before it can produce a plan here.
+          admitted = std::move(bind_plan);
+        }
+      }
+    } else {
+      s.index_audit_cp = vk_cp;
+      RecordCall([vk_cp, plan = std::move(bind_plan)] {
+        vk_cp->AuditFh1OwnedIndices(*plan, true);
+      });
+    }
+  }
+#endif
   s.ns_begin += NowNs() - t0;
+  return true;
+}
+
+bool CommandProcessor::TryFh1ReplayOwnedList(std::shared_ptr<const fl::ReplayPlan> plan,
+                                            uint32_t phys, uint32_t words, bool& success) {
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  auto& s = *fh1_lists_;
+  if (!plan || fh1_stereo_state_ != Fh1StereoState::kOff || Fh1StereoWanted() ||
+      !plan->IsCurrentList(s.registry, phys, words)) return false;
+  const auto lifetime = plan->producer_lifetime();
+  if (!std::exchange(s.refused_replay_control, true)) {
+    REXGPU_INFO("M4 timed list fallback: lifetime={} reason=control", lifetime);
+    return false;
+  }
+  auto* vk_cp = static_cast<vulkan::VulkanCommandProcessor*>(this);
+  s.index_audit_cp = vk_cp;
+  RecordCall([vk_cp, plan] { vk_cp->AuditFh1OwnedIndices(*plan, true); });
+  const uint64_t started = NowNs();
+  success = Fh1RecordOwnedList(*plan);
+  if (s.sustained_replay) {
+    if (!s.sustained_first_ns) s.sustained_first_ns = started;
+    s.sustained_last_ns = NowNs();
+    s.sustained_lists += success;
+    s.sustained_failed += !success;
+    if (success) s.sustained_operations += plan->operations().size();
+  } else {
+    REXGPU_INFO("M4 timed list replay: lifetime={} generation={} operations={} success={} dispatch_ns={}",
+                lifetime, *plan->captured_generation(), plan->operations().size(), success,
+                NowNs() - started);
+  }
+  return true;
+#else
+  (void)plan;
+  (void)phys;
+  (void)words;
+  (void)success;
+  return false;
+#endif
+}
+
+bool CommandProcessor::Fh1RecordOwnedList(const fl::ReplayPlan& plan) {
+  const auto words = plan.guest_words();
+  // RingBuffer's constructor takes a writable pointer. The selected PM4
+  // handlers only read this backing and advance the cursor.
+  auto* data = reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(words.data()));
+  memory::RingBuffer reader(data, words.size_bytes());
+  reader.set_write_offset(words.size_bytes());
+  fh1_command_cursor::Scope cursor_scope(&reader);
+  auto* const stock_reader = std::exchange(fh1_list_reader_, &reader);
+  for (const auto& op : plan.operations()) {
+    reader.set_read_offset_within(op.first_word * sizeof(uint32_t));
+    const auto input = plan.input_words(op);
+    bool ok = true;
+    const uint32_t opcode = (op.header >> 8) & 0x7f;
+    if (op.kind != fl::ReplayPlan::Kind::kType3) {
+      ok = ExecutePacketType0(&reader, op.header);
+    } else if ((op.header & 1) && !(bin_select_ & bin_mask_)) {
+      if (opcode == 0x22) Fh1ListDraw(op.first_word * sizeof(uint32_t), false);
+      reader.AdvanceRead(op.count * sizeof(uint32_t));
+    } else if (opcode == 0x27 && !input.empty()) {  // IM_LOAD
+      const uint32_t addr_type = reader.ReadAndSwap<uint32_t>();
+      const uint32_t start_size = reader.ReadAndSwap<uint32_t>();
+      const auto shader_type = static_cast<xenos::ShaderType>(addr_type & 3);
+      if (fh1_lists_) Fh1ListShader(addr_type, start_size);
+      if (record_split_) {
+        // The existing immediate-shader record owns its payload through the
+        // recorder's last read, even after the replay plan is destroyed.
+        uint32_t* record = RecordWords(3 + uint32_t(input.size()));
+        record[0] = kRecordShaderImmediate;
+        record[1] = uint32_t(shader_type);
+        record[2] = uint32_t(input.size());
+        std::memcpy(record + 3, input.data(), input.size_bytes());
+      } else {
+        auto* shader = LoadShader(shader_type, addr_type & ~3u, input.data(), uint32_t(input.size()));
+        (shader_type == xenos::ShaderType::kVertex ? active_vertex_shader_ : active_pixel_shader_) =
+            shader;
+      }
+    } else if (opcode == 0x2f && !input.empty()) {
+      // LOAD_ALU_CONSTANT. Preparation checks the literal count and ALU type.
+      reader.AdvanceRead(sizeof(uint32_t));
+      const uint32_t index = reader.ReadAndSwap<uint32_t>() & 0x7ff;
+      reader.AdvanceRead(sizeof(uint32_t));
+      PacketWriteRegistersFromMem(fh::kAluFirstRegister + index, input.data(),
+                                  uint32_t(input.size()));
+    } else {
+      switch (opcode) {
+        case 0x10:  // NOP without a host packet.
+          reader.AdvanceRead(op.count * sizeof(uint32_t));
+          break;
+        case 0x22:  // DRAW_INDX.
+          Fh1ListDraw(op.first_word * sizeof(uint32_t), true);
+          ok = ExecutePacketType3_DRAW_INDX(&reader, op.header, op.count);
+          break;
+        case 0x2d:  // The sealed tile-window register bundle.
+          ok = ExecutePacketType3_SET_CONSTANT(&reader, op.header, op.count);
+          break;
+        case 0x60:
+          bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | reader.ReadAndSwap<uint32_t>();
+          break;
+        case 0x61:
+          bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) |
+                      (uint64_t(reader.ReadAndSwap<uint32_t>()) << 32);
+          break;
+        default:
+          ok = false;
+          break;
+      }
+    }
+    // Dispatch has started and may have changed emulated state. The caller
+    // reports an execution failure instead of restarting on the stock path.
+    const size_t end = (op.first_word + op.count) * sizeof(uint32_t);
+    const size_t next = end == words.size_bytes() ? 0 : end;
+    if (!ok || reader.read_offset() != next) {
+      fh1_list_reader_ = stock_reader;
+      return false;
+    }
+  }
+  fh1_list_reader_ = stock_reader;
   return true;
 }
 
 void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
   auto& s = *fh1_lists_;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  if (auto* vk_cp = s.index_audit_cp) {
+    RecordCall([vk_cp, offset = executed ? packet_offset : UINT32_MAX] {
+      vk_cp->SelectFh1IndexAuditDraw(offset);
+    });
+  }
+#endif
   const uint64_t t0 = NowNs();
   const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;
   const uint32_t k = s.run.next_draw();
@@ -547,6 +1041,11 @@ bool CommandProcessor::Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t
 
 void CommandProcessor::Fh1ListEnd() {
   auto& s = *fh1_lists_;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  if (auto* vk_cp = std::exchange(s.index_audit_cp, nullptr)) {
+    RecordCall([vk_cp] { vk_cp->EndFh1IndexAudit(); });
+  }
+#endif
   const uint64_t t0 = NowNs();
   fh1_list_reader_ = nullptr;
   const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;
@@ -577,7 +1076,18 @@ void CommandProcessor::Fh1ListEnd() {
 
 void CommandProcessor::Fh1ListsSwap() {
   auto& s = *fh1_lists_;
-  if (++s.frames % 600 == 0)
+  ++s.frames;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  if (s.timed_pixel_parity && s.audit_attempts && s.frames % 240 == 0 &&
+      s.pixel_parity_sampling_passes < 7) {
+    s.audit_attempts = 0;
+    s.audited_lifetimes.fill(0);
+    s.retained_replays.fill({});
+    s.capture_visits.fill(0);
+    ++s.pixel_parity_sampling_passes;
+  }
+#endif
+  if (s.frames % 600 == 0)
     LogLists(s, "so far", s.frames);
 }
 

@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -203,6 +204,10 @@ class VulkanCommandProcessor : public CommandProcessor {
                         VkPipelineStageFlags wait_stage_mask);
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
+  void AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan, bool bind);
+  void SelectFh1IndexAuditDraw(uint32_t packet_offset);
+  void EndFh1IndexAudit();
+  void ObserveFh1IndexAuditUpload(uint32_t address, std::span<const uint8_t> bytes);
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
   // Submission must be open to insert barriers. If no pipeline stages access
@@ -351,6 +356,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool SupportsRecordThread() const override { return true; }
 
  private:
+  std::pair<VkBuffer, VkDeviceSize> TakeFh1IndexAudit(uint32_t address, uint32_t count,
+                                                      uint32_t width, uint32_t endian);
+  bool Fh1ReplayDrawSelected() const;
   // GetVulkanDevice's pointer, set in the constructor (null while the members are made).
   ui::vulkan::VulkanDevice* fh1_vulkan_device_ = nullptr;
 
@@ -634,7 +642,19 @@ class VulkanCommandProcessor : public CommandProcessor {
       bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
-  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+                      uint32_t* owned_texture_views = nullptr);
+  struct ReplayPixelComparison {
+    std::array<VulkanRenderTargetCache::ReplayParityTarget, 2> targets{};
+    VulkanPrimitiveProcessor::ReplayPixelReadback* readback = nullptr;
+  };
+  ReplayPixelComparison BeginFh1ReplayPixelComparison(
+      const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+      const std::array<uint32_t, 2>& vertex_window,
+      const PrimitiveProcessor::ProcessingResult& indices, uint32_t owned_texture_views);
+  void ReadFh1ReplayPixels(ReplayPixelComparison& comparison, uint32_t arm,
+                          const std::array<VkImage, 2>& images);
+  void EndFh1ReplayPixelComparison(ReplayPixelComparison& comparison);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,

@@ -88,6 +88,10 @@ class VulkanTextureCache final : public TextureCache {
   // also since it may insert deferred barriers, before flushing the barriers
   // preceding host GPU work.
   void RequestTextures(uint32_t used_texture_mask) override;
+  bool BeginFh1ReplayTextureDraw();
+  VkImageView GetFh1ReplayTextureView(uint32_t fetch_constant_index,
+                                      xenos::FetchOpDimension dimension, bool is_signed,
+                                      uint32_t* owned_views);
 
 
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
@@ -213,6 +217,13 @@ class VulkanTextureCache final : public TextureCache {
     VkImage image() const { return image_; }
     VkImageView storage_view() const { return storage_view_; }
     void set_storage_view(VkImageView view) { storage_view_ = view; }
+    VkFormat replay_copy_format() const { return replay_copy_format_; }
+    void set_replay_copy_format(VkFormat format) { replay_copy_format_ = format; }
+    Usage usage() const { return usage_; }
+    static constexpr VkComponentMapping ComponentMapping(uint32_t swizzle) {
+      return {GetComponentSwizzle(swizzle, 0), GetComponentSwizzle(swizzle, 1),
+              GetComponentSwizzle(swizzle, 2), GetComponentSwizzle(swizzle, 3)};
+    }
 
     VulkanTexture* upload_texture() { return cube_upload_ ? cube_upload_.get() : this; }
     void SetCubeUpload(std::unique_ptr<VulkanTexture> texture) {
@@ -292,6 +303,7 @@ class VulkanTextureCache final : public TextureCache {
     std::unique_ptr<VulkanTexture> cube_upload_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
+    VkFormat replay_copy_format_ = VK_FORMAT_UNDEFINED;
   };
 
   struct VulkanTextureBinding {
@@ -491,6 +503,19 @@ class VulkanTextureCache final : public TextureCache {
   uint64_t pack_idle_check_ms_ = 0;
   bool pack_heap_full_ = false;  // a device-local heap is nearly at the driver's budget
   bool pack_limit_logged_ = false;
+
+  struct ReplayTextureSlot {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0, height = 0, mip_count = 0, swizzle = 0;
+    uint64_t last_submission = 0;
+    VkImageView source_this_draw = VK_NULL_HANDLE;
+  };
+  void DestroyReplayTextureSlot(ReplayTextureSlot& slot);
+  PFN_vkCmdCopyImage replay_copy_image_ = nullptr;
+  std::array<ReplayTextureSlot, 8> replay_texture_slots_{};
 };
 
 }  // namespace rex::graphics::vulkan
