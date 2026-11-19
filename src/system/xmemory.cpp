@@ -57,6 +57,22 @@ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_s
 
 namespace {
 
+#if REX_PLATFORM_WIN32
+// Canonical physical heap page indices, guarded by the replay allocator lock.
+// A reset/restore retires every stamp. Unrelated frees do not retire other ranges.
+constexpr size_t kReplayPageSize = 4096;
+std::array<uint64_t, 0x20000000 / kReplayPageSize> replay_page_changes{};
+uint64_t replay_allocation_stamp = 1;
+uint64_t replay_reset_stamp = 1;
+
+void InvalidateReplayPages(uint32_t first, uint32_t last) {
+  if (first > last || last >= replay_page_changes.size()) return;
+  ++replay_allocation_stamp;
+  std::fill_n(replay_page_changes.begin() + first, size_t(last) - first + 1,
+              replay_allocation_stamp);
+}
+#endif
+
 // SetHostViewOffsetGranularityForTesting; 0: the host's.
 size_t host_view_offset_granularity_for_testing = 0;
 
@@ -551,17 +567,35 @@ bool Memory::WithReplayPhysicalCapture(bool (*capture)(void*, const ReplayPhysic
 }
 
 bool Memory::ReplayPhysicalCapture::Copy(uint32_t physical, uint8_t* destination, size_t size) const {
+  return Access(physical, destination, size, destination, 0);
+}
+
+uint64_t Memory::ReplayPhysicalCapture::AllocationStamp() const {
+#if REX_PLATFORM_WIN32
+  return replay_allocation_stamp;
+#else
+  return 0;
+#endif
+}
+
+bool Memory::ReplayPhysicalCapture::Matches(uint32_t physical, const uint8_t* expected, size_t size,
+                                            uint64_t stamp) const {
+  return stamp && Access(physical, expected, size, nullptr, stamp);
+}
+
+bool Memory::ReplayPhysicalCapture::Access(uint32_t physical, const uint8_t* bytes, size_t size,
+                                           uint8_t* destination, uint64_t stamp) const {
 #if REX_PLATFORM_WIN32
   constexpr uint64_t kBackingBase = UINT64_C(0x100000000);
   constexpr uint64_t kPhysicalSize = UINT64_C(0x20000000);
   constexpr size_t kPageSize = 4096;
   constexpr size_t kMaxReplayBytes = 65536 * sizeof(uint32_t);
-  if (!destination || !size || size > kMaxReplayBytes || physical >= kPhysicalSize ||
+  if (!bytes || !size || size > kMaxReplayBytes || physical >= kPhysicalSize ||
       size > kPhysicalSize - physical) {
     return false;
   }
 
-  const uintptr_t output = reinterpret_cast<uintptr_t>(destination);
+  const uintptr_t output = reinterpret_cast<uintptr_t>(bytes);
   const uintptr_t guest = reinterpret_cast<uintptr_t>(memory_.virtual_membase_);
   const uintptr_t guest_end = reinterpret_cast<uintptr_t>(memory_.physical_membase_) + kPhysicalSize;
   if (size > UINTPTR_MAX - output || (output < guest_end && output + size > guest))
@@ -570,11 +604,13 @@ bool Memory::ReplayPhysicalCapture::Copy(uint32_t physical, uint8_t* destination
   const uint32_t page = physical & ~uint32_t(kPageSize - 1);
   const size_t offset = physical - page;
   const size_t span = (offset + size + kPageSize - 1) & ~(kPageSize - 1);
-  HeapAllocationInfo allocation{};
-  if (!memory_.heaps_.physical.QueryRegionInfo(page, &allocation) ||
-      !(allocation.state & kMemoryAllocationCommit) || span > allocation.region_size) {
-    return false;
+  if (!destination) {
+    if (stamp < replay_reset_stamp || stamp > replay_allocation_stamp) return false;
+    const auto first = replay_page_changes.begin() + page / kPageSize;
+    if (std::any_of(first, first + span / kPageSize,
+                    [stamp](uint64_t change) { return change > stamp; })) return false;
   }
+  if (!memory_.heaps_.physical.IsCommittedReplayRange(page, span)) return false;
 
   const uint64_t first = kBackingBase + page;
   const uint64_t last = first + span;
@@ -591,25 +627,39 @@ bool Memory::ReplayPhysicalCapture::Copy(uint32_t physical, uint8_t* destination
     aliases[count++] = memory_.views_.all_views[i] + (first - begin);
   }
   if (count != aliases.size() || aliases.back() != memory_.physical_membase_ + page) return false;
-  return pages_.Copy(aliases, span, offset, {destination, size});
+  if (destination) return pages_.Copy(aliases, span, offset, {destination, size});
+  return pages_.Matches(aliases, span, offset, {bytes, size});
 #else
   (void)physical;
-  (void)destination;
+  (void)bytes;
   (void)size;
+  (void)destination;
+  (void)stamp;
   return false;
 #endif
 }
 
 bool Memory::ReplayPhysicalCapture::CopyPhysicalAlias(uint32_t guest, uint8_t* destination,
                                                      size_t size) const {
+  uint32_t physical;
+  return ResolveAlias(guest, size, physical) && Copy(physical, destination, size);
+}
+
+bool Memory::ReplayPhysicalCapture::MatchesPhysicalAlias(uint32_t guest, const uint8_t* expected,
+                                                         size_t size, uint64_t stamp) const {
+  uint32_t physical;
+  return ResolveAlias(guest, size, physical) && Matches(physical, expected, size, stamp);
+}
+
+bool Memory::ReplayPhysicalCapture::ResolveAlias(uint32_t guest, size_t size,
+                                                 uint32_t& physical) const {
   if (!size || size - 1 > UINT32_MAX - guest) return false;
   const uint32_t last = guest + uint32_t(size - 1);
   const BaseHeap* heap = memory_.LookupHeap(guest);
   if (!heap || heap != memory_.LookupHeap(last) || heap->heap_type() != HeapType::kGuestPhysical)
     return false;
-  const uint32_t physical = memory_.GetPhysicalAddress(guest);
-  if (uint64_t(physical) + size - 1 != memory_.GetPhysicalAddress(last)) return false;
-  return Copy(physical, destination, size);
+  physical = memory_.GetPhysicalAddress(guest);
+  return uint64_t(physical) + size - 1 == memory_.GetPhysicalAddress(last);
 }
 
 int Memory::MapViews(uint8_t* mapping_base) {
@@ -1173,6 +1223,9 @@ BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_siz
 BaseHeap::~BaseHeap() = default;
 
 std::unique_lock<std::recursive_mutex> BaseHeap::AcquireHostPageReconcileLock() const {
+#if REX_PLATFORM_WIN32
+  if (this == &memory_->heaps_.physical) return rex::thread::global_critical_region::AcquireDirect();
+#endif
   if (page_size_ >= memory_->system_page_size_) {
     return {};
   }
@@ -1439,6 +1492,9 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
   // the global critical region held by its caller.
   auto global_lock = AcquireHostPageReconcileLock();
 
+#if REX_PLATFORM_WIN32
+  if (this == &memory_->heaps_.physical) replay_reset_stamp = ++replay_allocation_stamp;
+#endif
   for (size_t i = 0; i < page_table_.size(); i++) {
     auto& page = page_table_[i];
     page.qword = stream->Read<uint64_t>();
@@ -1506,6 +1562,13 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
 }
 
 void BaseHeap::Reset() {
+#if REX_PLATFORM_WIN32
+  std::unique_lock<std::recursive_mutex> replay_lock;
+  if (this == &memory_->heaps_.physical) {
+    replay_lock = AcquireHostPageReconcileLock();
+    replay_reset_stamp = ++replay_allocation_stamp;
+  }
+#endif
   // TODO(DrChat): protect pages.
   std::memset(page_table_.data(), 0, sizeof(PageEntry) * page_table_.size());
   // TODO(Triang3l): Remove access callbacks from pages if this is a physical
@@ -1622,6 +1685,10 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
   }
   const bool physical_heap = this == &memory_->heaps_.physical;
   const bool physical_alias = !physical_heap && heap_type_ == memory::HeapType::kGuestPhysical;
+#if REX_PLATFORM_WIN32
+  if (physical_heap && (allocation_type & kMemoryAllocationReserve))
+    InvalidateReplayPages(start_page_number, end_page_number);
+#endif
 
   // Set page state.
   int64_t committed_pages = 0;
@@ -1857,6 +1924,9 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
   }*/
 
   // Perform table change.
+#if REX_PLATFORM_WIN32
+  if (this == &memory_->heaps_.physical) InvalidateReplayPages(start_page_number, end_page_number);
+#endif
   int64_t decommitted_pages = 0;
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
@@ -1926,6 +1996,10 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 
   // Perform table change.
   uint32_t end_page_number = base_page_number + base_page_entry.region_page_count - 1;
+#if REX_PLATFORM_WIN32
+  if (this == &memory_->heaps_.physical && base_page_entry.region_page_count)
+    InvalidateReplayPages(base_page_number, end_page_number);
+#endif
   int64_t released_pages = 0;
   for (uint32_t page_number = base_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
@@ -2032,6 +2106,28 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
     return false;
   }
 
+  return true;
+}
+
+// QueryRegionInfo scans to the end of the allocation even for a one-page
+// read. Capture only needs the same allocation and protections over its span.
+bool BaseHeap::IsCommittedReplayRange(uint32_t page_address, size_t bytes) {
+  if (!bytes || page_address < heap_base_ || (page_address - heap_base_) % page_size_ ||
+      bytes % page_size_) return false;
+  const size_t first = (page_address - heap_base_) >> page_size_shift_;
+  const size_t count = bytes >> page_size_shift_;
+  std::lock_guard<std::recursive_mutex> lock(heap_mutex_);
+  if (first >= page_table_.size() || count > page_table_.size() - first) return false;
+
+  const auto& initial = page_table_[first];
+  const size_t allocation_end = size_t(initial.base_address) + initial.region_page_count;
+  if (!(initial.state & kMemoryAllocationCommit) || first < initial.base_address ||
+      first + count > allocation_end) return false;
+  for (size_t i = first + 1; i < first + count; ++i) {
+    const auto& page = page_table_[i];
+    if (page.base_address != initial.base_address || page.state != initial.state ||
+        page.current_protect != initial.current_protect) return false;
+  }
   return true;
 }
 

@@ -127,7 +127,36 @@ class ReplayPlan {
     if (!plan || !plan->CaptureIndices(lease) ||
         lease.ReadGeneration(binding.state_word) != generation) return std::nullopt;
     plan->captured_generation_ = generation;
+    plan->header_ = header;
+    plan->link_ = link;
+    plan->chain_ = chain;
+    plan->patch_ = std::move(patch);
     return plan;
+  }
+
+  // Recheck precisely the same byte spans Capture owned. The caller still
+  // holds the original producer lease and the physical capture transaction.
+  template <typename Lease>
+  bool Revalidate(const Binding& binding, Lease& lease) const {
+    if (!captured_generation_ || !lease.Matches(binding) ||
+        lease.ReadGeneration(binding.state_word) != captured_generation_) return false;
+
+    const auto match = [&](AddressSpace space, uint32_t address, const auto& data) {
+      auto bytes = std::as_bytes(std::span(data));
+      return bytes.empty() || lease.MatchBytes(space, address, bytes);
+    };
+    if (!match(AddressSpace::kVirtual, binding.cb, header_) ||
+        !match(AddressSpace::kVirtual, chain_, link_) ||
+        !match(AddressSpace::kVirtual, binding.patch, patch_) ||
+        !match(AddressSpace::kPhysical, binding.phys, words_)) return false;
+    for (const auto& input : inputs_) {
+      if (!match(AddressSpace::kPhysical, input.address & 0x1fffffffu, input.guest_words))
+        return false;
+    }
+    for (const auto& input : indices_) {
+      if (!match(AddressSpace::kPhysical, input.address, input.bytes)) return false;
+    }
+    return lease.ReadGeneration(binding.state_word) == captured_generation_;
   }
 
   std::optional<uint32_t> captured_generation() const { return captured_generation_; }
@@ -262,6 +291,10 @@ class ReplayPlan {
   std::vector<MemorySnapshot> inputs_;
   std::vector<IndexSnapshot> indices_;
   std::optional<uint32_t> captured_generation_;
+  std::array<uint8_t, kHeaderBytes> header_{};
+  std::array<uint8_t, 16> link_{};
+  uint32_t chain_ = 0;
+  std::vector<uint32_t> patch_;
 };
 
 // Holds a prepared replay until the next indirect-buffer admission. The

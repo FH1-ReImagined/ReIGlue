@@ -254,6 +254,7 @@ class BaseHeap {
 
   // Queries information about the given region of pages.
   bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
+  bool IsCommittedReplayRange(uint32_t page_address, size_t bytes);
 
   // Queries the size of the region containing the given address.
   bool QuerySize(uint32_t address, uint32_t* out_size);
@@ -449,11 +450,18 @@ class Memory {
     ReplayPhysicalCapture& operator=(const ReplayPhysicalCapture&) = delete;
     bool Copy(uint32_t physical, uint8_t* destination, size_t size) const;
     bool CopyPhysicalAlias(uint32_t guest, uint8_t* destination, size_t size) const;
+    uint64_t AllocationStamp() const;
+    bool Matches(uint32_t physical, const uint8_t* expected, size_t size, uint64_t stamp) const;
+    bool MatchesPhysicalAlias(uint32_t guest, const uint8_t* expected, size_t size,
+                              uint64_t stamp) const;
 
    private:
     friend class Memory;
     ReplayPhysicalCapture(Memory& memory, detail::FrozenReplayPages& pages)
         : memory_(memory), pages_(pages) {}
+    bool Access(uint32_t physical, const uint8_t* bytes, size_t size, uint8_t* destination,
+                uint64_t stamp) const;
+    bool ResolveAlias(uint32_t guest, size_t size, uint32_t& physical) const;
     Memory& memory_;
     detail::FrozenReplayPages& pages_;
   };

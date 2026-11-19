@@ -807,7 +807,7 @@ void TestCaptureFromLease() {
     std::map<std::tuple<Space, uint32_t, size_t>, std::vector<uint8_t>> ranges;
     std::optional<uint32_t> generation = 2;
     std::optional<uint32_t> closing_generation = 2;
-    unsigned samples = 0, reads = 0;
+    unsigned samples = 0, reads = 0, comparisons = 0;
 
     bool Matches(const fl::Binding& b) const {
       return identity.incarnation == b.incarnation && identity.phys == b.phys &&
@@ -824,6 +824,12 @@ void TestCaptureFromLease() {
       if (range == ranges.end()) return false;
       std::memcpy(bytes.data(), range->second.data(), bytes.size());
       return true;
+    }
+    bool MatchBytes(Space space, uint32_t address, std::span<const std::byte> bytes) {
+      ++comparisons;
+      const auto range = ranges.find({space, address, bytes.size()});
+      return range != ranges.end() &&
+             std::memcmp(bytes.data(), range->second.data(), bytes.size()) == 0;
     }
     void Add(Space space, uint32_t address, std::vector<uint8_t> bytes) {
       ranges[{space, address, bytes.size()}] = std::move(bytes);
@@ -912,9 +918,31 @@ void TestCaptureFromLease() {
     CHECK(!pending.Take(registry, binding.phys, binding.words, 2));
 
     CHECK(prepare(lease) && lease.samples == 2);
-    lease.ranges.clear();
     auto owned = pending.Take(registry, binding.phys, binding.words, 2);
     CHECK(owned && std::memcmp(owned->guest_words().data(), pm4.data(), pm4.size()) == 0);
+
+    lease.samples = lease.reads = 0;
+    auto valid = lease;
+    CHECK(owned->Revalidate(binding, valid));
+    CHECK(valid.samples == 2 && valid.reads == 0 && valid.comparisons >= 4);
+
+    for (const auto& [range, bytes] : lease.ranges) {
+      CHECK(!bytes.empty());
+      auto changed = lease;
+      changed.ranges.at(range).back() ^= 1;
+      CHECK(!owned->Revalidate(binding, changed));
+      CHECK(changed.reads == 0);
+    }
+    auto changed = lease;
+    changed.generation = 4;
+    CHECK(!owned->Revalidate(binding, changed) && changed.comparisons == 0);
+    changed = lease;
+    changed.closing_generation = 4;
+    CHECK(!owned->Revalidate(binding, changed) && changed.samples == 2);
+    changed = lease;
+    changed.identity.incarnation++;
+    CHECK(!owned->Revalidate(binding, changed) && changed.samples == 0);
+    lease.ranges.clear();
     size_t input_index = 0;
     size_t index_draw = 0;
     for (const auto& op : owned->operations()) {

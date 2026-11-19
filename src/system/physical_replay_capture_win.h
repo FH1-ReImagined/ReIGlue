@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +22,8 @@ class FrozenReplayPages {
   ~FrozenReplayPages();
   bool Copy(const std::array<uint8_t*, 4>& pages, size_t span_bytes, size_t offset,
             std::span<uint8_t> destination);
+  bool Matches(const std::array<uint8_t*, 4>& pages, size_t span_bytes, size_t offset,
+               std::span<const uint8_t> expected);
 
  private:
   struct Restore {
@@ -30,7 +33,14 @@ class FrozenReplayPages {
     bool applied = false;
   };
   bool Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes);
+  bool FreezeForAccess(const std::array<uint8_t*, 4>& pages, size_t span_bytes, size_t offset,
+                       std::span<const uint8_t> bytes);
+  struct Span {
+    uintptr_t start;
+    uintptr_t end;
+  };
   std::vector<Restore> restore_;
+  std::vector<Span> sealed_;
 };
 
 inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes) {
@@ -49,6 +59,14 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
     // those pages and seal only the remaining writable runs.
     const uintptr_t end = start + span_bytes;
     for (uintptr_t base = start; base < end;) {
+      uintptr_t verified_end = base;
+      for (const auto& span : sealed_) {
+        if (base >= span.start && base < span.end) verified_end = (std::max)(verified_end, span.end);
+      }
+      if (verified_end != base) {
+        base = (std::min)(verified_end, end);
+        continue;
+      }
       MEMORY_BASIC_INFORMATION info{};
       auto* address = reinterpret_cast<uint8_t*>(base);
       if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT ||
@@ -74,6 +92,14 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
     run.applied = true;
     if (previous != PAGE_READWRITE) return false;
   }
+  for (auto* page : pages) {
+    const auto start = reinterpret_cast<uintptr_t>(page);
+    if (std::none_of(sealed_.begin(), sealed_.end(), [&](const Span& span) {
+          return span.start <= start && span.end >= start + span_bytes;
+        })) {
+      sealed_.push_back({start, start + span_bytes});
+    }
+  }
   return true;
 }
 
@@ -88,24 +114,36 @@ inline FrozenReplayPages::~FrozenReplayPages() {
   }
 }
 
-inline bool FrozenReplayPages::Copy(const std::array<uint8_t*, 4>& pages, size_t span_bytes,
-                                    size_t offset, std::span<uint8_t> destination) {
-  if (offset >= 4096 || offset >= span_bytes || destination.empty() ||
-      destination.size() > span_bytes - offset) {
+inline bool FrozenReplayPages::FreezeForAccess(const std::array<uint8_t*, 4>& pages,
+                                                size_t span_bytes, size_t offset,
+                                                std::span<const uint8_t> bytes) {
+  if (offset >= 4096 || offset >= span_bytes || bytes.empty() ||
+      bytes.size() > span_bytes - offset) {
     return false;
   }
-  const auto output = reinterpret_cast<uintptr_t>(destination.data());
-  if (destination.size() > UINTPTR_MAX - output) return false;
+  const auto output = reinterpret_cast<uintptr_t>(bytes.data());
+  if (bytes.size() > UINTPTR_MAX - output) return false;
   for (auto* page : pages) {
     const auto start = reinterpret_cast<uintptr_t>(page);
     if (span_bytes > UINTPTR_MAX - start ||
-        (output < start + span_bytes && start < output + destination.size())) {
+        (output < start + span_bytes && start < output + bytes.size())) {
       return false;
     }
   }
-  if (!Freeze(pages, span_bytes)) return false;
+  return Freeze(pages, span_bytes);
+}
+
+inline bool FrozenReplayPages::Copy(const std::array<uint8_t*, 4>& pages, size_t span_bytes,
+                                    size_t offset, std::span<uint8_t> destination) {
+  if (!FreezeForAccess(pages, span_bytes, offset, destination)) return false;
   std::memcpy(destination.data(), pages.back() + offset, destination.size());
   return true;
+}
+
+inline bool FrozenReplayPages::Matches(const std::array<uint8_t*, 4>& pages, size_t span_bytes,
+                                       size_t offset, std::span<const uint8_t> expected) {
+  return FreezeForAccess(pages, span_bytes, offset, expected) &&
+         std::memcmp(expected.data(), pages.back() + offset, expected.size()) == 0;
 }
 
 }  // namespace rex::memory::detail
