@@ -7840,8 +7840,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           index_buffer.first = guest_dma_index_scratch_buffer.buffer();
           index_buffer.second = 0;
         } else {
-          index_buffer.first = shared_memory_->buffer();
-          index_buffer.second = primitive_processing_result.guest_index_base;
+          index_buffer = {};
+          if (!memexport_writes_possible) {
+            index_buffer = TakeFh1IndexAudit(
+                primitive_processing_result.guest_index_base,
+                primitive_processing_result.host_draw_vertex_count,
+                primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4,
+                uint32_t(regs.Get<reg::VGT_DMA_SIZE>().swap_mode));
+          }
+          if (index_buffer.first == VK_NULL_HANDLE) {
+            index_buffer = {shared_memory_->buffer(), primitive_processing_result.guest_index_base};
+          }
         }
         break;
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:

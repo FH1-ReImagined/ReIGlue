@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -203,7 +204,10 @@ class VulkanCommandProcessor : public CommandProcessor {
                         VkPipelineStageFlags wait_stage_mask);
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
-  void AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan, uint64_t lifetime);
+  void AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan, uint64_t lifetime, bool bind);
+  void SelectFh1IndexAuditDraw(uint32_t packet_offset);
+  void EndFh1IndexAudit();
+  void ObserveFh1IndexAuditUpload(uint32_t address, std::span<const uint8_t> bytes);
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
   // Submission must be open to insert barriers. If no pipeline stages access
@@ -352,6 +356,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool SupportsRecordThread() const override { return true; }
 
  private:
+  std::pair<VkBuffer, VkDeviceSize> TakeFh1IndexAudit(uint32_t address, uint32_t count,
+                                                      uint32_t width, uint32_t endian);
   // GetVulkanDevice's pointer, set in the constructor (null while the members are made).
   ui::vulkan::VulkanDevice* fh1_vulkan_device_ = nullptr;
 

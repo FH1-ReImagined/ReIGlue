@@ -38,7 +38,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -120,6 +122,10 @@ struct CommandProcessor::Fh1Lists {
   bool audit_binding = false;
   bool audit_capture = false;
   bool audit_upload = false;
+  bool audit_bind = false;
+#if REX_HAS_VULKAN
+  vulkan::VulkanCommandProcessor* index_audit_cp = nullptr;
+#endif
   uint32_t audit_attempts = 0;
   std::array<uint64_t, 16> audited_lifetimes{};
 #endif
@@ -309,7 +315,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
     fh1_lists_ = new Fh1Lists;
 #if REX_PLATFORM_WIN32
     if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT")) {
-      fh1_lists_->audit_upload = std::strcmp(e, "upload") == 0;
+      fh1_lists_->audit_bind = std::strcmp(e, "bind") == 0;
+      fh1_lists_->audit_upload = fh1_lists_->audit_bind || std::strcmp(e, "upload") == 0;
       fh1_lists_->audit_capture = fh1_lists_->audit_upload || std::strcmp(e, "capture") == 0;
       fh1_lists_->audit_binding = fh1_lists_->audit_capture || std::strcmp(e, "1") == 0;
     }
@@ -456,6 +463,9 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
 
 bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader) {
   auto& s = *fh1_lists_;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  std::optional<fl::ReplayPlan> bind_plan;
+#endif
   const uint64_t t0 = NowNs();
   fl::Skip skip;
   fl::Binding* b = s.registry.Lookup(ptr & 0x1FFFFFFFu, count, &skip);
@@ -521,10 +531,14 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
 #if REX_HAS_VULKAN
             if (captured && s.audit_upload) {
               if (auto* vk_cp = dynamic_cast<vulkan::VulkanCommandProcessor*>(this)) {
-                RecordCall([vk_cp, plan = std::move(*probe.plan),
-                            lifetime = b->producer_lifetime] {
-                  vk_cp->AuditFh1OwnedIndices(plan, lifetime);
-                });
+                if (s.audit_bind) {
+                  bind_plan = std::move(probe.plan);
+                } else {
+                  RecordCall([vk_cp, plan = std::move(*probe.plan),
+                              lifetime = b->producer_lifetime] {
+                    vk_cp->AuditFh1OwnedIndices(plan, lifetime, false);
+                  });
+                }
               }
             }
 #else
@@ -661,6 +675,15 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   if (untiled)
     ++g.untiled_runs;
   fh1_list_reader_ = reader;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  if (bind_plan) {
+    auto* vk_cp = static_cast<vulkan::VulkanCommandProcessor*>(this);
+    s.index_audit_cp = vk_cp;
+    RecordCall([vk_cp, plan = std::move(*bind_plan), lifetime = b->producer_lifetime] {
+      vk_cp->AuditFh1OwnedIndices(plan, lifetime, true);
+    });
+  }
+#endif
   s.ns_begin += NowNs() - t0;
   return true;
 }
@@ -719,6 +742,13 @@ bool CommandProcessor::Fh1RecordOwnedList(const fl::ReplayPlan& plan) {
 
 void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
   auto& s = *fh1_lists_;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  if (auto* vk_cp = s.index_audit_cp) {
+    RecordCall([vk_cp, offset = executed ? packet_offset : UINT32_MAX] {
+      vk_cp->SelectFh1IndexAuditDraw(offset);
+    });
+  }
+#endif
   const uint64_t t0 = NowNs();
   const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;
   const uint32_t k = s.run.next_draw();
@@ -775,6 +805,11 @@ bool CommandProcessor::Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t
 
 void CommandProcessor::Fh1ListEnd() {
   auto& s = *fh1_lists_;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  if (auto* vk_cp = std::exchange(s.index_audit_cp, nullptr)) {
+    RecordCall([vk_cp] { vk_cp->EndFh1IndexAudit(); });
+  }
+#endif
   const uint64_t t0 = NowNs();
   fh1_list_reader_ = nullptr;
   const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;

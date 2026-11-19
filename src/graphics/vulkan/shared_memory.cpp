@@ -340,6 +340,8 @@ bool VulkanSharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
+      command_processor_.ObserveFh1IndexAuditUpload(
+          upload_range_start << page_size_log2(), {upload_buffer_mapping, size_t(upload_buffer_size)});
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
@@ -394,6 +396,7 @@ bool VulkanSharedMemory::Fh1UploadData(uint32_t start, const uint8_t* data, uint
         upload_buffer_offset, upload_buffer_size);
     if (!mapping) return false;
     std::memcpy(mapping, data, size_t(upload_buffer_size));
+    command_processor_.ObserveFh1IndexAuditUpload(start, {mapping, size_t(upload_buffer_size)});
     VkBufferCopy region;
     region.srcOffset = upload_buffer_offset;
     region.dstOffset = start;

@@ -42,11 +42,42 @@ REXCVAR_DEFINE_BOOL(vulkan_force_convert_quad_lists_to_triangle_lists, false, "G
 
 namespace rex::graphics::vulkan {
 
+namespace {
+struct Fh1IndexAuditEntry {
+  uint32_t packet;
+  fh1_list::ReplayPlan::IndexSnapshot index;
+  std::pair<VkBuffer, VkDeviceSize> slice;
+};
+
+struct Fh1IndexAudit {
+  const VulkanCommandProcessor* owner = nullptr;
+  uint64_t lifetime = 0;
+  uint64_t frame = 0;
+  uint64_t submission = 0;
+  std::vector<Fh1IndexAuditEntry> entries;
+  const Fh1IndexAuditEntry* selected = nullptr;
+  bool witnessed = false;
+  size_t bound = 0;
+  size_t forced = 0;
+};
+
+thread_local Fh1IndexAudit fh1_index_audit;
+thread_local bool fh1_index_audit_forced_fallback = false;
+}  // namespace
+
 void VulkanCommandProcessor::AuditFh1OwnedIndices(const fh1_list::ReplayPlan& plan,
-                                                  uint64_t lifetime) {
+                                                  uint64_t lifetime, bool bind) {
   if (!submission_open_ || !frame_open_ || !primitive_processor_) {
     REXGPU_INFO("M4 index upload audit: lifetime={} skipped=no-frame", lifetime);
     return;
+  }
+  auto& audit = fh1_index_audit;
+  if (bind) {
+    audit = {};
+    audit.owner = this;
+    audit.lifetime = lifetime;
+    audit.frame = GetCurrentFrame();
+    audit.submission = GetCurrentSubmission();
   }
   size_t uploads = 0, bytes = 0, refused = 0;
   for (const auto& op : plan.operations()) {
@@ -59,9 +90,69 @@ void VulkanCommandProcessor::AuditFh1OwnedIndices(const fh1_list::ReplayPlan& pl
     }
     ++uploads;
     bytes += index->bytes.size();
+    if (bind) audit.entries.push_back({op.first_word * 4, *index, {buffer, offset}});
   }
   REXGPU_INFO("M4 index upload audit: lifetime={} frame={} submission={} uploads={} bytes={} refused={}",
               lifetime, GetCurrentFrame(), GetCurrentSubmission(), uploads, bytes, refused);
+}
+
+void VulkanCommandProcessor::SelectFh1IndexAuditDraw(uint32_t packet_offset) {
+  auto& audit = fh1_index_audit;
+  if (audit.owner != this) return;
+  audit.selected = nullptr;
+  audit.witnessed = false;
+  for (const auto& entry : audit.entries) {
+    if (entry.packet == packet_offset) {
+      audit.selected = &entry;
+      break;
+    }
+  }
+}
+
+void VulkanCommandProcessor::ObserveFh1IndexAuditUpload(uint32_t address,
+                                                       std::span<const uint8_t> bytes) {
+  auto& audit = fh1_index_audit;
+  if (audit.owner != this || !audit.selected || audit.frame != GetCurrentFrame() ||
+      audit.submission != GetCurrentSubmission()) return;
+  const auto& index = audit.selected->index;
+  const uint64_t upload_end = uint64_t(address) + bytes.size();
+  const uint64_t index_end = uint64_t(index.address) + index.bytes.size();
+  if (upload_end <= index.address || index_end <= address) return;
+  // A later overlapping transfer supersedes any earlier witness.
+  audit.witnessed = address <= index.address && index_end <= upload_end &&
+                    std::memcmp(bytes.data() + (index.address - address), index.bytes.data(),
+                                index.bytes.size()) == 0;
+}
+
+std::pair<VkBuffer, VkDeviceSize> VulkanCommandProcessor::TakeFh1IndexAudit(
+    uint32_t address, uint32_t count, uint32_t width, uint32_t endian) {
+  auto& audit = fh1_index_audit;
+  if (audit.owner != this) return {};
+  const auto* entry = std::exchange(audit.selected, nullptr);
+  if (!entry || !audit.witnessed || !frame_open_ || !submission_open_ ||
+      audit.frame != GetCurrentFrame() || audit.submission != GetCurrentSubmission()) return {};
+  const auto& index = entry->index;
+  if (index.address != address || index.width != width || index.endian != endian ||
+      index.bytes.size() != uint64_t(count) * width ||
+      shared_memory_->IsRangeGpuWritten(address, uint32_t(index.bytes.size()))) return {};
+  if (!std::exchange(fh1_index_audit_forced_fallback, true)) {
+    ++audit.forced;
+    REXGPU_INFO("M4 index bind audit: lifetime={} packet={} forced-stock bytes={}",
+                audit.lifetime, entry->packet, index.bytes.size());
+    return {};
+  }
+  ++audit.bound;
+  REXGPU_INFO("M4 index bind audit: lifetime={} packet={} owned bytes={}",
+              audit.lifetime, entry->packet, index.bytes.size());
+  return entry->slice;
+}
+
+void VulkanCommandProcessor::EndFh1IndexAudit() {
+  auto& audit = fh1_index_audit;
+  if (audit.owner != this) return;
+  REXGPU_INFO("M4 index bind summary: lifetime={} staged={} owned={} forced={}",
+              audit.lifetime, audit.entries.size(), audit.bound, audit.forced);
+  audit = {};
 }
 
 VulkanPrimitiveProcessor::~VulkanPrimitiveProcessor() {
