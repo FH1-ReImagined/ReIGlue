@@ -124,7 +124,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
     // P705), however, words (not full elements) out of glBufferData bounds
     // contain 0.
-    word_composite_constituents[word_count++] = LoadUint32FromSharedMemory(word_address);
+    word_composite_constituents[word_count++] = LoadVertexFetchUint32(word_address);
   }
   spv::Id words;
   if (word_count > 1) {

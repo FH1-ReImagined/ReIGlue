@@ -109,6 +109,12 @@ void VulkanCommandProcessor::SelectFh1IndexAuditDraw(uint32_t packet_offset) {
   }
 }
 
+bool VulkanCommandProcessor::Fh1ReplayDrawSelected() const {
+  const auto& audit = fh1_index_audit;
+  return audit.owner == this && audit.selected && frame_open_ && submission_open_ &&
+         audit.frame == GetCurrentFrame() && audit.submission == GetCurrentSubmission();
+}
+
 void VulkanCommandProcessor::ObserveFh1IndexAuditUpload(uint32_t address,
                                                        std::span<const uint8_t> bytes) {
   auto& audit = fh1_index_audit;
@@ -202,6 +208,8 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
 
   frame_index_buffers_.clear();
   frame_index_buffer_pool_.reset();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, replay_vertex_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, replay_vertex_memory_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, builtin_index_buffer_upload_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
                                          builtin_index_buffer_upload_memory_);
@@ -211,6 +219,13 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
   if (!from_destructor) {
     ShutdownCommon();
   }
+}
+
+void VulkanPrimitiveProcessor::InitializeReplayVertexBuffer() {
+  ui::vulkan::util::CreateDedicatedAllocationBuffer(
+      command_processor_.GetVulkanDevice(), SpirvShaderTranslator::kFh1ReplayVertexCapacity,
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      ui::vulkan::util::MemoryPurpose::kDeviceLocal, replay_vertex_buffer_, replay_vertex_memory_);
 }
 
 void VulkanPrimitiveProcessor::CompletedSubmissionUpdated() {

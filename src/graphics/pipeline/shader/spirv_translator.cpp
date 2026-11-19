@@ -585,6 +585,37 @@ void SpirvShaderTranslator::StartTranslation() {
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffers_shared_memory_);
     }
+    if (IsSpirvVertexShader() && (GetSpirvShaderModification().value & kFh1ReplayVertex)) {
+      const auto storage_class = features_.spirv_version >= spv::Spv_1_3
+                                     ? spv::StorageClassStorageBuffer
+                                     : spv::StorageClassUniform;
+      id_vector_temp_.assign(1, builder_->makeRuntimeArray(type_uint_));
+      builder_->addDecoration(id_vector_temp_[0], spv::DecorationArrayStride, sizeof(uint32_t));
+      const auto buffer_type = builder_->makeStructType(id_vector_temp_, "Fh1ReplayVertex");
+      builder_->addMemberDecoration(buffer_type, 0, spv::DecorationOffset, 0);
+      builder_->addMemberDecoration(buffer_type, 0, spv::DecorationNonWritable);
+      builder_->addDecoration(buffer_type, storage_class == spv::StorageClassStorageBuffer
+                                               ? spv::DecorationBlock
+                                               : spv::DecorationBufferBlock);
+      fh1_replay_vertex_buffer_ =
+          builder_->createVariable(spv::NoPrecision, storage_class, buffer_type, "fh1_vertex_copy");
+      builder_->addDecoration(fh1_replay_vertex_buffer_, spv::DecorationDescriptorSet,
+                              kDescriptorSetSharedMemoryAndEdram);
+      builder_->addDecoration(fh1_replay_vertex_buffer_, spv::DecorationBinding,
+                              kFh1ReplayVertexBinding);
+
+      id_vector_temp_.assign(2, type_uint_);
+      const auto window_type = builder_->makeStructType(id_vector_temp_, "Fh1ReplayVertexWindow");
+      builder_->addMemberDecoration(window_type, 0, spv::DecorationOffset, 0);
+      builder_->addMemberDecoration(window_type, 1, spv::DecorationOffset, sizeof(uint32_t));
+      builder_->addDecoration(window_type, spv::DecorationBlock);
+      fh1_replay_vertex_window_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassPushConstant, window_type, "fh1_vertex_window");
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(fh1_replay_vertex_buffer_);
+        main_interface_.push_back(fh1_replay_vertex_window_);
+      }
+    }
   }
 
   if (is_vertex_shader()) {
@@ -4374,6 +4405,36 @@ spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian)
       builder_->makeUintConstant(static_cast<unsigned int>(xenos::Endian128::k8in32)), endian);
 
   return EndianSwap32Uint(value, endian);
+}
+
+spv::Id SpirvShaderTranslator::LoadVertexFetchUint32(spv::Id address_dwords_int) {
+  if (!IsSpirvVertexShader() || !(GetSpirvShaderModification().value & kFh1ReplayVertex)) {
+    return LoadUint32FromSharedMemory(address_dwords_int);
+  }
+  id_vector_temp_.assign(1, const_int_0_);
+  const auto base = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassPushConstant, fh1_replay_vertex_window_,
+                                  id_vector_temp_), spv::NoPrecision);
+  id_vector_temp_[0] = builder_->makeIntConstant(1);
+  const auto count = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassPushConstant, fh1_replay_vertex_window_,
+                                  id_vector_temp_), spv::NoPrecision);
+  const auto address = builder_->createUnaryOp(spv::OpBitcast, type_uint_, address_dwords_int);
+  const auto relative = builder_->createBinOp(spv::OpISub, type_uint_, address, base);
+  const auto in_window = builder_->createBinOp(spv::OpULessThan, type_bool_, relative, count);
+
+  SpirvBuilder::IfBuilder window(in_window, spv::SelectionControlDontFlattenMask, *builder_);
+  id_vector_temp_.assign({const_int_0_, relative});
+  const auto owned = builder_->createLoad(
+      builder_->createAccessChain(features_.spirv_version >= spv::Spv_1_3
+                                      ? spv::StorageClassStorageBuffer
+                                      : spv::StorageClassUniform,
+                                  fh1_replay_vertex_buffer_, id_vector_temp_),
+      spv::NoPrecision);
+  window.makeBeginElse();
+  const auto stock = LoadUint32FromSharedMemory(address_dwords_int);
+  window.makeEndIf();
+  return window.createMergePhi(owned, stock);
 }
 
 spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords_int) {

@@ -1909,6 +1909,13 @@ bool VulkanCommandProcessor::SetupContext() {
   // Shared memory and EDRAM descriptor set layout.
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  const char* replay_audit = std::getenv("FH1_M4_BINDING_AUDIT");
+  if (replay_audit && std::strcmp(replay_audit, "bind-vertex") == 0 &&
+      !edram_fragment_shader_interlock && shared_memory_binding_count < 4 &&
+      shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers) {
+    primitive_processor_->InitializeReplayVertexBuffer();
+  }
+  const VkBuffer replay_vertex_buffer = primitive_processor_->replay_vertex_buffer();
   VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[2];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
@@ -1937,6 +1944,12 @@ bool VulkanCommandProcessor::SetupContext() {
   } else {
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
   }
+  if (replay_vertex_buffer != VK_NULL_HANDLE) {
+    shared_memory_and_edram_descriptor_set_layout_bindings[1] = {
+        SpirvShaderTranslator::kFh1ReplayVertexBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+        VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    ++shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount;
+  }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1953,7 +1966,8 @@ bool VulkanCommandProcessor::SetupContext() {
   VkDescriptorPoolSize descriptor_pool_sizes[1];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
-      shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
+      shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock) +
+      uint32_t(replay_vertex_buffer != VK_NULL_HANDLE);
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
@@ -2021,7 +2035,17 @@ bool VulkanCommandProcessor::SetupContext() {
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
   }
-  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
+  const VkDescriptorBufferInfo replay_vertex_info{
+      replay_vertex_buffer, 0, SpirvShaderTranslator::kFh1ReplayVertexCapacity};
+  if (replay_vertex_buffer != VK_NULL_HANDLE) {
+    write_descriptor_sets[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+                                shared_memory_and_edram_descriptor_set_,
+                                SpirvShaderTranslator::kFh1ReplayVertexBinding, 0, 1,
+                                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &replay_vertex_info,
+                                nullptr};
+  }
+  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock) +
+                                         uint32_t(replay_vertex_buffer != VK_NULL_HANDLE),
                              write_descriptor_sets, 0, nullptr);
 
   // Swap objects.
@@ -6593,8 +6617,10 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
   pipeline_layout_create_info.flags = 0;
   pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(descriptor_set_layouts));
   pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
-  pipeline_layout_create_info.pushConstantRangeCount = 0;
-  pipeline_layout_create_info.pPushConstantRanges = nullptr;
+  const bool replay_vertex = primitive_processor_->replay_vertex_buffer() != VK_NULL_HANDLE;
+  const VkPushConstantRange replay_vertex_window{VK_SHADER_STAGE_VERTEX_BIT, 0, 2 * sizeof(uint32_t)};
+  pipeline_layout_create_info.pushConstantRangeCount = uint32_t(replay_vertex);
+  pipeline_layout_create_info.pPushConstantRanges = replay_vertex ? &replay_vertex_window : nullptr;
   VkPipelineLayout pipeline_layout;
   if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr, &pipeline_layout) !=
       VK_SUCCESS) {
@@ -7147,6 +7173,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  std::array<uint32_t, 2> replay_vertex_window = {};
+  auto select_stock_vertex = [&]() {
+    replay_vertex_window = {};
+    vertex_shader_modification.value &= ~SpirvShaderTranslator::kFh1ReplayVertex;
+    vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+        vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+    return pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+                                                     pixel_shader_translation);
+  };
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -7248,6 +7283,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                              : SpirvShaderTranslator::Modification(0);
     VulkanPipelineCache::ApplyFh1DirtSeamModification(pixel_shader, vertex_shader_modification,
                                                       pixel_shader_modification);
+    replay_vertex_window = {};
+    if (primitive_processor_->replay_vertex_buffer() != VK_NULL_HANDLE &&
+        host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
+        !memexport_writes_possible && Fh1ReplayDrawSelected()) {
+      const auto& fetch_map = vertex_shader->constant_register_map().vertex_fetch_bitmap;
+      uint32_t fetch_index = UINT32_MAX;
+      for (uint32_t i = 0; i < rex::countof(fetch_map); ++i) {
+        if (!fetch_map[i]) continue;
+        if (fetch_index != UINT32_MAX || (fetch_map[i] & (fetch_map[i] - 1))) {
+          fetch_index = UINT32_MAX;
+          break;
+        }
+        uint32_t bit;
+        rex::bit_scan_forward(fetch_map[i], &bit);
+        fetch_index = i * 32 + bit;
+      }
+      if (fetch_index != UINT32_MAX) {
+        const auto fetch = regs.GetVertexFetch(fetch_index);
+        const uint32_t max_dwords = SharedMemory::kBufferSize / sizeof(uint32_t);
+        if (fetch.type == xenos::FetchConstantType::kVertex && fetch.size &&
+            fetch.size <= SpirvShaderTranslator::kFh1ReplayVertexCapacity / sizeof(uint32_t) &&
+            fetch.address < max_dwords && fetch.size <= max_dwords - fetch.address) {
+          replay_vertex_window = {fetch.address, fetch.size};
+          vertex_shader_modification.value |= SpirvShaderTranslator::kFh1ReplayVertex;
+        }
+      }
+    }
 
     // Translate the shaders now to obtain the sampler bindings.
     vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
@@ -7257,7 +7319,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                      : nullptr;
     if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
-                                                  pixel_shader_translation)) {
+                                                  pixel_shader_translation) &&
+        (!replay_vertex_window[1] || !select_stock_vertex())) {
       return draw_fail("shader_translation");
     }
 
@@ -7462,20 +7525,31 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
-  VkPipeline pipeline;
+  VkPipeline pipeline = VK_NULL_HANDLE;
   void* pipeline_handle = nullptr;
-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
-                                          primitive_processing_result, normalized_depth_control,
-                                          normalized_color_mask,
-                                          render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
-    return draw_fail("configure_pipeline");
-  }
   bool pipeline_is_placeholder = false;
-  // Reload the current handle state to observe async hot-swap completions that
-  // may happen between pipeline configuration and binding.
-  pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
-                                                &pipeline_is_placeholder);
+  auto configure_pipeline = [&]() {
+    if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+                                            primitive_processing_result, normalized_depth_control,
+                                            normalized_color_mask,
+                                            render_target_cache_->last_update_render_pass_key(),
+                                            pipeline, pipeline_layout_provider, &pipeline_handle)) {
+      return false;
+    }
+    // Observe hot-swap completion between configuration and binding.
+    pipeline_cache_->GetPipelineAndLayoutByHandle(
+        pipeline_handle, pipeline, pipeline_layout_provider, &pipeline_is_placeholder);
+    return true;
+  };
+  bool pipeline_configured = configure_pipeline();
+  if (replay_vertex_window[1] &&
+      (!pipeline_configured || pipeline_is_placeholder || pipeline == VK_NULL_HANDLE ||
+       pipeline_layout_provider == nullptr)) {
+    REXGPU_INFO("M4 vertex bind audit: frame={} submission={} stock-pipeline-fallback",
+                GetCurrentFrame(), GetCurrentSubmission());
+    pipeline_configured = select_stock_vertex() && configure_pipeline();
+  }
+  if (!pipeline_configured) return draw_fail("configure_pipeline");
   if (pipeline_is_placeholder && REXCVAR_GET(async_shader_compilation) &&
       REXCVAR_GET(sync_pipeline_creation)) {
     // A render that is made once (a car's picture) cannot lose this draw: wait for the
@@ -7785,6 +7859,29 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                         std::make_pair(0u, SharedMemory::kBufferSize));
   } else {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  }
+
+  if (replay_vertex_window[1]) {
+    const VkBuffer replay_vertex = primitive_processor_->replay_vertex_buffer();
+    const VkDeviceSize size = VkDeviceSize(replay_vertex_window[1]) * sizeof(uint32_t);
+    EndRenderPass();
+    PushBufferMemoryBarrier(replay_vertex, 0, size,
+                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT);
+    SubmitBarriers(true);
+    const VkBufferCopy region{VkDeviceSize(replay_vertex_window[0]) * sizeof(uint32_t), 0, size};
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), replay_vertex, 1, &region);
+    PushBufferMemoryBarrier(replay_vertex, 0, size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT);
+    deferred_command_buffer_.CmdVkPushConstants(
+        current_guest_graphics_pipeline_layout_->GetPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT,
+        0, sizeof(replay_vertex_window), replay_vertex_window.data());
+    REXGPU_INFO("M4 vertex bind audit: frame={} submission={} address={:08X} bytes={} vs={:016X}",
+                GetCurrentFrame(), GetCurrentSubmission(), region.srcOffset, size,
+                vertex_shader->ucode_data_hash());
   }
 
   // FH1 (#640): the draw's render pass (and pixel shader) as its zone.

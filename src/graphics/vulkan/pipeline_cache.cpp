@@ -1941,7 +1941,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
   // built the ones the lookahead found; wait for those too.
   finish_ahead(nullptr);
 
-  if (pipeline_storage_file_) {
+  // The replay vertex variant requires a private descriptor and push constant range.
+  if (pipeline_storage_file_ &&
+      !(description.vertex_shader_modification & SpirvShaderTranslator::kFh1ReplayVertex)) {
     assert_not_null(storage_write_thread_);
     pipeline_storage_file_flush_needed_ = true;
     {
@@ -2057,7 +2059,8 @@ void VulkanPipelineCache::Fh1StoreDrawnAhead(
   // uses it (a lookahead that guessed wrong).
   pipeline.second.fh1_ahead = false;
   ++fh1_pipeline_lookahead::stats.drawn_ahead;
-  if (!pipeline_storage_file_) {
+  if (!pipeline_storage_file_ || (pipeline.first.vertex_shader_modification &
+                                  SpirvShaderTranslator::kFh1ReplayVertex)) {
     return;
   }
   assert_not_null(storage_write_thread_);

@@ -52,6 +52,8 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   // caller supplies the final bytes for the index format it will bind.
   std::pair<VkBuffer, VkDeviceSize> StageCapturedIndex(std::span<const std::byte> bytes,
                                                       uint32_t width);
+  void InitializeReplayVertexBuffer();
+  VkBuffer replay_vertex_buffer() const { return replay_vertex_buffer_; }
 
  protected:
   bool InitializeBuiltinIndexBuffer(size_t size_bytes,
@@ -80,6 +82,8 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> frame_index_buffer_pool_;
   // Indexed by the backend handles.
   std::deque<std::pair<VkBuffer, VkDeviceSize>> frame_index_buffers_;
+  VkBuffer replay_vertex_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory replay_vertex_memory_ = VK_NULL_HANDLE;
 };
 
 }  // namespace rex::graphics::vulkan

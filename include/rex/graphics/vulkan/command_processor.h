@@ -358,6 +358,7 @@ class VulkanCommandProcessor : public CommandProcessor {
  private:
   std::pair<VkBuffer, VkDeviceSize> TakeFh1IndexAudit(uint32_t address, uint32_t count,
                                                       uint32_t width, uint32_t endian);
+  bool Fh1ReplayDrawSelected() const;
   // GetVulkanDevice's pointer, set in the constructor (null while the members are made).
   ui::vulkan::VulkanDevice* fh1_vulkan_device_ = nullptr;
 

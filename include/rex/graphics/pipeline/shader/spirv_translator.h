@@ -27,6 +27,9 @@ namespace rex::graphics {
 
 class SpirvShaderTranslator : public ShaderTranslator {
  public:
+  static constexpr uint64_t kFh1ReplayVertex = UINT64_C(1) << 62;
+  static constexpr uint32_t kFh1ReplayVertexBinding = 2;
+  static constexpr uint32_t kFh1ReplayVertexCapacity = 64 * 1024;
   union Modification {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
@@ -720,6 +723,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id EndianSwap128Uint4(spv::Id value, spv::Id endian);
 
   spv::Id LoadUint32FromSharedMemory(spv::Id address_dwords_int);
+  spv::Id LoadVertexFetchUint32(spv::Id address_dwords_int);
   // If `replace_mask` is provided, the bits specified in the mask will be
   // replaced with those from the value via OpAtomicAnd/Or.
   // Bits of `value` not in `replace_mask` will be ignored.
@@ -1155,6 +1159,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // the exec-level predicate value, and can't merge two execs with the same
   // predicate condition anymore.
   bool cf_exec_predicate_written_;
+  spv::Id fh1_replay_vertex_buffer_;
+  spv::Id fh1_replay_vertex_window_;
 };
 
 }  // namespace rex::graphics

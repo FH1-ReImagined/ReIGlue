@@ -315,7 +315,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
     fh1_lists_ = new Fh1Lists;
 #if REX_PLATFORM_WIN32
     if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT")) {
-      fh1_lists_->audit_bind = std::strcmp(e, "bind") == 0;
+      fh1_lists_->audit_bind =
+          std::strcmp(e, "bind") == 0 || std::strcmp(e, "bind-vertex") == 0;
       fh1_lists_->audit_upload = fh1_lists_->audit_bind || std::strcmp(e, "upload") == 0;
       fh1_lists_->audit_capture = fh1_lists_->audit_upload || std::strcmp(e, "capture") == 0;
       fh1_lists_->audit_binding = fh1_lists_->audit_capture || std::strcmp(e, "1") == 0;
