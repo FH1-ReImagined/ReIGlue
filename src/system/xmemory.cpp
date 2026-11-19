@@ -539,7 +539,9 @@ bool Memory::WithReplayPhysicalCapture(bool (*capture)(void*, const ReplayPhysic
   if (!capture || rex::memory::page_size() != 4096) return false;
   return detail::WithReplayCaptureLocks(detail::physical_replay_gate,
                                        rex::thread::global_critical_region::mutex(), [&] {
-    return virtual_membase_ && physical_membase_ && capture(context, ReplayPhysicalCapture(*this));
+    if (!virtual_membase_ || !physical_membase_) return false;
+    detail::FrozenReplayPages pages;
+    return capture(context, ReplayPhysicalCapture(*this, pages));
   });
 #else
   (void)capture;
@@ -589,7 +591,7 @@ bool Memory::ReplayPhysicalCapture::Copy(uint32_t physical, uint8_t* destination
     aliases[count++] = memory_.views_.all_views[i] + (first - begin);
   }
   if (count != aliases.size() || aliases.back() != memory_.physical_membase_ + page) return false;
-  return detail::CopyFrozenReplayAliases(aliases, span, offset, {destination, size});
+  return pages_.Copy(aliases, span, offset, {destination, size});
 #else
   (void)physical;
   (void)destination;

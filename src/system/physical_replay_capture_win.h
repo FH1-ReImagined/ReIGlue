@@ -7,18 +7,37 @@
 #include <cstring>
 #include <exception>
 #include <span>
+#include <vector>
 
 namespace rex::memory::detail {
 
-// The caller serializes allocation and mapping changes and supplies every
-// writable alias of the selected physical range.
-template <typename Read>
-bool WithFrozenReplayAliases(const std::array<uint8_t*, 4>& pages, size_t span_bytes, Read read) {
+// Construct and destroy under the allocator lock. All changed aliases stay
+// frozen until the transaction ends, even after their bytes were copied.
+class FrozenReplayPages {
+ public:
+  FrozenReplayPages() = default;
+  FrozenReplayPages(const FrozenReplayPages&) = delete;
+  FrozenReplayPages& operator=(const FrozenReplayPages&) = delete;
+  ~FrozenReplayPages();
+  bool Copy(const std::array<uint8_t*, 4>& pages, size_t span_bytes, size_t offset,
+            std::span<uint8_t> destination);
+
+ private:
+  struct Restore {
+    uint8_t* page = nullptr;
+    size_t bytes = 0;
+    DWORD protection = 0;
+  };
+  bool Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes);
+  std::vector<Restore> restore_;
+};
+
+inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size_t span_bytes) {
   constexpr size_t kPageSize = 4096;
   if (!span_bytes || span_bytes % kPageSize) return false;
-  static_assert(noexcept(read()));
 
   std::array<DWORD, 4> protect{};
+  size_t writable = 0;
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto start = reinterpret_cast<uintptr_t>(pages[i]);
     if (!start || start % kPageSize || span_bytes > UINTPTR_MAX - start) return false;
@@ -38,37 +57,35 @@ bool WithFrozenReplayAliases(const std::array<uint8_t*, 4>& pages, size_t span_b
       return false;
     }
     protect[i] = info.Protect;
+    writable += info.Protect == PAGE_READWRITE;
   }
 
   // Each span has one uniform protection, so protect it with one system
   // call. Remember exactly the regions this operation changed.
-  std::array<DWORD, 4> restore{};
-  bool frozen = true;
+  size_t next = restore_.size();
+  restore_.resize(next + writable);
   for (size_t i = 0; i < pages.size(); ++i) {
     if (protect[i] == PAGE_READONLY) continue;
-    if (!VirtualProtect(pages[i], span_bytes, PAGE_READONLY, &restore[i])) {
-      restore[i] = 0;
-      frozen = false;
-      break;
-    }
-    if (restore[i] != protect[i]) {
-      frozen = false;
-      break;
-    }
-  }
-  if (frozen) read();
-  for (size_t i = pages.size(); i-- > 0;) {
-    if (!restore[i]) continue;
     DWORD previous = 0;
-    if (!VirtualProtect(pages[i], span_bytes, restore[i], &previous) ||
+    if (!VirtualProtect(pages[i], span_bytes, PAGE_READONLY, &previous)) return false;
+    restore_[next++] = {pages[i], span_bytes, previous};
+    if (previous != protect[i]) return false;
+  }
+  return true;
+}
+
+inline FrozenReplayPages::~FrozenReplayPages() {
+  for (auto it = restore_.rbegin(); it != restore_.rend(); ++it) {
+    if (!it->page) continue;
+    DWORD previous = 0;
+    if (!VirtualProtect(it->page, it->bytes, it->protection, &previous) ||
         previous != PAGE_READONLY) {
       std::terminate();
     }
   }
-  return frozen;
 }
 
-inline bool CopyFrozenReplayAliases(const std::array<uint8_t*, 4>& pages, size_t span_bytes,
+inline bool FrozenReplayPages::Copy(const std::array<uint8_t*, 4>& pages, size_t span_bytes,
                                     size_t offset, std::span<uint8_t> destination) {
   if (offset >= 4096 || offset >= span_bytes || destination.empty() ||
       destination.size() > span_bytes - offset) {
@@ -83,9 +100,9 @@ inline bool CopyFrozenReplayAliases(const std::array<uint8_t*, 4>& pages, size_t
       return false;
     }
   }
-  return WithFrozenReplayAliases(pages, span_bytes, [&]() noexcept {
-    std::memcpy(destination.data(), pages.back() + offset, destination.size());
-  });
+  if (!Freeze(pages, span_bytes)) return false;
+  std::memcpy(destination.data(), pages.back() + offset, destination.size());
+  return true;
 }
 
 }  // namespace rex::memory::detail

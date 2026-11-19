@@ -57,6 +57,7 @@ class ByteStream;
 #endif
 
 namespace rex::memory::detail {
+class FrozenReplayPages;
 
 /// Compensates for a 0xE0 physical view mapped short of its 4KB offset. The
 /// 0xE0 heap starts 0x1000 bytes into physical memory; where the backing file
@@ -450,8 +451,10 @@ class Memory {
 
    private:
     friend class Memory;
-    explicit ReplayPhysicalCapture(Memory& memory) : memory_(memory) {}
+    ReplayPhysicalCapture(Memory& memory, detail::FrozenReplayPages& pages)
+        : memory_(memory), pages_(pages) {}
     Memory& memory_;
+    detail::FrozenReplayPages& pages_;
   };
 
   // Keep the allocator and cooperating runtime writers out across all
