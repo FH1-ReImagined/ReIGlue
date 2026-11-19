@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Windows.h>
+#include <Psapi.h>
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,10 @@
 #include <exception>
 #include <span>
 #include <vector>
+
+namespace rex::memory {
+class Memory;
+}
 
 namespace rex::memory::detail {
 
@@ -26,6 +31,11 @@ class FrozenReplayPages {
                std::span<const uint8_t> expected);
 
  private:
+  friend class ::rex::memory::Memory;
+  // Memory derives these aliases from its original file-backed views.
+  explicit FrozenReplayPages(bool query_resident_pages)
+      : query_resident_pages_(query_resident_pages) {}
+
   struct Restore {
     uint8_t* page;
     size_t bytes;
@@ -43,7 +53,9 @@ class FrozenReplayPages {
     Span span;
     DWORD protection;
   };
-  bool Observe(uintptr_t page, Region& region);
+  bool Observe(uintptr_t page, uintptr_t limit, Region& region);
+  bool ObserveResident(uintptr_t page, uintptr_t limit, Region& region) const;
+  bool query_resident_pages_ = false;
   std::vector<Restore> restore_;
   std::vector<Span> sealed_;
   // Cache only observations made in this locked transaction. A sealed
@@ -53,7 +65,38 @@ class FrozenReplayPages {
   bool failed_ = false;
 };
 
-inline bool FrozenReplayPages::Observe(uintptr_t page, Region& region) {
+inline bool FrozenReplayPages::ObserveResident(uintptr_t page, uintptr_t limit,
+                                                Region& region) const {
+  constexpr size_t kPageSize = 4096;
+  // The existing capture limit is 256 KiB, which can straddle 65 pages.
+  std::array<PSAPI_WORKING_SET_EX_INFORMATION, 65> pages{};
+  const size_t count = (limit - page) / kPageSize;
+  if (!count || count > pages.size()) return false;
+  for (size_t i = 0; i < count; ++i) {
+    pages[i].VirtualAddress = reinterpret_cast<void*>(page + i * kPageSize);
+  }
+  if (!K32QueryWorkingSetEx(GetCurrentProcess(), pages.data(), DWORD(count * sizeof(pages[0]))))
+    return false;
+
+  // The guard closes permissions and mapping changes. Working-set data
+  // supplies protection only for valid resident entries in those known views.
+  const auto first = pages[0].VirtualAttributes;
+  if (!first.Valid || first.Bad || first.LargePage ||
+      (first.Win32Protection != PAGE_READONLY && first.Win32Protection != PAGE_READWRITE))
+    return false;
+  size_t same = 1;
+  while (same < count) {
+    const auto flags = pages[same].VirtualAttributes;
+    if (!flags.Valid || flags.Bad || flags.LargePage ||
+        flags.Win32Protection != first.Win32Protection)
+      break;
+    ++same;
+  }
+  region = {{page, page + same * kPageSize}, DWORD(first.Win32Protection)};
+  return true;
+}
+
+inline bool FrozenReplayPages::Observe(uintptr_t page, uintptr_t limit, Region& region) {
   for (size_t i = 0; i < observed_count_; ++i) {
     const auto& observed = observed_[i];
     if (page >= observed.span.start && page < observed.span.end) {
@@ -62,6 +105,10 @@ inline bool FrozenReplayPages::Observe(uintptr_t page, Region& region) {
     }
   }
 
+  if (query_resident_pages_ && ObserveResident(page, limit, region)) {
+    if (observed_count_ < observed_.size()) observed_[observed_count_++] = region;
+    return true;
+  }
   MEMORY_BASIC_INFORMATION info{};
   if (!VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) ||
       info.State != MEM_COMMIT || info.Type != MEM_MAPPED ||
@@ -103,7 +150,7 @@ inline bool FrozenReplayPages::Freeze(const std::array<uint8_t*, 4>& pages, size
       }
 
       Region region;
-      if (!Observe(base, region)) {
+      if (!Observe(base, next_sealed, region)) {
         restore_.resize(first_restore);
         return false;
       }

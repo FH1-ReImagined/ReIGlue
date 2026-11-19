@@ -13,6 +13,7 @@
 #include <atomic>
 #include <bit>
 #include <cstring>
+#include <cstdlib>
 #include <utility>
 
 #if REX_PLATFORM_MAC
@@ -553,10 +554,16 @@ bool Memory::WithReplayPhysicalCapture(bool (*capture)(void*, const ReplayPhysic
                                        void* context) {
 #if REX_PLATFORM_WIN32
   if (!capture || rex::memory::page_size() != 4096) return false;
+  static const bool use_resident = [] {
+    const char* value = std::getenv("FH1_M4_CAPTURE_WORKING_SET");
+    return value && std::strcmp(value, "1") == 0;
+  }();
   return detail::WithReplayCaptureLocks(detail::physical_replay_gate,
                                        rex::thread::global_critical_region::mutex(), [&] {
     if (!virtual_membase_ || !physical_membase_) return false;
-    detail::FrozenReplayPages pages;
+    // Access derives each alias from the immutable file-view table under
+    // this lock, and checks the exact committed canonical allocation.
+    detail::FrozenReplayPages pages(use_resident);
     return capture(context, ReplayPhysicalCapture(*this, pages));
   });
 #else
