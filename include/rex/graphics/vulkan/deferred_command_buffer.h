@@ -50,6 +50,15 @@ class DeferredCommandBuffer {
         WriteCommand(Command::kFh1ReplayCopyImage, sizeof(ArgsFh1ReplayCopyImage)));
     args = {copy, src, dst, region};
   }
+  void CmdFh1ReplayReadImage(VkImage src, VkBuffer dst, const VkBufferImageCopy& region) {
+    auto& args = *reinterpret_cast<ArgsFh1ReplayReadImage*>(
+        WriteCommand(Command::kFh1ReplayReadImage, sizeof(ArgsFh1ReplayReadImage)));
+    args = {src, dst, region};
+  }
+  void CmdFh1ReplayParityCheckpoint(const char* label) {
+    *static_cast<const char**>(WriteCommand(Command::kFh1ReplayParityCheckpoint, sizeof(label))) =
+        label;
+  }
   // A square cube view is populated from an integer-stride 2D-array resolve.
   void CmdFh1NativeCubeBlit(VkImage src, VkImage dst, const VkImageBlit& region) {
     auto& args = *reinterpret_cast<ArgsFh1NativeCubeBlit*>(
@@ -540,6 +549,8 @@ class DeferredCommandBuffer {
     kFh1BeginConditionalRendering,
     kFh1EndConditionalRendering,
     kFh1ReplayCopyImage,
+    kFh1ReplayReadImage,
+    kFh1ReplayParityCheckpoint,
   };
 
   struct CommandHeader {
@@ -559,6 +570,11 @@ class DeferredCommandBuffer {
     PFN_vkCmdCopyImage copy;
     VkImage src, dst;
     VkImageCopy region;
+  };
+  struct ArgsFh1ReplayReadImage {
+    VkImage src;
+    VkBuffer dst;
+    VkBufferImageCopy region;
   };
   static constexpr size_t kCommandHeaderSizeElements =
       (sizeof(CommandHeader) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);

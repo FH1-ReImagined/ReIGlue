@@ -126,7 +126,9 @@ struct CommandProcessor::Fh1Lists {
 #if REX_HAS_VULKAN
   vulkan::VulkanCommandProcessor* index_audit_cp = nullptr;
   bool timed_replay = false;
+  bool timed_pixel_parity = false;
   bool refused_replay_control = false;
+  uint32_t pixel_parity_sampling_passes = 0;
   std::shared_ptr<const fl::ReplayPlan> timed_plan;
 #endif
   uint32_t audit_attempts = 0;
@@ -320,6 +322,9 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
     if (const char* e = std::getenv("FH1_M4_BINDING_AUDIT")) {
 #if REX_HAS_VULKAN
       fh1_lists_->timed_replay = std::strcmp(e, "timed-replay") == 0;
+      const char* parity = std::getenv("FH1_M4_REPLAY_PIXEL_PARITY");
+      fh1_lists_->timed_pixel_parity =
+          fh1_lists_->timed_replay && parity && std::strcmp(parity, "1") == 0;
 #endif
       fh1_lists_->audit_bind =
           std::strcmp(e, "bind") == 0 || std::strcmp(e, "bind-vertex") == 0 ||
@@ -925,7 +930,16 @@ void CommandProcessor::Fh1ListEnd() {
 
 void CommandProcessor::Fh1ListsSwap() {
   auto& s = *fh1_lists_;
-  if (++s.frames % 600 == 0)
+  ++s.frames;
+#if REX_PLATFORM_WIN32 && REX_HAS_VULKAN
+  if (s.timed_pixel_parity && s.audit_attempts && s.frames % 240 == 0 &&
+      s.pixel_parity_sampling_passes < 7) {
+    s.audit_attempts = 0;
+    s.audited_lifetimes.fill(0);
+    ++s.pixel_parity_sampling_passes;
+  }
+#endif
+  if (s.frames % 600 == 0)
     LogLists(s, "so far", s.frames);
 }
 

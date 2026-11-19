@@ -204,6 +204,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                          uint32_t* color_attachment_count_out,
                                          VkRenderingAttachmentInfo* depth_attachment,
                                          VkRenderingAttachmentInfo* stencil_attachment) const;
+  struct ReplayParityTarget {
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags aspects = 0;
+    VkPipelineStageFlags stages = 0;
+    VkAccessFlags access = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  };
+  static bool ReplayParityEnabled();
+  bool GetReplayParityTargets(std::array<ReplayParityTarget, 2>& targets) const;
 
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
@@ -413,6 +423,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     ~VulkanRenderTarget();
 
     VkImage image() const { return image_; }
+    bool replay_parity_transfer = false;
 
     VkImageView view_depth_color() const { return view_depth_color_; }
     VkImageView view_depth_stencil() const { return view_depth_stencil_; }

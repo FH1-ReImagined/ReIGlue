@@ -643,6 +643,17 @@ class VulkanCommandProcessor : public CommandProcessor {
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  struct ReplayPixelComparison {
+    std::array<VulkanRenderTargetCache::ReplayParityTarget, 2> targets{};
+    VulkanPrimitiveProcessor::ReplayPixelReadback* readback = nullptr;
+  };
+  ReplayPixelComparison BeginFh1ReplayPixelComparison(
+      const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+      const std::array<uint32_t, 2>& vertex_window,
+      const PrimitiveProcessor::ProcessingResult& indices);
+  void ReadFh1ReplayPixels(ReplayPixelComparison& comparison, uint32_t arm,
+                          const std::array<VkImage, 2>& images);
+  void EndFh1ReplayPixelComparison(ReplayPixelComparison& comparison);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,

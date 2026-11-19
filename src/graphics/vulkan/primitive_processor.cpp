@@ -241,6 +241,7 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  LandReplayPixelReadbacks(command_processor_.GetCompletedSubmission(), true);
 
   frame_index_buffers_.clear();
   frame_index_buffer_pool_.reset();
@@ -274,6 +275,7 @@ void VulkanPrimitiveProcessor::InitializeReplayIndexBuffer() {
 }
 
 void VulkanPrimitiveProcessor::CompletedSubmissionUpdated() {
+  LandReplayPixelReadbacks(command_processor_.GetCompletedSubmission());
   if (builtin_index_buffer_upload_ != VK_NULL_HANDLE &&
       command_processor_.GetCompletedSubmission() >= builtin_index_buffer_upload_submission_) {
     const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -283,6 +285,101 @@ void VulkanPrimitiveProcessor::CompletedSubmissionUpdated() {
                                            builtin_index_buffer_upload_);
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
                                            builtin_index_buffer_upload_memory_);
+  }
+}
+
+VulkanPrimitiveProcessor::ReplayPixelReadback*
+VulkanPrimitiveProcessor::AllocateReplayPixelReadback(VkRect2D rect, VkFormat depth_format,
+                                                       VkFormat color_format) {
+  ReplayPixelReadback sample;
+  const VkDeviceSize pixels = VkDeviceSize(rect.extent.width) * rect.extent.height;
+  const bool color = color_format != VK_FORMAT_UNDEFINED;
+  if (!pixels || pixels > 1280 * 2048 || replay_pixel_samples_[color] >= 4) return nullptr;
+  auto add = [&](VkImageAspectFlags aspect, uint32_t bytes, bool d24 = false) {
+    sample.planes[sample.plane_count++] = {aspect, bytes, sample.stride, d24};
+    sample.stride = (sample.stride + pixels * bytes + 7) & ~VkDeviceSize(7);
+  };
+  if (depth_format != VK_FORMAT_UNDEFINED) {
+    if (depth_format != VK_FORMAT_D24_UNORM_S8_UINT &&
+        depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return nullptr;
+    add(VK_IMAGE_ASPECT_DEPTH_BIT, 4, depth_format == VK_FORMAT_D24_UNORM_S8_UINT);
+    add(VK_IMAGE_ASPECT_STENCIL_BIT, 1);
+  }
+  if (color) {
+    switch (color_format) {
+      case VK_FORMAT_R8G8B8A8_UNORM:
+      case VK_FORMAT_R8G8B8A8_SRGB:
+      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        add(VK_IMAGE_ASPECT_COLOR_BIT, 4);
+        break;
+      case VK_FORMAT_R16G16B16A16_UNORM:
+      case VK_FORMAT_R16G16B16A16_SNORM:
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+        add(VK_IMAGE_ASPECT_COLOR_BIT, 8);
+        break;
+      default:
+        return nullptr;
+    }
+  }
+  assert_not_zero(sample.plane_count);
+  for (auto& slot : replay_pixel_readbacks_) {
+    if (slot.buffer) continue;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            command_processor_.GetVulkanDevice(), sample.stride * 3,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, ui::vulkan::util::MemoryPurpose::kReadback,
+            sample.buffer, sample.memory, &sample.memory_type)) return nullptr;
+    sample.submission = command_processor_.GetCurrentSubmission();
+    sample.rect = rect;
+    slot = sample;
+    ++replay_pixel_samples_[color];
+    return &slot;
+  }
+  return nullptr;
+}
+
+void VulkanPrimitiveProcessor::LandReplayPixelReadbacks(uint64_t completed, bool discard) {
+  if (!replay_pixel_samples_[0] && !replay_pixel_samples_[1]) return;
+  const auto* device = command_processor_.GetVulkanDevice();
+  const auto& dfn = device->functions();
+  for (auto& slot : replay_pixel_readbacks_) {
+    if (!slot.buffer || (!discard && slot.submission > completed)) continue;
+    void* mapped = nullptr;
+    const bool mapped_ok = slot.complete && slot.submission <= completed &&
+        dfn.vkMapMemory(device->device(), slot.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS;
+    bool readable = mapped_ok;
+    if (readable && !(device->memory_types().host_coherent & (1u << slot.memory_type))) {
+      const VkMappedMemoryRange range{
+          VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, slot.memory, 0, VK_WHOLE_SIZE};
+      readable = dfn.vkInvalidateMappedMemoryRanges(device->device(), 1, &range) == VK_SUCCESS;
+    }
+    const auto pixels = size_t(slot.rect.extent.width) * slot.rect.extent.height;
+    for (uint32_t i = 0; i < slot.plane_count; ++i) {
+      const auto& plane = slot.planes[i];
+      size_t changed = 0;
+      size_t mismatch = 0;
+      if (readable) {
+        const auto* before = static_cast<const uint8_t*>(mapped) + plane.offset;
+        const auto* stock = before + slot.stride;
+        const auto* replay = stock + slot.stride;
+        // X8_D24 has an unused high byte in the transferred depth aspect.
+        const uint32_t meaningful = plane.depth24 ? 3 : plane.pixel_bytes;
+        for (size_t pixel = 0; pixel < pixels; ++pixel) {
+          const auto offset = pixel * plane.pixel_bytes;
+          changed += std::memcmp(before + offset, stock + offset, meaningful) != 0;
+          mismatch += std::memcmp(stock + offset, replay + offset, meaningful) != 0;
+        }
+      }
+      REXGPU_INFO("M4 pixel parity: submission={} completed={} aspect={} pixels={} readable={} "
+                  "stock_changed={} replay_mismatch={} x={} y={} w={} h={}",
+                  slot.submission, completed, uint32_t(plane.aspect), pixels, readable, changed,
+                  mismatch, slot.rect.offset.x, slot.rect.offset.y, slot.rect.extent.width,
+                  slot.rect.extent.height);
+    }
+    if (mapped_ok) dfn.vkUnmapMemory(device->device(), slot.memory);
+    dfn.vkDestroyBuffer(device->device(), slot.buffer, nullptr);
+    dfn.vkFreeMemory(device->device(), slot.memory, nullptr);
+    slot = {};
   }
 }
 

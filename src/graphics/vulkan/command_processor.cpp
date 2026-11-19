@@ -7042,6 +7042,242 @@ void VulkanCommandProcessor::Fh1SelectNativeHud(bool native_hud) {
   current_graphics_descriptor_sets_bound_up_to_date_ = 0;
 }
 
+void VulkanCommandProcessor::ReadFh1ReplayPixels(
+    ReplayPixelComparison& comparison, uint32_t arm, const std::array<VkImage, 2>& images) {
+  auto& readback = *comparison.readback;
+  for (uint32_t i = 0; i < readback.plane_count; ++i) {
+    const auto& plane = readback.planes[i];
+    VkBufferImageCopy region = {};
+    region.bufferOffset = readback.stride * arm + plane.offset;
+    region.imageSubresource = {plane.aspect, 0, 0, 1};
+    region.imageOffset = {readback.rect.offset.x, readback.rect.offset.y, 0};
+    region.imageExtent = {readback.rect.extent.width, readback.rect.extent.height, 1};
+    deferred_command_buffer_.CmdFh1ReplayReadImage(
+        images[plane.aspect == VK_IMAGE_ASPECT_COLOR_BIT], readback.buffer, region);
+  }
+}
+
+VulkanCommandProcessor::ReplayPixelComparison VulkanCommandProcessor::BeginFh1ReplayPixelComparison(
+    const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+    const std::array<uint32_t, 2>& vertex_window,
+    const PrimitiveProcessor::ProcessingResult& indices) {
+  ReplayPixelComparison result;
+  if (active_occlusion_query_.valid || !REXCVAR_GET(vulkan_dynamic_rendering) ||
+      !GetVulkanDevice()->properties().dynamicRendering ||
+      !render_target_cache_->GetReplayParityTargets(result.targets)) {
+    const auto key = render_target_cache_->last_update_render_pass_key();
+    REXGPU_INFO("M4 pixel parity skipped: query={} samples={} attachments={} transfer_formats={}",
+                active_occlusion_query_.valid, uint32_t(key.msaa_samples),
+                uint32_t(key.depth_and_color_used), bool(key.color_rts_use_transfer_formats));
+    return {};
+  }
+  if (!primitive_processor_->CanSampleReplayPixels(result.targets[1].image != VK_NULL_HANDLE)) {
+    return {};
+  }
+  const auto extent = render_target_cache_->last_update_framebuffer()->host_extent;
+  const VkRect2D rect = dynamic_scissor_;
+  if (rect.offset.x < 0 || rect.offset.y < 0 || !rect.extent.width || !rect.extent.height ||
+      uint64_t(rect.offset.x) + rect.extent.width > extent.width ||
+      uint64_t(rect.offset.y) + rect.extent.height > extent.height ||
+      uint64_t(extent.width) * extent.height > 1280u * 2048u) return {};
+  const auto* device = GetVulkanDevice();
+  const auto& dfn = device->functions();
+  const auto copy = reinterpret_cast<PFN_vkCmdCopyImage>(
+      device->vulkan_instance()->functions().vkGetDeviceProcAddr(device->device(), "vkCmdCopyImage"));
+  const auto read_image = device->vulkan_instance()->functions().vkGetDeviceProcAddr(
+      device->device(), "vkCmdCopyImageToBuffer");
+  if (!copy || !read_image) return {};
+  const auto submission = GetCurrentSubmission();
+  std::array<VkImage, 2> clones{};
+  std::array<VkImageView, 2> clone_views{};
+  for (uint32_t i = 0; i < result.targets.size(); ++i) {
+    const auto& target = result.targets[i];
+    if (!target.image) continue;
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = target.format;
+    info.extent = {extent.width, extent.height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 (i ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, clones[i], memory)) return {};
+    destroy_images_.emplace_back(submission, clones[i]);
+    destroy_memory_.emplace_back(submission, memory);
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = clones[i];
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = target.format;
+    view.subresourceRange = ui::vulkan::util::InitializeSubresourceRange(target.aspects, 0, 1, 0, 1);
+    if (dfn.vkCreateImageView(device->device(), &view, nullptr, &clone_views[i]) != VK_SUCCESS) return {};
+    destroy_image_views_.emplace_back(submission, clone_views[i]);
+  }
+  result.readback = primitive_processor_->AllocateReplayPixelReadback(
+      rect, result.targets[0].format, result.targets[1].format);
+  if (!result.readback) return {};
+
+  EndRenderPass();
+  std::array<VkRenderingAttachmentInfo, xenos::kMaxColorRenderTargets> color{};
+  VkRenderingAttachmentInfo depth{}, stencil{};
+  uint32_t color_count = 0;
+  render_target_cache_->GetLastUpdateRenderingAttachments(color.data(), &color_count, &depth,
+                                                          &stencil);
+  if (color_count) color[0].imageView = clone_views[1];
+  depth.imageView = stencil.imageView = clone_views[0];
+  VkRenderingInfo rendering{};
+  rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  rendering.renderArea.extent = extent;
+  rendering.layerCount = 1;
+  rendering.colorAttachmentCount = color_count;
+  rendering.pColorAttachments = color_count ? color.data() : nullptr;
+  rendering.pDepthAttachment = clones[0] ? &depth : nullptr;
+  rendering.pStencilAttachment = clones[0] ? &stencil : nullptr;
+
+  // Take has consumed this draw's replay marker. Rebinding therefore builds
+  // exactly the stock texture sets, while the saved replay sets stay alive.
+  std::array<VkDescriptorSet, SpirvShaderTranslator::kDescriptorSetCount> replay_sets;
+  std::copy(std::begin(current_graphics_descriptor_sets_), std::end(current_graphics_descriptor_sets_),
+            replay_sets.begin());
+  const auto replay_values = current_graphics_descriptor_set_values_up_to_date_;
+  const auto replay_bound = current_graphics_descriptor_sets_bound_up_to_date_;
+  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount> replay_offsets{};
+  if (dynamic_uniform_constants_) {
+    for (uint32_t i = 0; i < replay_offsets.size(); ++i) {
+      assert_true(current_constant_buffer_infos_[i].offset <= UINT32_MAX);
+      replay_offsets[i] = uint32_t(current_constant_buffer_infos_[i].offset);
+    }
+  }
+  const bool stock_ready = UpdateBindings(vertex_shader, pixel_shader);
+  const auto layout = current_guest_graphics_pipeline_layout_->GetPipelineLayout();
+  auto restore_replay = [&] {
+    for (uint32_t i = 0; i < replay_sets.size(); ++i) {
+      if ((replay_bound & (1u << i)) && replay_sets[i]) {
+        const bool dynamic = dynamic_uniform_constants_ &&
+                             i == SpirvShaderTranslator::kDescriptorSetConstants;
+        deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+            layout, i, 1, &replay_sets[i], dynamic ? uint32_t(replay_offsets.size()) : 0,
+            dynamic ? replay_offsets.data() : nullptr);
+      }
+    }
+    std::copy(replay_sets.begin(), replay_sets.end(), std::begin(current_graphics_descriptor_sets_));
+    current_graphics_descriptor_set_values_up_to_date_ = replay_values;
+    current_graphics_descriptor_sets_bound_up_to_date_ = replay_bound;
+  };
+  if (!stock_ready) {
+    restore_replay();
+    return {};
+  }
+  constexpr auto src_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  constexpr auto dst_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  constexpr auto read = VK_ACCESS_TRANSFER_READ_BIT;
+  constexpr auto write = VK_ACCESS_TRANSFER_WRITE_BIT;
+  auto change = [&](uint32_t index, VkImage image, VkPipelineStageFlags from,
+                    VkPipelineStageFlags to, VkAccessFlags previous, VkAccessFlags next,
+                    VkImageLayout old_layout, VkImageLayout new_layout) {
+    const auto range = ui::vulkan::util::InitializeSubresourceRange(
+        result.targets[index].aspects, 0, 1, 0, 1);
+    PushImageMemoryBarrier(image, range, from, to, previous, next, old_layout, new_layout);
+  };
+  std::array<VkImage, 2> live{};
+  for (uint32_t i = 0; i < result.targets.size(); ++i) {
+    const auto& target = result.targets[i];
+    live[i] = target.image;
+    if (!target.image) continue;
+    change(i, target.image, target.stages, transfer, target.access, read, target.layout, src_layout);
+    change(i, clones[i], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, transfer, 0, write,
+           VK_IMAGE_LAYOUT_UNDEFINED, dst_layout);
+  }
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("initial attachment barriers");
+  SubmitBarriers(true);
+  ReadFh1ReplayPixels(result, 0, live);
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("initial readback recorded");
+  for (uint32_t i = 0; i < result.readback->plane_count; ++i) {
+    const auto aspect = result.readback->planes[i].aspect;
+    const uint32_t target = aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageCopy copy_region{};
+    copy_region.srcSubresource = {aspect, 0, 0, 1};
+    copy_region.dstSubresource = copy_region.srcSubresource;
+    copy_region.srcOffset = {rect.offset.x, rect.offset.y, 0};
+    copy_region.dstOffset = copy_region.srcOffset;
+    copy_region.extent = {rect.extent.width, rect.extent.height, 1};
+    deferred_command_buffer_.CmdFh1ReplayCopyImage(copy, live[target], clones[target], copy_region);
+  }
+  for (uint32_t i = 0; i < result.targets.size(); ++i) {
+    const auto& target = result.targets[i];
+    if (!target.image) continue;
+    change(i, live[i], transfer, target.stages, read, target.access, src_layout, target.layout);
+    change(i, clones[i], transfer, target.stages, write, target.access, dst_layout, target.layout);
+  }
+  SubmitBarriers(true);
+  if (vertex_window[1]) {
+    const std::array<uint32_t, 2> empty{};
+    deferred_command_buffer_.CmdVkPushConstants(layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                                 sizeof(empty), empty.data());
+  }
+  deferred_command_buffer_.CmdVkBindIndexBuffer(
+      shared_memory_->buffer(), indices.guest_index_base,
+      indices.host_index_format == xenos::IndexFormat::kInt16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("stock reference render begin");
+  deferred_command_buffer_.CmdVkBeginRendering(&rendering);
+  deferred_command_buffer_.CmdVkDrawIndexed(indices.host_draw_vertex_count, 1, 0, 0, 0);
+  deferred_command_buffer_.CmdVkEndRendering();
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("stock reference render end");
+  for (uint32_t i = 0; i < result.targets.size(); ++i) {
+    const auto& target = result.targets[i];
+    if (target.image) {
+      change(i, clones[i], target.stages, transfer, target.access, read, target.layout, src_layout);
+    }
+  }
+  SubmitBarriers(true);
+  ReadFh1ReplayPixels(result, 1, clones);
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("stock readback recorded");
+  restore_replay();
+  if (vertex_window[1]) {
+    deferred_command_buffer_.CmdVkPushConstants(layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                                 sizeof(vertex_window), vertex_window.data());
+  }
+  REXGPU_INFO("M4 pixel parity draw: submission={} index_count={} vertex={} color={} depth={}",
+              submission, indices.host_draw_vertex_count, vertex_window[1] != 0,
+              live[1] != VK_NULL_HANDLE, live[0] != VK_NULL_HANDLE);
+  return result;
+}
+
+void VulkanCommandProcessor::EndFh1ReplayPixelComparison(ReplayPixelComparison& comparison) {
+  auto& rb = *comparison.readback;
+  std::array<VkImage, 2> images{};
+  auto barrier = [&](bool restore) {
+    for (uint32_t i = 0; i < comparison.targets.size(); ++i) {
+      const auto& target = comparison.targets[i];
+      images[i] = target.image;
+      if (!target.image) continue;
+      const auto range = ui::vulkan::util::InitializeSubresourceRange(target.aspects, 0, 1, 0, 1);
+      constexpr auto src = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      constexpr VkPipelineStageFlags transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      constexpr VkAccessFlags read = VK_ACCESS_TRANSFER_READ_BIT;
+      PushImageMemoryBarrier(target.image, range, restore ? transfer : target.stages,
+          restore ? target.stages : transfer, restore ? read : target.access,
+          restore ? target.access : read, restore ? src : target.layout, restore ? target.layout : src);
+    }
+  };
+  barrier(false);
+  SubmitBarriers(true);
+  ReadFh1ReplayPixels(comparison, 2, images);
+  deferred_command_buffer_.CmdFh1ReplayParityCheckpoint("replay readback recorded");
+  barrier(true);
+  PushBufferMemoryBarrier(rb.buffer, 0, rb.stride * 3, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+  rb.complete = true;
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -7900,6 +8136,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 vertex_shader->ucode_data_hash());
   }
 
+  ReplayPixelComparison replay_comparison;
+  if (replay_index.first && VulkanRenderTargetCache::ReplayParityEnabled()) {
+    replay_comparison = BeginFh1ReplayPixelComparison(
+        vertex_shader, pixel_shader, replay_vertex_window, primitive_processing_result);
+  }
+
   // FH1 (#640): the draw's render pass (and pixel shader) as its zone.
   if (deferred_command_buffer_.fh1_gpu_profiling()) {
     Fh1SetDrawGpuZone(pixel_shader ? pixel_shader->ucode_data_hash() : 0);
@@ -7979,6 +8221,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  if (replay_comparison.readback) EndFh1ReplayPixelComparison(replay_comparison);
   // FH1 (#551): the draw's number, written by the GPU once issued and once finished.
   if (fh1_breadcrumbs_on) {
     deferred_command_buffer_.CmdFh1Breadcrumb(fh1_trail.Record(
