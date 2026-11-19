@@ -1,4 +1,6 @@
 #pragma once
+
+#include <rex/graphics/vulkan/fh1_hud_seed.h>
 #include <rex/graphics/vulkan/fh1_screen_raster.h>
 /**
  ******************************************************************************
@@ -423,6 +425,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     ~VulkanRenderTarget();
 
     VkImage image() const { return image_; }
+    fh1::HudSeedSurface hud_seed_surface{};
     bool replay_parity_transfer = false;
 
     VkImageView view_depth_color() const { return view_depth_color_; }
@@ -974,6 +977,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   PFN_vkCmdBeginConditionalRenderingEXT fh1_begin_conditional_rendering_ = nullptr;
   PFN_vkCmdEndConditionalRenderingEXT fh1_end_conditional_rendering_ = nullptr;
   PFN_vkCmdFillBuffer fh1_fill_buffer_ = nullptr;
+  PFN_vkCmdCopyImage fh1_seed_copy_ = nullptr;
+  bool hud_seed_copy_used_ = false;
+  uint64_t hud_seed_copy_submission_ = 0;
   uint64_t fh1_stencil_mask_region_submission_[kFh1StencilMaskRegions] = {};
   uint64_t fh1_stencil_mask_submission_ = UINT64_MAX;
   uint32_t fh1_stencil_mask_next_slot_ = 0;

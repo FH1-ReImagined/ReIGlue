@@ -43,6 +43,9 @@
 
 #include "fh1_device_memory.h"
 
+REXCVAR_DEFINE_BOOL(fh1_hud_seed_copy, false, "GPU/Vulkan",
+                    "Use one exact-grid copy for a compatible 1440p split HUD seed")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(vulkan_render_target_initial_fill, 0, "GPU/Vulkan",
                      "Fill a host color render target before its first use: 0 leaves the driver's "
                      "memory (undefined), 1 clears it to zero, 2 to a loud magenta (64, 0, 64, 1) to "
@@ -234,6 +237,10 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
+  if (REXCVAR_GET(fh1_hud_seed_copy)) {
+    fh1_seed_copy_ = reinterpret_cast<PFN_vkCmdCopyImage>(
+        ifn.vkGetDeviceProcAddr(device, "vkCmdCopyImage"));
+  }
 
   bool fsi_path_supported =
       (device_properties.fragmentShaderSampleInterlock ||
@@ -1296,6 +1303,12 @@ void VulkanRenderTargetCache::TrimRenderTargets() {
 }
 
 void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
+  if (hud_seed_copy_submission_ &&
+      command_processor_.GetCompletedSubmission() >= hud_seed_copy_submission_) {
+    REXGPU_INFO("FH1 HUD seed copy retired: submission={} completed={}",
+                hud_seed_copy_submission_, command_processor_.GetCompletedSubmission());
+    hud_seed_copy_submission_ = 0;
+  }
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
@@ -2543,6 +2556,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       key, *this, image, memory, view_depth_color, view_depth_stencil, view_stencil, view_srgb,
       view_color_transfer_separate, descriptor_set_index_transfer_source);
   render_target->memory_size_ = memory_size;
+  render_target->hud_seed_surface = {
+      image_create_info.extent.width, image_create_info.extent.height,
+      uint32_t(image_create_info.format), image_create_info.samples == VK_SAMPLE_COUNT_1_BIT,
+      bool(image_create_info.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT),
+      bool(image_create_info.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)};
   render_target->replay_parity_transfer =
       (image_create_info.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
   render_target_memory_bytes_ += memory_size;
@@ -6996,7 +7014,31 @@ bool VulkanRenderTargetCache::SeedNativeHud(VulkanRenderTargetCache& scene,
     // NGX may change pipeline bindings on the real command buffer; subsequent
     // guest work is rebound by the command processor before rendering the HUD.
   } else {
-    command_processor_.deferred_command_buffer().CmdVkBlitImage(src->image(), dst->image(), region);
+    const auto& input = src->hud_seed_surface;
+    const auto& output = dst->hud_seed_surface;
+    const uint64_t submission = command_processor_.GetCurrentSubmission();
+    if (fh1_seed_copy_ && !hud_seed_copy_used_ && command_processor_.submission_open() &&
+        submission > command_processor_.GetCompletedSubmission() &&
+        src->key().base_tiles == dst->key().base_tiles &&
+        fh1::CanCopyHudSeed(input, output, region.srcOffsets[1].x, region.srcOffsets[1].y,
+                            region.dstOffsets[1].x, region.dstOffsets[1].y,
+                            src->image() != dst->image(), VK_FORMAT_A2B10G10R10_UNORM_PACK32)) {
+      // Both RTs own dedicated images. The original blit uses positive,
+      // zero-origin color regions in mip zero, layer zero, one layer.
+      VkImageCopy copy{};
+      copy.srcSubresource = region.srcSubresource;
+      copy.dstSubresource = region.dstSubresource;
+      copy.extent = {uint32_t(region.srcOffsets[1].x), uint32_t(region.srcOffsets[1].y), 1};
+      command_processor_.deferred_command_buffer().CmdFh1ReplayCopyImage(
+          fh1_seed_copy_, src->image(), dst->image(), copy);
+      hud_seed_copy_used_ = true;
+      hud_seed_copy_submission_ = submission;
+      REXGPU_INFO("FH1 HUD seed copy recorded: frame={} submission={} src={:X} dst={:X} format={} width={} height={}",
+                  command_processor_.GetCurrentFrame(), submission, uint64_t(src->image()),
+                  uint64_t(dst->image()), input.format, copy.extent.width, copy.extent.height);
+    } else {
+      command_processor_.deferred_command_buffer().CmdVkBlitImage(src->image(), dst->image(), region);
+    }
   }
   command_processor_.PushImageMemoryBarrier(dst->image(), range, dst->current_stage_mask(),
       VulkanRenderTarget::kColorDrawStageMask, dst->current_access_mask(),
