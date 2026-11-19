@@ -1910,7 +1910,8 @@ bool VulkanCommandProcessor::SetupContext() {
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
   const char* replay_audit = std::getenv("FH1_M4_BINDING_AUDIT");
-  if (replay_audit && std::strcmp(replay_audit, "bind-vertex") == 0 &&
+  if (replay_audit && (std::strcmp(replay_audit, "bind-vertex") == 0 ||
+                       std::strcmp(replay_audit, "bind-texture") == 0) &&
       !edram_fragment_shader_interlock && shared_memory_binding_count < 4 &&
       shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers) {
     primitive_processor_->InitializeReplayVertexBuffer();
@@ -11663,13 +11664,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   descriptor_write_image_info_.reserve(
       (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
       (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+  const bool replay_textures = Fh1ReplayDrawSelected() && texture_cache_->BeginFh1ReplayTextureDraw();
+  auto texture_view = [&](const VulkanShader::TextureBinding& binding) {
+    if (replay_textures) {
+      return texture_cache_->GetFh1ReplayTextureView(binding.fetch_constant, binding.dimension,
+                                                     bool(binding.is_signed));
+    }
+    return texture_cache_->GetActiveBindingOrNullImageView(binding.fetch_constant, binding.dimension,
+                                                           bool(binding.is_signed));
+  };
   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
   if (write_vertex_textures && texture_count_vertex) {
     for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
+      descriptor_image_info.imageView = texture_view(texture_binding);
       descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
                                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                               : VK_IMAGE_LAYOUT_UNDEFINED;
@@ -11687,9 +11695,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   if (write_pixel_textures && texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
+      descriptor_image_info.imageView = texture_view(texture_binding);
       descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
                                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                               : VK_IMAGE_LAYOUT_UNDEFINED;

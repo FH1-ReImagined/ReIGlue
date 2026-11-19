@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -497,6 +498,7 @@ VulkanTextureCache::~VulkanTextureCache() {
   const VkDevice device = vulkan_device->device();
 
   Fh1DescriptorHandlesDestroyed();
+  for (auto& slot : replay_texture_slots_) DestroyReplayTextureSlot(slot);
   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
   }
@@ -761,6 +763,149 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
     default:
       return null_image_view_2d_array_;
   }
+}
+
+bool VulkanTextureCache::BeginFh1ReplayTextureDraw() {
+  if (!replay_copy_image_) return false;
+  for (auto& slot : replay_texture_slots_) slot.source_this_draw = VK_NULL_HANDLE;
+  return true;
+}
+
+void VulkanTextureCache::DestroyReplayTextureSlot(ReplayTextureSlot& slot) {
+  if (!slot.image) return;
+  const auto* device = command_processor_.GetVulkanDevice();
+  const auto& dfn = device->functions();
+  if (slot.view) {
+    Fh1DescriptorHandlesDestroyed();
+    dfn.vkDestroyImageView(device->device(), slot.view, nullptr);
+  }
+  dfn.vkDestroyImage(device->device(), slot.image, nullptr);
+  dfn.vkFreeMemory(device->device(), slot.memory, nullptr);
+  slot = {};
+}
+
+VkImageView VulkanTextureCache::GetFh1ReplayTextureView(uint32_t fetch_constant_index,
+                                                         xenos::FetchOpDimension dimension,
+                                                         bool is_signed) {
+  const VkImageView stock =
+      GetActiveBindingOrNullImageView(fetch_constant_index, dimension, is_signed);
+  const auto fallback = [&](const char* reason) {
+    REXGPU_INFO("M4 texture fallback audit: submission={} fetch={} reason={}",
+                command_processor_.GetCurrentSubmission(), fetch_constant_index, reason);
+    return stock;
+  };
+  if (!stock || dimension != xenos::FetchOpDimension::k2D) {
+    return fallback("unsupported-view");
+  }
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) return fallback("missing-source");
+  auto* source = static_cast<VulkanTexture*>(
+      is_signed && IsSignedVersionSeparateForFormat(binding->key) ? binding->texture_signed
+                                                                 : binding->texture);
+  if (!source) return fallback("missing-source");
+  const VkFormat format = source->replay_copy_format();
+  const auto& formats = GetHostFormatPair(source->key());
+  const VkFormat view_format = (is_signed ? formats.format_signed : formats.format_unsigned).format;
+  if (format == VK_FORMAT_UNDEFINED || source->usage() != VulkanTexture::Usage::kGuestShaderSampled ||
+      format != view_format || stock != source->GetView(is_signed, binding->host_swizzle)) {
+    return fallback("source-not-copyable");
+  }
+  const uint32_t width = source->key().GetWidth();
+  const uint32_t height = source->key().GetHeight();
+  const uint32_t mip_count = source->key().mip_max_level + 1;
+  const auto* device = command_processor_.GetVulkanDevice();
+  const uint32_t swizzle = device->properties().imageViewFormatSwizzle
+                               ? binding->host_swizzle : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+  auto compatible = [&](const ReplayTextureSlot& slot) {
+    return slot.image && slot.format == format && slot.width == width && slot.height == height &&
+           slot.mip_count == mip_count && slot.swizzle == swizzle;
+  };
+  ReplayTextureSlot* matching = nullptr;
+  ReplayTextureSlot* vacant = nullptr;
+  for (auto& slot : replay_texture_slots_) {
+    if (slot.source_this_draw == stock && compatible(slot)) return slot.view;
+    if (slot.source_this_draw) continue;
+    if (compatible(slot)) {
+      matching = &slot;
+    } else if (!slot.image || slot.last_submission <= command_processor_.GetCompletedSubmission()) {
+      if (!vacant || !slot.image) vacant = &slot;
+    }
+  }
+  ReplayTextureSlot* slot = matching ? matching : vacant;
+  if (!slot) return fallback("pool-full");
+  const auto image_range = ui::vulkan::util::InitializeSubresourceRange(
+      VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_count, 0, 1);
+  if (!matching) {
+    DestroyReplayTextureSlot(*slot);
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1};
+    info.mipLevels = mip_count;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, slot->image,
+            slot->memory)) return fallback("image-allocation");
+    VkImageViewCreateInfo view = {};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = slot->image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    view.format = format;
+    view.components = VulkanTexture::ComponentMapping(swizzle);
+    view.subresourceRange = image_range;
+    if (device->functions().vkCreateImageView(device->device(), &view, nullptr, &slot->view) !=
+        VK_SUCCESS) {
+      slot->view = VK_NULL_HANDLE;
+      DestroyReplayTextureSlot(*slot);
+      return fallback("view-allocation");
+    }
+    slot->format = format;
+    slot->width = width;
+    slot->height = height;
+    slot->mip_count = mip_count;
+    slot->swizzle = swizzle;
+  }
+
+  constexpr auto sampled = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  constexpr auto src = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  constexpr auto dst = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  constexpr auto read = VK_ACCESS_SHADER_READ_BIT;
+  constexpr auto transfer_read = VK_ACCESS_TRANSFER_READ_BIT;
+  constexpr auto transfer_write = VK_ACCESS_TRANSFER_WRITE_BIT;
+  command_processor_.PushImageMemoryBarrier(source->image(), image_range,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, transfer, VK_ACCESS_MEMORY_WRITE_BIT | read,
+      transfer_read, sampled, src);
+  command_processor_.PushImageMemoryBarrier(slot->image, image_range,
+      matching ? guest_shader_pipeline_stages_ : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, transfer,
+      matching ? read : 0, transfer_write, matching ? sampled : VK_IMAGE_LAYOUT_UNDEFINED, dst);
+  command_processor_.SubmitBarriers(true);
+  for (uint32_t mip = 0; mip < mip_count; ++mip) {
+    VkImageCopy region = {};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.extent = {std::max(1u, width >> mip), std::max(1u, height >> mip), 1};
+    command_processor_.deferred_command_buffer().CmdFh1ReplayCopyImage(
+        replay_copy_image_, source->image(), slot->image, region);
+  }
+  command_processor_.PushImageMemoryBarrier(source->image(), image_range, transfer,
+      guest_shader_pipeline_stages_, transfer_read, read, src, sampled);
+  command_processor_.PushImageMemoryBarrier(slot->image, image_range, transfer,
+      guest_shader_pipeline_stages_, transfer_write, read, dst, sampled);
+  slot->last_submission = command_processor_.GetCurrentSubmission();
+  slot->source_this_draw = stock;
+  REXGPU_INFO("M4 texture bind audit: submission={} fetch={} {}x{} mips={} format={} reused={} "
+              "source_pages={:05X}/{:05X} slot={}",
+              slot->last_submission, fetch_constant_index, width, height, mip_count,
+              uint32_t(format), matching != nullptr, uint32_t(source->key().base_page),
+              uint32_t(source->key().mip_page), slot - replay_texture_slots_.data());
+  return slot->view;
 }
 
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
@@ -1323,6 +1468,22 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
   if (direct_upload)
     image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  if (replay_copy_image_ && !key.scaled_resolve && key.base_page &&
+      (!key.mip_max_level || key.mip_page) &&
+      key.dimension == xenos::DataDimension::k2DOrStacked && depth_or_array_size == 1 &&
+      !image_create_info.flags && key.GetWidth() <= 256 && key.GetHeight() <= 256 &&
+      key.mip_max_level < 9 &&
+      (formats[0] == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ||
+       formats[0] == VK_FORMAT_BC2_UNORM_BLOCK || formats[0] == VK_FORMAT_BC3_UNORM_BLOCK ||
+       formats[0] == VK_FORMAT_BC4_UNORM_BLOCK || formats[0] == VK_FORMAT_BC5_UNORM_BLOCK ||
+       formats[0] == VK_FORMAT_R8G8B8A8_UNORM)) {
+    VkFormatProperties properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), formats[0], &properties);
+    if (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) {
+      image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
+  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -1342,7 +1503,12 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
 
   VkImage image;
   VmaAllocation allocation;
-  if (VkResult result = CreateTextureImage(vma_allocator_, image_create_info, image, allocation)) {
+  VkResult create_result = CreateTextureImage(vma_allocator_, image_create_info, image, allocation);
+  if (create_result && (image_create_info.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+    image_create_info.usage &= ~VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    create_result = CreateTextureImage(vma_allocator_, image_create_info, image, allocation);
+  }
+  if (VkResult result = create_result) {
     // Storage usage or format reinterpretation may impose extra device limits.
     // A failed fast-path allocation must not prevent the original upload path.
     if (!direct_upload) {
@@ -1367,6 +1533,9 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   }
 
   auto result = std::make_unique<VulkanTexture>(*this, key, image, allocation);
+  if (image_create_info.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+    result->set_replay_copy_format(formats[0]);
+  }
   if (direct_upload) {
     VkImageViewCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -2436,7 +2605,15 @@ VulkanTextureCache::VulkanTextureCache(const RegisterFile& register_file,
                                        VkPipelineStageFlags guest_shader_pipeline_stages)
     : TextureCache(register_file, shared_memory, draw_resolution_scale_x, draw_resolution_scale_y),
       command_processor_(command_processor),
-      guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
+      guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {
+  const char* mode = std::getenv("FH1_M4_BINDING_AUDIT");
+  if (mode && std::strcmp(mode, "bind-texture") == 0) {
+    const auto* device = command_processor_.GetVulkanDevice();
+    replay_copy_image_ = reinterpret_cast<PFN_vkCmdCopyImage>(
+        device->vulkan_instance()->functions().vkGetDeviceProcAddr(device->device(),
+                                                                   "vkCmdCopyImage"));
+  }
+}
 
 bool VulkanTextureCache::InitializeScaledResolveBuffer() {
   assert_true(IsDrawResolutionScaled());

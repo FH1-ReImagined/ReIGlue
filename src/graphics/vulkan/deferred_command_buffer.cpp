@@ -106,6 +106,11 @@ VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buf
         blit(command_buffer, args.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, args.dst,
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &args.region, VK_FILTER_LINEAR);
       } break;
+      case Command::kFh1ReplayCopyImage: {
+        const auto& args = *reinterpret_cast<const ArgsFh1ReplayCopyImage*>(stream);
+        args.copy(command_buffer, args.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, args.dst,
+                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &args.region);
+      } break;
       case Command::kVkBeginRenderPass: {
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);
