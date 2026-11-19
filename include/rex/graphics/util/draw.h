@@ -584,6 +584,15 @@ struct ResolveInfo {
   }
 };
 
+struct ResolveGeometry {
+  int32_t window_x = 0, window_y = 0;
+  uint32_t source_x = 0, source_y = 0;
+  bool expanded_for_alignment = false;
+  uint32_t destination_base = 0, destination_pitch = 0, destination_height = 0;
+  uint32_t vertex_fetch_address = 0, vertex_fetch_length = 0;
+  bool empty_after_clip = false;
+};
+
 // Returns false if there was an error obtaining the info making it totally
 // invalid. fixed_rg[ba]16_truncated_to_minus_1_to_1 is false if 16_16[_16_16]
 // color render target formats are properly emulated as -32...32, true if
@@ -593,6 +602,11 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out);
+bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+                    bool fixed_rg16_truncated_to_minus_1_to_1,
+                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
+                    ResolveGeometry* geometry_out);
 
 // FH1 (#785): moves the copy of a predicated tiling tile resolve whose RB_COPY_DEST_BASE points
 // at the tile's position (old_x, old_y) in a 2D texture (the copy itself at offset 0) to

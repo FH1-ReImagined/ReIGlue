@@ -823,6 +823,17 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out) {
+  return GetResolveInfo(regs, memory, draw_resolution_scale_x, draw_resolution_scale_y,
+                        fixed_rg16_truncated_to_minus_1_to_1,
+                        fixed_rgba16_truncated_to_minus_1_to_1, info_out, nullptr);
+}
+
+bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+                    bool fixed_rg16_truncated_to_minus_1_to_1,
+                    bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out,
+                    ResolveGeometry* geometry_out) {
+  if (geometry_out) *geometry_out = {};
   // Don't pass uninitialized values to shaders, not to leak data to frame
   // captures. Also initialize an invalid resolve to empty.
   info_out.coordinate_info.packed = 0;
@@ -850,8 +861,9 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     assert_always();
     return false;
   }
+  const uint32_t vertex_fetch_address = uint32_t(fetch.address) * sizeof(uint32_t);
   const float* vertices_guest =
-      reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
+      reinterpret_cast<const float*>(memory.TranslatePhysical(vertex_fetch_address));
   // Most vertices have a negative half-pixel offset applied, which we reverse.
   float half_pixel_offset =
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
@@ -859,6 +871,10 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   for (size_t i = 0; i < rex::countof(vertices_fixed); ++i) {
     vertices_fixed[i] = ui::FloatToD3D11Fixed16p8(xenos::GpuSwap(vertices_guest[i], fetch.endian) +
                                                   half_pixel_offset);
+  }
+  if (geometry_out) {
+    geometry_out->vertex_fetch_address = vertex_fetch_address;
+    geometry_out->vertex_fetch_length = sizeof(vertices_fixed);
   }
   // Inclusive.
   int32_t x0 = std::min(std::min(vertices_fixed[0], vertices_fixed[2]), vertices_fixed[4]);
@@ -874,9 +890,10 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   y1 = (y1 + 127) >> 8;
 
   auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  const bool window_offset_enabled = regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable;
 
   // Apply the window offset to the vertices.
-  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+  if (window_offset_enabled) {
     x0 += pa_sc_window_offset.window_x_offset;
     y0 += pa_sc_window_offset.window_y_offset;
     x1 += pa_sc_window_offset.window_x_offset;
@@ -904,6 +921,8 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // force-align the rectangle by expanding (D3D9 expands to the right/bottom
   // for some reason, haven't found how left/top is rounded, but logically it
   // would make sense to expand to the left/top too).
+  const bool expanded_for_alignment =
+      ((x0 | y0 | x1 | y1) & int32_t(xenos::kResolveAlignmentPixels - 1)) != 0;
   x0 &= ~int32_t(xenos::kResolveAlignmentPixels - 1);
   y0 &= ~int32_t(xenos::kResolveAlignmentPixels - 1);
   x1 = rex::align(x1, int32_t(xenos::kResolveAlignmentPixels));
@@ -945,11 +964,19 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // issues such resolves constantly; as an error every one logged two lines and
   // failed the draw.
   if (x0 >= x1 || y0 >= y1) {
+    if (geometry_out) geometry_out->empty_after_clip = true;
     info_out.coordinate_info.width_div_8 = 0;
     info_out.height_div_8 = 0;
     return true;
   }
 
+  if (geometry_out) {
+    geometry_out->window_x = window_offset_enabled ? int32_t(pa_sc_window_offset.window_x_offset) : 0;
+    geometry_out->window_y = window_offset_enabled ? int32_t(pa_sc_window_offset.window_y_offset) : 0;
+    geometry_out->source_x = uint32_t(x0);
+    geometry_out->source_y = uint32_t(y0);
+    geometry_out->expanded_for_alignment = expanded_for_alignment;
+  }
   info_out.coordinate_info.width_div_8 = uint32_t(x1 - x0) >> xenos::kResolveAlignmentPixelsLog2;
   info_out.height_div_8 = uint32_t(y1 - y0) >> xenos::kResolveAlignmentPixelsLog2;
   // 3 bits for each.
@@ -1009,6 +1036,11 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   uint32_t copy_dest_base_adjusted = rb_copy_dest_base;
   uint32_t copy_dest_extent_start, copy_dest_extent_end;
   auto rb_copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+  if (geometry_out) {
+    geometry_out->destination_base = rb_copy_dest_base;
+    geometry_out->destination_pitch = rb_copy_dest_pitch.copy_dest_pitch;
+    geometry_out->destination_height = rb_copy_dest_pitch.copy_dest_height;
+  }
   uint32_t copy_dest_pitch_aligned_div_32 =
       (rb_copy_dest_pitch.copy_dest_pitch + (xenos::kTextureTileWidthHeight - 1)) >>
       xenos::kTextureTileWidthHeightLog2;
