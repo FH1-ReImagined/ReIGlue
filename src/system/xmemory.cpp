@@ -2055,6 +2055,34 @@ rex::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address, uint32_
   }
 }
 
+bool BaseHeap::FindUncommittedRun(uint32_t start, uint32_t end, uint32_t* run_start,
+                                  uint32_t* run_end) const {
+  // Without heap_mutex_, as EnableAccessCallbacks and TriggerCallbacks read the page table: the
+  // table is never resized, and an entry is one aligned 64-bit word.
+  start = std::max(start, heap_base_);
+  end = uint32_t(std::min(uint64_t(end), uint64_t(heap_base_) + heap_size_));
+  if (start >= end) {
+    return false;
+  }
+  uint32_t page = (start - heap_base_) >> page_size_shift_;
+  const uint32_t page_end =
+      uint32_t((uint64_t(end - heap_base_) + page_size_ - 1) >> page_size_shift_);
+  while (page < page_end && (page_table_[page].state & memory::kMemoryAllocationCommit)) {
+    ++page;
+  }
+  if (page == page_end) {
+    return false;
+  }
+  const uint32_t first = page;
+  while (page < page_end && !(page_table_[page].state & memory::kMemoryAllocationCommit)) {
+    ++page;
+  }
+  *run_start = heap_base_ + (first << page_size_shift_);
+  *run_end = uint32_t(
+      std::min(uint64_t(heap_base_) + (uint64_t(page) << page_size_shift_), uint64_t(UINT32_MAX)));
+  return true;
+}
+
 VirtualHeap::VirtualHeap() = default;
 
 VirtualHeap::~VirtualHeap() = default;
@@ -2100,28 +2128,34 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
-  // Global critical region before heap_mutex_ - see
-  // AcquireHostPageReconcileLock for why the order matters.
-  auto global_lock = AcquireHostPageReconcileLock();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  uint32_t address;
+  {
+    // Global critical region before heap_mutex_ - see
+    // AcquireHostPageReconcileLock for why the order matters.
+    auto global_lock = AcquireHostPageReconcileLock();
+    std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
-  // Allocate from parent heap (gets our physical address in 0-512mb).
-  uint32_t parent_heap_start = GetPhysicalAddress(heap_base_);
-  uint32_t parent_heap_end = GetPhysicalAddress(heap_base_ + (heap_size_ - 1));
-  uint32_t parent_address;
-  if (!parent_heap_->AllocRange(parent_heap_start, parent_heap_end, size, alignment,
-                                allocation_type, protect, top_down, &parent_address)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
-    return false;
+    // Allocate from parent heap (gets our physical address in 0-512mb).
+    uint32_t parent_heap_start = GetPhysicalAddress(heap_base_);
+    uint32_t parent_heap_end = GetPhysicalAddress(heap_base_ + (heap_size_ - 1));
+    uint32_t parent_address;
+    if (!parent_heap_->AllocRange(parent_heap_start, parent_heap_end, size, alignment,
+                                  allocation_type, protect, top_down, &parent_address)) {
+      REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
+      return false;
+    }
+
+    // Given the address we've reserved in the parent heap, pin that here.
+    // Shouldn't be possible for it to be allocated already.
+    address = heap_base_ + parent_address - parent_heap_start;
+    if (!BaseHeap::AllocFixed(address, size, alignment, allocation_type, protect)) {
+      REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
+      // TODO(benvanik): don't leak parent memory.
+      return false;
+    }
   }
-
-  // Given the address we've reserved in the parent heap, pin that here.
-  // Shouldn't be possible for it to be allocated already.
-  uint32_t address = heap_base_ + parent_address - parent_heap_start;
-  if (!BaseHeap::AllocFixed(address, size, alignment, allocation_type, protect)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
-    // TODO(benvanik): don't leak parent memory.
-    return false;
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    InvalidateNewContents(address, size);  // patch 1110
   }
   *out_address = address;
   return true;
@@ -2133,28 +2167,34 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
-  // Global critical region before heap_mutex_ - see
-  // AcquireHostPageReconcileLock for why the order matters.
-  auto global_lock = AcquireHostPageReconcileLock();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  uint32_t address;
+  {
+    // Global critical region before heap_mutex_ - see
+    // AcquireHostPageReconcileLock for why the order matters.
+    auto global_lock = AcquireHostPageReconcileLock();
+    std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
-  // Allocate from parent heap (gets our physical address in 0-512mb).
-  // NOTE: this can potentially overwrite heap contents if there are already
-  // committed pages in the requested physical range.
-  // TODO(benvanik): flag for ensure-not-committed?
-  uint32_t parent_base_address = GetPhysicalAddress(base_address);
-  if (!parent_heap_->AllocFixed(parent_base_address, size, alignment, allocation_type, protect)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
-    return false;
+    // Allocate from parent heap (gets our physical address in 0-512mb).
+    // NOTE: this can potentially overwrite heap contents if there are already
+    // committed pages in the requested physical range.
+    // TODO(benvanik): flag for ensure-not-committed?
+    uint32_t parent_base_address = GetPhysicalAddress(base_address);
+    if (!parent_heap_->AllocFixed(parent_base_address, size, alignment, allocation_type, protect)) {
+      REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
+      return false;
+    }
+
+    // Given the address we've reserved in the parent heap, pin that here.
+    // Shouldn't be possible for it to be allocated already.
+    address = heap_base_ + parent_base_address - GetPhysicalAddress(heap_base_);
+    if (!BaseHeap::AllocFixed(address, size, page_size_, allocation_type, protect)) {
+      REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
+      // TODO(benvanik): don't leak parent memory.
+      return false;
+    }
   }
-
-  // Given the address we've reserved in the parent heap, pin that here.
-  // Shouldn't be possible for it to be allocated already.
-  uint32_t address = heap_base_ + parent_base_address - GetPhysicalAddress(heap_base_);
-  if (!BaseHeap::AllocFixed(address, size, page_size_, allocation_type, protect)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
-    // TODO(benvanik): don't leak parent memory.
-    return false;
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    InvalidateNewContents(address, size);  // patch 1110
   }
 
   return true;
@@ -2169,30 +2209,36 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
-  // Global critical region before heap_mutex_ - see
-  // AcquireHostPageReconcileLock for why the order matters.
-  auto global_lock = AcquireHostPageReconcileLock();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  uint32_t address;
+  {
+    // Global critical region before heap_mutex_ - see
+    // AcquireHostPageReconcileLock for why the order matters.
+    auto global_lock = AcquireHostPageReconcileLock();
+    std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
-  // Allocate from parent heap (gets our physical address in 0-512mb).
-  low_address = std::max(heap_base_, low_address);
-  high_address = std::min(heap_base_ + (heap_size_ - 1), high_address);
-  uint32_t parent_low_address = GetPhysicalAddress(low_address);
-  uint32_t parent_high_address = GetPhysicalAddress(high_address);
-  uint32_t parent_address;
-  if (!parent_heap_->AllocRange(parent_low_address, parent_high_address, size, alignment,
-                                allocation_type, protect, top_down, &parent_address)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
-    return false;
+    // Allocate from parent heap (gets our physical address in 0-512mb).
+    low_address = std::max(heap_base_, low_address);
+    high_address = std::min(heap_base_ + (heap_size_ - 1), high_address);
+    uint32_t parent_low_address = GetPhysicalAddress(low_address);
+    uint32_t parent_high_address = GetPhysicalAddress(high_address);
+    uint32_t parent_address;
+    if (!parent_heap_->AllocRange(parent_low_address, parent_high_address, size, alignment,
+                                  allocation_type, protect, top_down, &parent_address)) {
+      REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
+      return false;
+    }
+
+    // Given the address we've reserved in the parent heap, pin that here.
+    // Shouldn't be possible for it to be allocated already.
+    address = heap_base_ + parent_address - GetPhysicalAddress(heap_base_);
+    if (!BaseHeap::AllocFixed(address, size, page_size_, allocation_type, protect)) {
+      REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
+      // TODO(benvanik): don't leak parent memory.
+      return false;
+    }
   }
-
-  // Given the address we've reserved in the parent heap, pin that here.
-  // Shouldn't be possible for it to be allocated already.
-  uint32_t address = heap_base_ + parent_address - GetPhysicalAddress(heap_base_);
-  if (!BaseHeap::AllocFixed(address, size, page_size_, allocation_type, protect)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to pin physical memory in physical heap");
-    // TODO(benvanik): don't leak parent memory.
-    return false;
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    InvalidateNewContents(address, size);  // patch 1110
   }
   *out_address = address;
   return true;
@@ -2258,7 +2304,33 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
     return false;
   }
 
-  return BaseHeap::Protect(address, size, protect);
+  if (!BaseHeap::Protect(address, size, protect)) {
+    return false;
+  }
+  // Patch 1110: the watch above only covers pages that were watched. A page that was read-only
+  // had none (EnableAccessCallbacks skips it), and the GPU may hold it as up to date.
+  if (protect & memory::kMemoryProtectWrite) {
+    InvalidateNewContents(address, size);
+  }
+  return true;
+}
+
+void PhysicalHeap::InvalidateNewContents(uint32_t address, uint32_t size) {
+  if (!size || address < heap_base_ || address - heap_base_ >= heap_size_) {
+    return;
+  }
+  size = std::min(size, heap_size_ - (address - heap_base_));
+  auto global_lock = global_critical_region_.Acquire();
+  const uint32_t physical_address = GetPhysicalAddress(address);
+  for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
+    invalidation_callback->first(invalidation_callback->second, physical_address, size, true);
+  }
+  // A request on another thread may have armed a watch on these pages while the heaps were
+  // being updated (the update sets the host protection without the global critical region):
+  // the page is then marked as watched with the protection the update gave it, and its watch
+  // would never fire. Unwatching sets the protection the page table gives; the next request
+  // arms the watch again. Nothing to do, and no callback, when no page is watched.
+  TriggerCallbacks(std::move(global_lock), address, size, true, true);
 }
 
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t length,

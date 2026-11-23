@@ -183,7 +183,8 @@ class SharedMemory {
   virtual bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                                 uint32_t length_allocations);
 
-  // Mark the memory range as updated and protect it.
+  // Mark the memory range as updated and protect it. Pages of a CPU upload that no view of guest
+  // memory holds, which cannot be protected, are not marked (patch 1110).
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
 
   // Uploads a range of host pages - only called if host GPU sparse memory
@@ -212,6 +213,9 @@ class SharedMemory {
   bool fh1_upload_log_overflow_ = false;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
+  // Patch 1110: clears the valid bits of the pages in [page_first, page_last] that no view of
+  // guest memory holds. Call in the global critical region.
+  void DropUnheldPages(uint32_t page_first, uint32_t page_last);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;
