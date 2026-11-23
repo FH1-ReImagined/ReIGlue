@@ -5,8 +5,8 @@
 // invalidate it some other way. Memory released while a frame still queued reads it, or held
 // read-only, cannot be watched (EnablePhysicalMemoryAccessCallbacks skips pages a heap does not
 // hold or the guest may not write), so the GPU copy may hold it as valid with no watch: the
-// allocation that gives such pages new contents must invalidate them, and the protection change
-// that makes them writable must arm their watch.
+// allocation that gives such pages new contents, and the protection change that makes them
+// writable, must invalidate them.
 //
 // Its own process (ctest runs it apart from unit_tests): Memory maps 4.5GB, one per process.
 // `--view-granularity 0x10000` maps the views as on a host with that view offset granularity
@@ -232,7 +232,7 @@ void CommittedAgain() {
   REQUIRE(E0().Release(address));
 }
 
-// A read-only block made writable: a write after it is seen.
+// A read-only block made writable: the GPU copy is invalidated (a write after it is seen).
 void ReadOnlyMadeWritable() {
   current_case = "read-only made writable";
   CountingSharedMemory gpu(TestMemory());
@@ -244,30 +244,33 @@ void ReadOnlyMadeWritable() {
   CHECK(gpu.Uploads(physical, kBlock));
   CHECK_FALSE(gpu.Uploads(physical, kBlock));
   REQUIRE(E0().Protect(address, kBlock, kReadWrite));
-  CHECK_FALSE(gpu.Uploads(physical, kBlock));  // nothing written yet
-  GuestStore(address + 0x20, 4);
-  CHECK_FALSE(gpu.IsRangeValid(physical, 0x1000));
+  CHECK_FALSE(gpu.IsRangeValid(physical, kBlock));
   CHECK(gpu.Uploads(physical, kBlock));
-  GuestStore(address + 0x20, 5);
+  GuestStore(address + 0x20, 4);
   CHECK_FALSE(gpu.IsRangeValid(physical, 0x1000));
 
   REQUIRE(E0().Release(address));
 }
 
-// What the GPU wrote to a read-only block stays when the block is made writable, until a write.
-void GpuWrittenReadOnlyMadeWritable() {
-  current_case = "GPU-written read-only made writable";
+// What the GPU wrote: a block made writable is invalidated whether it was watched (writable
+// before, made read-only) or not (read-only from the start), as before 1110 for a watched one.
+void GpuWrittenMadeWritable() {
+  current_case = "GPU-written made writable";
   CountingSharedMemory gpu(TestMemory());
   const uint32_t physical = 0x08600000;
   const uint32_t address = E0Address(physical);
-  REQUIRE(E0().AllocFixed(address, kBlock, 0x1000, kCommit, rex::memory::kMemoryProtectRead));
-  gpu.RangeWrittenByGpu(physical, kBlock);
+  REQUIRE(E0().AllocFixed(address, kBlock, 0x1000, kCommit, kReadWrite));
+  REQUIRE(
+      E0().AllocFixed(address + kBlock, kBlock, 0x1000, kCommit, rex::memory::kMemoryProtectRead));
+  gpu.RangeWrittenByGpu(physical, 2 * kBlock);
+  REQUIRE(E0().Protect(address, kBlock, rex::memory::kMemoryProtectRead));
+  CHECK(gpu.IsRangeValid(physical, 2 * kBlock));
   REQUIRE(E0().Protect(address, kBlock, kReadWrite));
-  CHECK(gpu.IsRangeGpuWritten(physical, kBlock));
-  CHECK_FALSE(gpu.Uploads(physical, kBlock));
-  GuestStore(address + 0x40, 6);
-  CHECK_FALSE(gpu.IsRangeValid(physical, 0x1000));
+  REQUIRE(E0().Protect(address + kBlock, kBlock, kReadWrite));
+  CHECK_FALSE(gpu.IsRangeValid(physical, kBlock));
+  CHECK_FALSE(gpu.IsRangeValid(physical + kBlock, kBlock));
 
+  REQUIRE(E0().Release(address + kBlock));
   REQUIRE(E0().Release(address));
 }
 
@@ -354,7 +357,7 @@ int main(int argc, char** argv) {
   AllocAgain();
   CommittedAgain();
   ReadOnlyMadeWritable();
-  GpuWrittenReadOnlyMadeWritable();
+  GpuWrittenMadeWritable();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

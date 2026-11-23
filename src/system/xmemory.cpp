@@ -2154,7 +2154,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
     }
   }
   if (allocation_type & memory::kMemoryAllocationCommit) {
-    InvalidateNewContents(address, size);  // patch 1110
+    InvalidateWhetherWatched(address, size);  // patch 1110
   }
   *out_address = address;
   return true;
@@ -2206,8 +2206,8 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
     }
   }
   for (const auto& [run_physical, run_size] : new_runs) {
-    InvalidateNewContents(heap_base_ + run_physical - GetPhysicalAddress(heap_base_),
-                          run_size);  // patch 1110
+    InvalidateWhetherWatched(heap_base_ + run_physical - GetPhysicalAddress(heap_base_),
+                             run_size);  // patch 1110
   }
 
   return true;
@@ -2251,7 +2251,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
     }
   }
   if (allocation_type & memory::kMemoryAllocationCommit) {
-    InvalidateNewContents(address, size);  // patch 1110
+    InvalidateWhetherWatched(address, size);  // patch 1110
   }
   *out_address = address;
   return true;
@@ -2320,15 +2320,16 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   if (!BaseHeap::Protect(address, size, protect)) {
     return false;
   }
-  // Patch 1110: the watch above only covers pages that were watched. A page that was read-only
-  // had none (EnableAccessCallbacks skips it), and the GPU may hold it as up to date.
+  // Patch 1110: the invalidation above only reaches pages that were watched. A page that was
+  // read-only had no watch (EnableAccessCallbacks skips it), and the GPU may hold it as up to date:
+  // it is invalidated as a watched page is.
   if (protect & memory::kMemoryProtectWrite) {
-    WatchMadeWritable(address, size);
+    InvalidateWhetherWatched(address, size);
   }
   return true;
 }
 
-void PhysicalHeap::InvalidateNewContents(uint32_t address, uint32_t size) {
+void PhysicalHeap::InvalidateWhetherWatched(uint32_t address, uint32_t size) {
   if (!size || address < heap_base_ || address - heap_base_ >= heap_size_) {
     return;
   }
@@ -2346,17 +2347,6 @@ void PhysicalHeap::InvalidateNewContents(uint32_t address, uint32_t size) {
   for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
     invalidation_callback->first(invalidation_callback->second, physical_address, size, true);
   }
-}
-
-void PhysicalHeap::WatchMadeWritable(uint32_t address, uint32_t size) {
-  if (!size || address < heap_base_ || address - heap_base_ >= heap_size_) {
-    return;
-  }
-  size = std::min(size, heap_size_ - (address - heap_base_));
-  // As above, a watch armed while BaseHeap::Protect set the host protection may have lost it:
-  // drop it (nothing happens when no page is watched), then arm the watch on every page.
-  TriggerCallbacks(global_critical_region_.Acquire(), address, size, true, true);
-  memory_->EnablePhysicalMemoryAccessCallbacks(GetPhysicalAddress(address), size, true, false);
 }
 
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
