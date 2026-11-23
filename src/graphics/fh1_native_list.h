@@ -207,6 +207,13 @@ inline void PublishDefineAck(uint32_t& word, uint32_t sequence) {
   std::atomic_ref<uint32_t>(word).store(__builtin_bswap32(sequence), std::memory_order_release);
 }
 
+// The game's fixup hook makes a list's state word (its generation) odd while it writes the
+// slots and even again after (a seqlock's writer). What was read between two loads of it is
+// stable when the first load is even and the second the same.
+inline bool StableGeneration(uint32_t before, uint32_t after) {
+  return !(before & 1) && after == before;
+}
+
 inline Key TemplateKey(const uint32_t* t) {
   Key k;
   std::memcpy(k.w, t + kTKey, sizeof(k.w));
@@ -393,23 +400,32 @@ inline void Resolve(const uint32_t* t, const uint8_t* pm4, uint32_t* pool) {
 // shadow mode it is anyway).
 enum class Skip : uint32_t {
   kNone,
-  kRefused,        // the game's converter refused the list (its reason in the binding)
-  kNoTemplate,     // bound to a template id the plugin never got (or could not read)
-  kLength,         // the indirect buffer's length is not the registered one: the address reused
-  kRebound,        // the command buffer no longer names this buffer: the object reused
-  kStaticChanged,  // a static word of the list changed: its key, the template's at an earlier
-                   // run since the bind, is not the template's now
-  kNested,         // a list run inside a list being compared
-  kKeyAtBind,      // the key is not the template's at the first key check after the bind: the
-                   // template's slot table or the converter is wrong (not the game), never 0
-                   // in a correct build
+  kRefused,          // the game's converter refused the list (its reason in the binding)
+  kNoTemplate,       // bound to a template id the plugin never got (or could not read)
+  kLength,           // the indirect buffer's length is not the registered one: the address reused
+  kRebound,          // the command buffer no longer names this buffer: the object reused
+  kStaticChanged,    // a static word of the list changed: its key, the template's at an earlier
+                     // run since the bind, is not the template's now
+  kNested,           // a list run inside a list being compared
+  kKeyAtBind,        // the key is not the template's at the first key check after the bind: the
+                     // template's slot table or the converter is wrong (not the game), never 0
+                     // in a correct build
   kFixupInProgress,  // the slot snapshot was rejected by the generation check
+  kFixupDuringRun,   // the generation moved between the run's start and its end: a fixup
+                     // rewrote the list while it was decoded, so the verdict is dropped
   kCount,
 };
 constexpr const char* SkipName(Skip s) {
-  constexpr const char* names[] = {"none",    "refused",     "no-template",
-                                   "length",  "rebound",     "static-words-changed",
-                                   "nested",  "key-at-bind", "fixup-in-progress"};
+  constexpr const char* names[] = {"none",
+                                   "refused",
+                                   "no-template",
+                                   "length",
+                                   "rebound",
+                                   "static-words-changed",
+                                   "nested",
+                                   "key-at-bind",
+                                   "fixup-in-progress",
+                                   "fixup-during-run"};
   static_assert(sizeof(names) / sizeof(names[0]) == size_t(Skip::kCount));
   return s < Skip::kCount ? names[size_t(s)] : "?";
 }

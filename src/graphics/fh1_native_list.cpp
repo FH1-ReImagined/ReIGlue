@@ -10,7 +10,8 @@
 //   still names this buffer, and the list's static words still have the template's key (read
 //   again on every run, tiled and untiled alike);
 // - the template's slots are read from the live list when its state word's generation changed
-//   (as a replay would), and also on every run, to count a slot written without a fixup;
+//   (as a replay would), and also on every run, to count a slot written without a fixup; the
+//   generation is read again after the buffer, and a run a fixup overlapped gets no verdict;
 // - each draw: the state the template says it starts with (the register file at the buffer's
 //   start, the list's writes up to the draw overlaid, the tile block applied for the live bin
 //   select) against the register file the packets produced, over what the draw's shaders and
@@ -90,6 +91,12 @@ struct CommandProcessor::Fh1Lists {
   uint32_t group = 21, phys = 0;
   bool untiled = false, run_agree = true;
   uint32_t run_fields = 0;
+  // The list's state word and its generation at the run's start (read again at its end).
+  const uint8_t* state = nullptr;
+  uint32_t generation = 0;
+  // The run's draws, added to its group at its end unless the verdict is dropped.
+  uint64_t run_draws = 0, run_draws_agree = 0, run_draws_skipped = 0;
+  uint64_t run_draw_fields[fl::kFieldCount] = {};
 
   GroupCounts groups[kGroups];
   uint64_t refusals[kRefusals] = {};
@@ -424,7 +431,7 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   fl::Resolve(t, pm4, s.fresh_pool.data());
   std::atomic_thread_fence(std::memory_order_acquire);
   const uint32_t generation_after = state ? fl::Word(state, 0) : 0;
-  if ((generation & 1) || generation_after != generation) {
+  if (!fl::StableGeneration(generation, generation_after)) {
     ++s.in_progress;
     b->pool_valid = false;
     // The rejected snapshot cannot establish agreement with the packet decoder.
@@ -481,9 +488,10 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
   s.untiled = untiled;
   s.run_agree = true;
   s.run_fields = 0;
-  ++g.compared;
-  if (untiled)
-    ++g.untiled_runs;
+  s.state = state;
+  s.generation = generation;
+  s.run_draws = s.run_draws_agree = s.run_draws_skipped = 0;
+  std::fill(std::begin(s.run_draw_fields), std::end(s.run_draw_fields), 0);
   fh1_list_reader_ = reader;
   s.ns_begin += NowNs() - t0;
   return true;
@@ -496,17 +504,16 @@ void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
   const uint32_t k = s.run.next_draw();
   const fl::Outcome o =
       s.run.Draw(packet_offset / 4 - 1, executed, regs.values, bin_mask_, s.shaders);
-  GroupCounts& g = s.groups[s.group];
-  ++g.draws;
+  ++s.run_draws;
   if (!executed)
-    ++g.draws_skipped;
+    ++s.run_draws_skipped;
   if (o.agree) {
-    ++g.draws_agree;
+    ++s.run_draws_agree;
   } else {
     s.run_agree = false;
     for (uint32_t f = 0; f < fl::kFieldCount; ++f)
       if (o.fields >> f & 1)
-        ++s.draw_fields[f];
+        ++s.run_draw_fields[f];
     if (s.detailed < 32) {
       ++s.detailed;
       std::string fields;
@@ -552,6 +559,33 @@ void CommandProcessor::Fh1ListEnd() {
   const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;
   const fl::Outcome o = s.run.End(regs.values, bin_mask_, s.shaders);
   GroupCounts& g = s.groups[s.group];
+  // The generation again, after everything the buffer's packets read (the seqlock's second
+  // load, for the whole run): a fixup that started or ended while the list was decoded may have
+  // rewritten words the packets read, so agreement and disagreement alike mean nothing.
+  std::atomic_thread_fence(std::memory_order_acquire);
+  const uint32_t generation_end = s.state ? fl::Word(s.state, 0) : 0;
+  if (!fl::StableGeneration(s.generation, generation_end)) {
+    ++g.skips[size_t(fl::Skip::kFixupDuringRun)];
+    s.binding->pool_valid = false;
+    if (s.detailed < 32 && !(o.agree && s.run_agree)) {
+      ++s.detailed;
+      REXGPU_INFO(
+          "FH1 native lists: list {:08X} (group {}): a fixup ran during the run (generation "
+          "{} -> {}), its verdict dropped",
+          s.phys, s.group, s.generation, generation_end);
+    }
+    s.binding = nullptr;
+    s.ns_end += NowNs() - t0;
+    return;
+  }
+  ++g.compared;
+  if (s.untiled)
+    ++g.untiled_runs;
+  g.draws += s.run_draws;
+  g.draws_agree += s.run_draws_agree;
+  g.draws_skipped += s.run_draws_skipped;
+  for (uint32_t f = 0; f < fl::kFieldCount; ++f)
+    s.draw_fields[f] += s.run_draw_fields[f];
   if (!o.agree) {
     for (uint32_t f = 0; f < fl::kFieldCount; ++f)
       if (o.fields >> f & 1)

@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <string>
 #include <vector>
 
 #include "fh1_native_list_fixture.h"
@@ -586,11 +587,26 @@ void TestDefineAck() {
   CHECK(!fl::IsNewDefineSequence(0x80000000u, 0));
 }
 
+// The seqlock reader's test, at the run's start (the slots) and again at its end (the run):
+// stable only from an even generation that did not move.
+void TestStableGeneration() {
+  CHECK(fl::StableGeneration(0, 0));
+  CHECK(fl::StableGeneration(6, 6));
+  CHECK(!fl::StableGeneration(7, 7));            // a fixup under way at the first load
+  CHECK(!fl::StableGeneration(6, 7));            // one started in between
+  CHECK(!fl::StableGeneration(6, 8));            // one ran from start to end in between
+  CHECK(!fl::StableGeneration(7, 8));            // one ended in between
+  CHECK(!fl::StableGeneration(0xFFFFFFFEu, 0));  // at wrap
+  CHECK(fl::Skip::kFixupDuringRun < fl::Skip::kCount &&
+        std::string(fl::SkipName(fl::Skip::kFixupDuringRun)) == "fixup-during-run");
+}
+
 }  // namespace
 
 int main() {
   TestValidate();
   TestDefineAck();
+  TestStableGeneration();
   TestKey();
   TestRegistry();
   TestKeyCheck();
