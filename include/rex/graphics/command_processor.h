@@ -97,6 +97,9 @@ class CommandProcessor {
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
   // FH1 (0610): the native renderer's shadow mode statistics (fh1_native_shadow.cpp).
   struct Fh1NativeShadow;
+  // FH1 (0650): the native renderer's model list registry and its shadow compare
+  // (fh1_native_list.cpp).
+  struct Fh1Lists;
 
   virtual bool Initialize();
   virtual void Shutdown();
@@ -188,6 +191,14 @@ class CommandProcessor {
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   // FH1 (#45, patch 0360): see fh1_plain_registers_.
   bool Fh1WritePlainRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t count);
+  // FH1 (0650): its call sites' entry. With a run open, the range written and told out of line
+  // (Fh1ListWritePlainRange); without one, the test and Fh1WritePlainRangeFromRing as on main.
+  bool Fh1WritePlainRange(memory::RingBuffer* ring, uint32_t base, uint32_t count) {
+    if (fh1_list_reader_) [[unlikely]] {
+      return Fh1ListWritePlainRange(ring, base, count);
+    }
+    return Fh1WritePlainRangeFromRing(ring, base, count);
+  }
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet);
@@ -371,6 +382,53 @@ class CommandProcessor {
   void Fh1NativeShadowPacket(const uint32_t* words, uint32_t count);
   void Fh1NativeShadowDraw(uint32_t initiator, bool indexed, uint32_t index_base);
   void Fh1NativeShadowShutdown();
+
+  // FH1 (0650): the game's model lists (fh1_native_list.cpp): the registry ops, handled on the
+  // decoder; the run of a registered list compared with its template. Null until the first
+  // registry op, so without the game's native_lists switch nothing here runs.
+  Fh1Lists* fh1_lists_ = nullptr;
+  // The indirect buffer whose list is being compared (its draw packets are reported).
+  memory::RingBuffer* fh1_list_reader_ = nullptr;
+  void Fh1ListPacket(const uint32_t* words, uint32_t count);
+  bool Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBuffer* reader);
+  void Fh1ListDraw(uint32_t packet_offset, bool executed);
+  void Fh1ListEnd();
+  // A register write the decoder makes (its write paths' entries): told to the run being
+  // compared, if any. These paths are the decoder's hottest (PacketWriteRegister, the ranges
+  // from the ring), so without a run open this must be the null test and a branch never taken,
+  // nothing else: the call is out of line and cold, and on x86-64 clang it keeps every register
+  // but r11 (preserve_most), so a caller keeps its values where they are and saves no register
+  // for it. Where even a call would add to the path (it needs a stack frame), the path instead
+  // hands the whole write to a cold function that tells and makes it: PacketWriteRegister's
+  // unsplit path tail-calls Fh1ListWriteRegister, and Fh1WritePlainRangeFromRing's call sites
+  // take Fh1ListWritePlainRange (Fh1WritePlainRange), so that function stays main's.
+  void Fh1ListWrites(uint32_t first, uint32_t count) {
+    if (fh1_list_reader_) [[unlikely]]
+      Fh1ListNoteWrites(first, count);
+  }
+#if defined(__clang__) && defined(_M_X64)
+#define REX_FH1_LIST_SEAM __attribute__((noinline, cold, preserve_most))
+#elif defined(__clang__) && defined(__x86_64__)
+  // Hidden: always a direct call, never through the PLT (a lazy binding resolver keeps only
+  // the argument registers, preserve_most needs them all).
+#define REX_FH1_LIST_SEAM __attribute__((noinline, cold, preserve_most, visibility("hidden")))
+#elif defined(__GNUC__) || defined(__clang__)
+#define REX_FH1_LIST_SEAM __attribute__((noinline, cold))
+#else
+#define REX_FH1_LIST_SEAM __declspec(noinline)
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+#define REX_FH1_LIST_COLD __attribute__((noinline, cold))
+#else
+#define REX_FH1_LIST_COLD __declspec(noinline)
+#endif
+  REX_FH1_LIST_SEAM void Fh1ListNoteWrites(uint32_t first, uint32_t count);
+  REX_FH1_LIST_COLD void Fh1ListWriteRegister(uint32_t index, uint32_t value);
+  REX_FH1_LIST_COLD bool Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t base,
+                                                uint32_t count);
+  void Fh1ListShader(uint32_t address_type, uint32_t start_size);
+  void Fh1ListsSwap();
+  void Fh1ListsShutdown();
 
   // (type-0 packet, SET_CONSTANT of registers, SET_CONSTANT2) made only of such registers from
   // the ring itself, without the two virtual calls and the backend's sorting of the range (most
