@@ -196,6 +196,14 @@ REXCVAR_DEFINE_BOOL(vulkan_fractional_raster_readback, true, "GPU/Vulkan",
                     "(the picture in the top-left three quarters), for comparisons")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_readback_box_filter, true, "GPU/Vulkan",
+                    "With draw resolution scaling, an unsigned 8:8:8:8 or 2:10:10:10 color copy to "
+                    "guest memory gives each guest pixel the average of its host pixels (a photo, "
+                    "a Big Shot's tiles, a replay movie's frames). Off: one host pixel each (the "
+                    "top-left one, or the centre with readback_resolve_half_pixel_offset; car "
+                    "thumbnails keep the average), for comparisons")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_defer, true, "GPU/Vulkan",
                     "readback_resolve = some: put a resolve seen for the first time in guest "
                     "memory when the GPU has done it (a frame or two later) instead of waiting "
@@ -9060,6 +9068,28 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     // RGBA8 car thumbnails are saved at guest resolution. Average their
     // supersampled pixels rather than discarding all but one sample.
     if (thumbnail_readback) constants.half_pixel_offset = 2u;
+    // 1120 (#905): every unsigned normalized 8:8:8:8 or 2:10:10:10 color copy too (a photo and its
+    // thumbnail, a Big Shot's tiles, a replay movie's frames at render scale 2 or a 1440p output),
+    // as 1000 does on the fractional raster: each guest pixel the average of its host pixels.
+    // Signed and integer values would not average this way, and an endianness that swaps pixels
+    // within the 16-byte quad (8in64, 8in128) moves them across the host pixels the filter reads.
+    if (REXCVAR_GET(vulkan_readback_box_filter) && copy_control.copy_src_select < 4 &&
+        copy_dest_info.copy_dest_number == xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
+        copy_dest_info.copy_dest_endian <= xenos::Endian128::k16in32) {
+      switch (copy_dest_info.copy_dest_format) {
+        case xenos::ColorFormat::k_8_8_8_8:
+        case xenos::ColorFormat::k_8_8_8_8_A:
+        case xenos::ColorFormat::k_8_8_8_8_AS_16_16_16_16:
+          constants.half_pixel_offset = 2u;
+          break;
+        case xenos::ColorFormat::k_2_10_10_10:
+        case xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16:
+          constants.half_pixel_offset = 4u | (uint32_t(copy_dest_info.copy_dest_endian) << 4);
+          break;
+        default:
+          break;
+      }
+    }
     deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
                                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
                                                 &constants);
