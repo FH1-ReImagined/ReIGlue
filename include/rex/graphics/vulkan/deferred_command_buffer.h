@@ -20,6 +20,13 @@
 #include <rex/ui/vulkan/api.h>
 #include <rex/graphics/vulkan/fh1_dlss.h>
 
+// FH1 (#913): DeferredCommandBuffer::Fh1WriteHook, out of line and off the hot path.
+#if defined(__GNUC__) || defined(__clang__)
+#define REX_FH1_WRITE_HOOK __attribute__((noinline, cold))
+#else
+#define REX_FH1_WRITE_HOOK __declspec(noinline)
+#endif
+
 namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor;
@@ -82,19 +89,27 @@ class DeferredCommandBuffer {
         WriteCommand(Command::kFh1SetupBreadcrumb, sizeof(ArgsFh1Breadcrumb)));
     args.seq = seq;
   }
-  // FH1 (#913): the commands written to the main stream since the last call, by kind (counted
-  // only while breadcrumbs are set; the hoisted stream, which runs before the render pass, is
-  // not counted). The device-lost trail keeps them with each draw.
+  // FH1 (#913): the commands written to the main stream since the last call, by kind, while
+  // counting is on (gpu_device_lost_setup_breadcrumbs; off, WriteCommand does what it did). The
+  // device-lost trail keeps them with each draw and resolve (fh1_device_lost_trail.h::Work).
   struct Fh1Work {
-    uint16_t render_passes = 0;  // vkCmdBeginRenderPass, vkCmdBeginRendering
-    uint16_t draws = 0;          // vkCmdDraw, vkCmdDrawIndexed
+    uint16_t render_passes = 0;     // vkCmdBeginRenderPass, vkCmdBeginRendering
+    uint16_t render_pass_ends = 0;  // vkCmdEndRenderPass, vkCmdEndRendering
+    uint16_t draws = 0;             // vkCmdDraw, vkCmdDrawIndexed
     uint16_t dispatches = 0;
     uint16_t barriers = 0;
     uint16_t copies = 0;       // buffer and image copies, blits, fills, image clears
     uint16_t clears = 0;       // vkCmdClearAttachments
-    uint16_t queries = 0;      // vkCmdBeginQuery
+    uint16_t queries = 0;      // query begins, ends and pool resets
     uint16_t conditional = 0;  // conditional rendering begins
+    uint16_t uploads = 0;      // hoist points: the hoisted uploads run there
+    uint16_t upscales = 0;     // CmdFh1Dlss
+    uint16_t test_hangs = 0;   // CmdFh1TestHang
   };
+  void SetFh1CountWork(bool count) {
+    fh1_write_hooks_.count_work = count;
+    fh1_work_ = Fh1Work();
+  }
   Fh1Work Fh1TakeWork() {
     const Fh1Work work = fh1_work_;
     fh1_work_ = Fh1Work();
@@ -106,19 +121,19 @@ class DeferredCommandBuffer {
   // written to the main stream in a new zone. Returns the previous zone.
   void SetFh1GpuProfile(Fh1GpuProfile* profile) {
     fh1_gpu_profile_ = profile;
-    fh1_gpu_zone_pending_ = false;
+    fh1_write_hooks_.zone_pending = false;
   }
   uint16_t SetFh1GpuZone(uint16_t zone) {
     const uint16_t previous = fh1_gpu_zone_;
     fh1_gpu_zone_ = zone;
     // A zone left without commands of its own back to the marked one needs no timestamp.
-    fh1_gpu_zone_pending_ = fh1_gpu_profile_ != nullptr && zone != fh1_gpu_zone_marked_;
+    fh1_write_hooks_.zone_pending = fh1_gpu_profile_ != nullptr && zone != fh1_gpu_zone_marked_;
     return previous;
   }
   // The profile wrote a timestamp starting `zone`.
   void Fh1GpuZoneMarked(uint16_t zone) {
     fh1_gpu_zone_marked_ = zone;
-    fh1_gpu_zone_pending_ = false;
+    fh1_write_hooks_.zone_pending = false;
   }
   uint16_t fh1_gpu_zone() const { return fh1_gpu_zone_; }
   Fh1GpuProfile* fh1_gpu_profile() const { return fh1_gpu_profile_; }
@@ -804,6 +819,21 @@ class DeferredCommandBuffer {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  // FH1: what WriteCommand also does for a command written to the main stream, both flags tested
+  // at once there (one 16-bit compare and a branch; before #913 it tested the zone's flag and the
+  // stream inline): a timestamp starting a new GPU profile zone (#640) and the device-lost trail's
+  // count of the work before the next draw (#913). The rest is out of line.
+  struct Fh1WriteHooks {
+    bool zone_pending = false;
+    bool count_work = false;
+  };
+  static_assert(sizeof(Fh1WriteHooks) == sizeof(uint16_t));
+  bool Fh1AnyWriteHook() const {
+    uint16_t any;
+    std::memcpy(&any, &fh1_write_hooks_, sizeof(any));
+    return any != 0;
+  }
+  REX_FH1_WRITE_HOOK void Fh1WriteHook(Command command);
   void Fh1CountWork(Command command);
   void Fh1GpuZoneMark();
   VkCommandBuffer ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
@@ -822,7 +852,7 @@ class DeferredCommandBuffer {
   Fh1GpuProfile* fh1_gpu_profile_ = nullptr;
   uint16_t fh1_gpu_zone_ = 0;
   uint16_t fh1_gpu_zone_marked_ = 0;
-  bool fh1_gpu_zone_pending_ = false;
+  Fh1WriteHooks fh1_write_hooks_;
 };
 
 // FH1 (#640): the zone of the commands recorded in a scope.

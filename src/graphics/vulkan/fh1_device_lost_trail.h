@@ -11,14 +11,17 @@
 // submission's draws.
 //
 // FH1 (#913): the marker after a draw is written once the draw and everything recorded before
-// it has finished, so "unfinished" covers the draw and the work the emulator recorded for it
-// first (a new render pass, render target transfers, texture loads, barriers). Each entry now
-// keeps that work as counted while it was recorded, the draw's shader modifications and render
-// pass, and, for a draw with such work, a second marker (offset 8 of the buffer) once the work
-// has finished, before the draw itself (gpu_device_lost_setup_breadcrumbs, off by default): the
+// it has finished, so "unfinished" covers the draw and the work the emulator recorded after the
+// draw before it (the draw before's own trailing work, a new render pass, render target
+// transfers, texture loads, barriers). With
+// gpu_device_lost_setup_breadcrumbs (off by default) the entries also get details, kept apart
+// from them (SetDetails): the work as counted while it was recorded, the draw's shader
+// modifications and render pass, and, for a draw with such work, whether a second marker went
+// before the draw command (offset 8 of the buffer, written once the work has finished): the
 // report then says which of the two the GPU hung on. A draw with no work recorded between it and
 // the draw before (the draw command itself is not counted) needs no marker: the one after the
-// draw before already says that everything before it finished.
+// draw before already says that everything before it finished. Without the setting nothing of
+// this is recorded: Record is what it was, and the details are never written.
 //
 // Free of the Vulkan headers so that tools/test_device_lost_trail.cpp can test it.
 #include <array>
@@ -31,32 +34,36 @@ namespace rex::graphics::vulkan::fh1_device_lost_trail {
 
 enum class Kind : uint8_t { kDraw, kResolve };
 
-// Commands recorded since the previous draw or resolve, in the main command stream (hoisted
-// uploads run before the render pass, earlier than the draws before this one, and are not
-// counted). For a draw: before the draw command itself; for a resolve: with its own commands.
+// Commands recorded since the previous draw or resolve, in the main command stream. For a draw:
+// before the draw command itself; for a resolve: with its own commands. A hoist point counts as
+// the hoisted uploads (the shared memory uploads moved before the render pass run there, also
+// those recorded for later draws).
 struct Work {
-  uint16_t render_passes = 0;  // render pass or dynamic rendering begins
-  uint16_t draws = 0;          // host draws (render target transfers, clears drawn, effects)
-  uint16_t dispatches = 0;     // compute (texture loads, resolves, effects)
+  uint16_t render_passes = 0;     // render pass or dynamic rendering begins
+  uint16_t render_pass_ends = 0;  // their ends (store and resolve operations)
+  uint16_t draws = 0;             // host draws (render target transfers, clears drawn, effects)
+  uint16_t dispatches = 0;        // compute (texture loads, resolves, effects)
   uint16_t barriers = 0;
   uint16_t copies = 0;       // buffer and image copies, blits, fills, image clears
   uint16_t clears = 0;       // attachment clears in the render pass
-  uint16_t queries = 0;      // occlusion query begins
+  uint16_t queries = 0;      // query begins, ends and resets
   uint16_t conditional = 0;  // conditional rendering begins
+  uint16_t uploads = 0;      // hoist points (the hoisted uploads)
+  uint16_t upscales = 0;     // Fh1Dlss passes (DLSS, FSR 3, MetalFX)
+  uint16_t test_hangs = 0;   // FORZA_TEST_GPU_HANG_AT_FRAME's wait
   bool Any() const {
-    return render_passes || draws || dispatches || barriers || copies || clears || queries ||
-           conditional;
+    return render_passes || render_pass_ends || draws || dispatches || barriers || copies ||
+           clears || queries || conditional || uploads || upscales || test_hangs;
   }
 };
 
-// What the draw was drawn with, besides its shaders (0 for a resolve).
+// What a draw was drawn with, besides its shaders (0 for a resolve), and the work before it.
 struct Details {
   uint64_t vertex_shader_modification = 0;
   uint64_t pixel_shader_modification = 0;
   uint32_t render_pass_key = 0;  // VulkanRenderTargetCache::RenderPassKey::key
   Work work;
   bool setup_marked = false;  // a marker after `work`, before the draw (offset 8)
-  bool filled = false;        // recorded with these (the tests' entries are not)
 };
 
 struct Entry {
@@ -68,7 +75,6 @@ struct Entry {
   uint64_t frame = 0;
   uint64_t vertex_shader = 0;
   uint64_t pixel_shader = 0;  // 0: none (depth only)
-  Details details;
 };
 
 struct Range {
@@ -87,8 +93,7 @@ class Trail {
 
   // A new sequence number (never 0) for work about to be recorded.
   uint32_t Record(Kind kind, uint64_t submission, uint64_t frame, uint32_t vertex_count,
-                  uint64_t vertex_shader, uint64_t pixel_shader,
-                  const Details& details = Details()) {
+                  uint64_t vertex_shader, uint64_t pixel_shader) {
     uint32_t seq = ++next_;
     if (!seq) seq = ++next_;  // after 2^32 draws (about 10 hours of racing)
     Range& r = ranges_[submission % kRanges];
@@ -108,12 +113,24 @@ class Trail {
     e.frame = frame;
     e.vertex_shader = vertex_shader;
     e.pixel_shader = pixel_shader;
-    e.details = details;
     return seq;
   }
 
-  // The number the next Record gives (for the marker written before a draw is recorded).
+  // FH1 (#913): the number the next Record gives (for the marker written before a draw is
+  // recorded).
   uint32_t next() const { return next_ + 1 ? next_ + 1 : 1; }
+  // FH1 (#913): the details of entry `seq` (gpu_device_lost_setup_breadcrumbs only). Kept in an
+  // array of their own, so that without the setting Record stores what it stored before and
+  // these pages are never touched.
+  void SetDetails(uint32_t seq, const Details& details) {
+    DetailSlot& slot = details_[seq % kEntries];
+    slot.seq = seq;
+    slot.details = details;
+  }
+  const Details* FindDetails(uint32_t seq) const {
+    const DetailSlot& slot = details_[seq % kEntries];
+    return seq && slot.seq == seq && Find(seq) ? &slot.details : nullptr;
+  }
 
   const Entry* Find(uint32_t seq) const {
     const Entry& e = entries_[seq % kEntries];
@@ -129,6 +146,11 @@ class Trail {
   std::array<Entry, kEntries> entries_{};
   std::array<Range, kRanges> ranges_{};
   uint32_t next_ = 0;
+  struct DetailSlot {
+    uint32_t seq = 0;
+    Details details;
+  };
+  std::array<DetailSlot, kEntries> details_{};
 };
 
 // printf into a std::string (no fmt here, for the test).
@@ -234,53 +256,96 @@ inline std::string DescribeWork(const Work& w) {
     out += Format("%s%" PRIu32 " %s", out.empty() ? "" : ", ", n, n == 1 ? one : many);
   };
   part(w.render_passes, "render pass", "render passes");
+  part(w.render_pass_ends, "render pass end", "render pass ends");
   part(w.draws, "draw", "draws");
   part(w.dispatches, "dispatch", "dispatches");
   part(w.barriers, "barrier", "barriers");
   part(w.copies, "copy", "copies");
   part(w.clears, "attachment clear", "attachment clears");
-  part(w.queries, "query", "queries");
+  part(w.queries, "query command", "query commands");
   part(w.conditional, "conditional rendering begin", "conditional rendering begins");
+  part(w.uploads, "hoisted upload point", "hoisted upload points");
+  part(w.upscales, "upscaling pass", "upscaling passes");
+  part(w.test_hangs, "test hang", "test hangs");
   return out;
 }
 
 // The second line of the report: what the unfinished draw was drawn with, the work recorded
-// for it before the draw command, and whether the GPU finished that work. setup_finished: the
-// last number of a draw whose work before it the GPU finished (offset 8; 0: none, or no such
-// marker, as with VK_NV_device_diagnostic_checkpoints).
-inline std::string DescribeDetails(const Trail& trail, uint32_t finished, uint32_t setup_finished) {
+// between it and the last finished entry (before its draw command), and whether the GPU finished
+// that work. setup_finished: the last number of a draw whose work before it the GPU finished
+// (offset 8; 0: none). setup: gpu_device_lost_setup_breadcrumbs was on (the details were
+// recorded); without it the line only names the setting. buffer_markers: `finished` and
+// `setup_finished` come from VK_AMD_buffer_marker; VK_NV_device_diagnostic_checkpoints say
+// where the checkpoints got, not exactly which work finished, so they get no verdict.
+//
+// Only the deferred command buffer's work is counted. Between two submissions other work runs
+// on the same queue (the presenter's, other submissions), so when the last finished entry is in
+// another submission (or gone), a verdict that rests on nothing having been recorded in between
+// is not given.
+inline std::string DescribeDetails(const Trail& trail, uint32_t finished, uint32_t setup_finished,
+                                   bool setup, bool buffer_markers) {
   if (finished == trail.last_recorded())
     return std::string();
   const uint32_t next = finished + 1 ? finished + 1 : 1;
   const Entry* e = trail.Find(next);
-  if (!e || !e->details.filled)
+  if (!e)
     return std::string();
-  const Details& d = e->details;
-  std::string out = Format("GPU breadcrumbs, unfinished #%" PRIu32 " (%s): ", next,
-                           e->kind == Kind::kDraw ? "draw" : "resolve");
+  const char* const what = e->kind == Kind::kDraw ? "draw" : "resolve";
+  const std::string since =
+      finished ? Format("#%" PRIu32, finished) : std::string("the start of the trail");
+  std::string out = Format("GPU breadcrumbs, unfinished #%" PRIu32 " (%s): ", next, what);
+  if (!setup) {
+    // (Appended, not formatted: Format's buffer is 256 characters.)
+    return out + "whether the GPU hung in it or in the work recorded since " + since +
+           " (a render pass, render target transfers, texture loads, barriers) is logged with "
+           "gpu_device_lost_setup_breadcrumbs";
+  }
+  const Details* const d = trail.FindDetails(next);
+  if (!d)
+    return std::string();
+  const Entry* const last = trail.Find(finished);
+  const bool across = !last || last->submission != e->submission;
   if (e->kind == Kind::kDraw) {
     out += Format("VS modification %016" PRIX64 ", PS modification %016" PRIX64 ", ",
-                  d.vertex_shader_modification, d.pixel_shader_modification);
-    out += DescribeRenderPass(d.render_pass_key);
-    out += "; recorded before the draw command: " + DescribeWork(d.work);
+                  d->vertex_shader_modification, d->pixel_shader_modification);
+    out += DescribeRenderPass(d->render_pass_key);
+    out += "; recorded since " + since + ", before the draw command: " + DescribeWork(d->work);
   } else {
-    out += "recorded with it: " + DescribeWork(d.work);
+    out += "recorded since " + since + ", with it: " + DescribeWork(d->work);
   }
-  if (d.setup_marked) {
-    out += setup_finished == next
-               ? "; the GPU finished that work: it hung in the draw itself"
-               : "; the GPU did not finish that work: it hung in it, not in the draw";
-  } else if (e->kind == Kind::kDraw && !d.work.Any()) {
-    out += Format("; nothing else was recorded after #%" PRIu32 ": it hung in the draw itself",
-                  finished);
-  } else if (e->kind == Kind::kDraw) {
-    // The marker before the draw is off by default (its GPU time): the player turns it on.
-    out += "; in that work or in the draw: gpu_device_lost_setup_breadcrumbs tells them apart";
+  if (across) {
+    out += last ? Format("; #%" PRIu32 " is in submission %" PRIu64 ", #%" PRIu32
+                         " in submission %" PRIu64,
+                         finished, last->submission, next, e->submission)
+                : std::string("; the last finished entry is no longer in the trail");
   }
-  if (const Entry* last = trail.Find(finished);
-      last && last->details.filled && last->kind == Kind::kDraw &&
-      last->details.render_pass_key != d.render_pass_key) {
-    out += "; last finished in " + DescribeRenderPass(last->details.render_pass_key);
+  if (e->kind == Kind::kDraw) {
+    if (!buffer_markers) {
+      out += "; in that work or in the draw (no verdict with VK_NV_device_diagnostic_checkpoints)";
+    } else if (d->setup_marked && setup_finished == next) {
+      // The marker before the draw command says that everything before it on the queue finished.
+      out += "; the GPU finished that work: it hung in the draw itself";
+    } else if (d->setup_marked && !across) {
+      out +=
+          "; the GPU did not finish that work: it hung in it (or in the draw, if the draw ran "
+          "alongside it)";
+    } else if (d->setup_marked) {
+      out +=
+          "; the GPU did not finish that work or the other work on the queue between the two "
+          "submissions (the presenter's), which is not counted";
+    } else if (!d->work.Any() && !across) {
+      out += "; nothing else was recorded since " + since + ": it hung in the draw itself";
+    } else {
+      out +=
+          "; in the draw or in the other work on the queue between the two submissions (the "
+          "presenter's), which is not counted";
+    }
+    if (last && last->kind == Kind::kDraw) {
+      if (const Details* l = trail.FindDetails(finished);
+          l && l->render_pass_key != d->render_pass_key) {
+        out += "; last finished in " + DescribeRenderPass(l->render_pass_key);
+      }
+    }
   }
   return out;
 }
