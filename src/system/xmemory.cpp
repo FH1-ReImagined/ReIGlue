@@ -2056,9 +2056,8 @@ rex::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address, uint32_
 }
 
 bool BaseHeap::FindUncommittedRun(uint32_t start, uint32_t end, uint32_t* run_start,
-                                  uint32_t* run_end) const {
-  // Without heap_mutex_, as EnableAccessCallbacks and TriggerCallbacks read the page table: the
-  // table is never resized, and an entry is one aligned 64-bit word.
+                                  uint32_t* run_end) {
+  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
   start = std::max(start, heap_base_);
   end = uint32_t(std::min(uint64_t(end), uint64_t(heap_base_) + heap_size_));
   if (start >= end) {
@@ -2168,6 +2167,7 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
   alignment = rex::round_up(alignment, page_size_);
 
   uint32_t address;
+  std::vector<std::pair<uint32_t, uint32_t>> new_runs;  // physical (start, size)
   {
     // Global critical region before heap_mutex_ - see
     // AcquireHostPageReconcileLock for why the order matters.
@@ -2179,6 +2179,18 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
     // committed pages in the requested physical range.
     // TODO(benvanik): flag for ensure-not-committed?
     uint32_t parent_base_address = GetPhysicalAddress(base_address);
+    // Patch 1110: only pages no view held get new contents; committing pages again keeps theirs
+    // (and what the GPU wrote there).
+    if (allocation_type & memory::kMemoryAllocationCommit) {
+      uint32_t run_start, run_end;
+      uint32_t position = parent_base_address;
+      const uint32_t parent_end = parent_base_address + size;
+      while (position < parent_end &&
+             parent_heap_->FindUncommittedRun(position, parent_end, &run_start, &run_end)) {
+        new_runs.emplace_back(run_start, std::min(run_end, parent_end) - run_start);
+        position = run_end;
+      }
+    }
     if (!parent_heap_->AllocFixed(parent_base_address, size, alignment, allocation_type, protect)) {
       REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
       return false;
@@ -2193,8 +2205,9 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
       return false;
     }
   }
-  if (allocation_type & memory::kMemoryAllocationCommit) {
-    InvalidateNewContents(address, size);  // patch 1110
+  for (const auto& [run_physical, run_size] : new_runs) {
+    InvalidateNewContents(heap_base_ + run_physical - GetPhysicalAddress(heap_base_),
+                          run_size);  // patch 1110
   }
 
   return true;
@@ -2310,7 +2323,7 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   // Patch 1110: the watch above only covers pages that were watched. A page that was read-only
   // had none (EnableAccessCallbacks skips it), and the GPU may hold it as up to date.
   if (protect & memory::kMemoryProtectWrite) {
-    InvalidateNewContents(address, size);
+    WatchMadeWritable(address, size);
   }
   return true;
 }
@@ -2320,17 +2333,30 @@ void PhysicalHeap::InvalidateNewContents(uint32_t address, uint32_t size) {
     return;
   }
   size = std::min(size, heap_size_ - (address - heap_base_));
+  // A request on another thread may have armed a watch on these pages while the heaps were being
+  // updated (the update sets the host protection without the global critical region): the page
+  // is then marked as watched with the protection the update gave it, and its watch would never
+  // fire. TriggerCallbacks unwatches it, setting the protection the page table gives, and tells
+  // the callbacks. With no page watched, the common case, it tells nobody: tell them here.
+  if (TriggerCallbacks(global_critical_region_.Acquire(), address, size, true, true)) {
+    return;
+  }
   auto global_lock = global_critical_region_.Acquire();
   const uint32_t physical_address = GetPhysicalAddress(address);
   for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
     invalidation_callback->first(invalidation_callback->second, physical_address, size, true);
   }
-  // A request on another thread may have armed a watch on these pages while the heaps were
-  // being updated (the update sets the host protection without the global critical region):
-  // the page is then marked as watched with the protection the update gave it, and its watch
-  // would never fire. Unwatching sets the protection the page table gives; the next request
-  // arms the watch again. Nothing to do, and no callback, when no page is watched.
-  TriggerCallbacks(std::move(global_lock), address, size, true, true);
+}
+
+void PhysicalHeap::WatchMadeWritable(uint32_t address, uint32_t size) {
+  if (!size || address < heap_base_ || address - heap_base_ >= heap_size_) {
+    return;
+  }
+  size = std::min(size, heap_size_ - (address - heap_base_));
+  // As above, a watch armed while BaseHeap::Protect set the host protection may have lost it:
+  // drop it (nothing happens when no page is watched), then arm the watch on every page.
+  TriggerCallbacks(global_critical_region_.Acquire(), address, size, true, true);
+  memory_->EnablePhysicalMemoryAccessCallbacks(GetPhysicalAddress(address), size, true, false);
 }
 
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t length,

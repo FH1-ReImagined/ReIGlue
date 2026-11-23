@@ -270,10 +270,8 @@ class BaseHeap {
 
   // Patch 1110 (ReIGlue #64): the first run of whole pages in [start, end) that are not
   // committed (free or only reserved), from start on. Returns false if there is none, else the
-  // run's bounds, page aligned (*run_end may be past end). Reads the page table without the heap
-  // mutex: a page allocated or released meanwhile may be reported either way.
-  bool FindUncommittedRun(uint32_t start, uint32_t end, uint32_t* run_start,
-                          uint32_t* run_end) const;
+  // run's bounds, page aligned (*run_end may be past end). Takes heap_mutex_.
+  bool FindUncommittedRun(uint32_t start, uint32_t end, uint32_t* run_start, uint32_t* run_end);
 
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
@@ -386,14 +384,17 @@ class PhysicalHeap : public BaseHeap {
 
   VirtualHeap* parent_heap_;
 
-  // Patch 1110 (ReIGlue #64): tells the invalidation callbacks (the GPU's copies of guest memory)
-  // that [address, address + size) holds new contents, whether or not a page of it is watched,
-  // and drops any watch armed on it while it was being allocated or made writable. Called
-  // after an allocation that commits pages and after a protection change that makes them
-  // writable: a page the GPU read while it was free (a frame still queued after a release) or
-  // read-only had no watch armed, and TriggerCallbacks tells nobody about such a page.
-  // Takes the global critical region; call it without heap_mutex_ held.
+  // Patch 1110 (ReIGlue #64): a page the GPU read while it was free (a frame still queued after
+  // a release) or read-only had no write watch armed (EnableAccessCallbacks skips such pages), so
+  // the GPU's copy may hold it as up to date, and TriggerCallbacks tells nobody about a page
+  // that is not watched. Both take the global critical region; call them without heap_mutex_.
+  //
+  // After an allocation commits pages that were not committed: tells the invalidation callbacks
+  // that [address, address + size) holds new contents, whether or not a page of it is watched.
   void InvalidateNewContents(uint32_t address, uint32_t size);
+  // After a protection change makes pages writable: arms the watch on them, so the first write
+  // invalidates the GPU's copy and what it holds until then (also what the GPU wrote) is kept.
+  void WatchMadeWritable(uint32_t address, uint32_t size);
 
   uint32_t system_page_size_;
   uint32_t system_page_count_;
@@ -562,15 +563,6 @@ class Memory {
   void EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                            bool enable_invalidation_notifications,
                                            bool enable_data_providers);
-
-  // Patch 1110 (ReIGlue #64): the first run of physical memory in [start, end) that no view
-  // holds (free or only reserved in the physical heap every view allocates from), in whole
-  // 4 KB pages: false if there is none. A view of such memory cannot be write-watched
-  // (EnablePhysicalMemoryAccessCallbacks skips pages a heap does not hold).
-  bool FindUncommittedPhysicalRun(uint32_t start, uint32_t end, uint32_t* run_start,
-                                  uint32_t* run_end) const {
-    return heaps_.physical.FindUncommittedRun(start, end, run_start, run_end);
-  }
 
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was

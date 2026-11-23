@@ -83,7 +83,8 @@ set_target_properties(shader_disasm_test PROPERTIES
 add_test(NAME gpu.shader_disasm COMMAND shader_disasm_test)
 
 # The GPU's copy of guest memory and its write watches (1110, ReIGlue #64): the real guest Memory
-# and SharedMemory, no GPU (the plugin exports neither, so the test builds shared_memory.cpp).
+# and SharedMemory, no GPU (the plugin does not export SharedMemory, so the test builds
+# shared_memory.cpp).
 # Its own process: Memory maps 4.5GB, one per process.
 add_executable(shared_memory_watch_test shared_memory_watch_test.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp)
@@ -95,6 +96,9 @@ target_compile_options(shared_memory_watch_test PRIVATE
 set_target_properties(shared_memory_watch_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
 add_test(NAME gpu.shared_memory_watch COMMAND shared_memory_watch_test)
+# The views as Windows maps them (64 KB view offset granularity: the 0xE0000000 heap's 0x1000
+# is a host address offset).
+add_test(NAME gpu.shared_memory_watch.64k COMMAND shared_memory_watch_test --view-granularity 0x10000)
 
 add_executable(driver_cache_file_test driver_cache_file_test.cpp)
 target_include_directories(driver_cache_file_test PRIVATE ${PROJECT_SOURCE_DIR}/include)

@@ -321,63 +321,27 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
 
-  // Patch 1110: the valid bits, the watch and the check below in one hold of the global critical
-  // region (the watch took it on its own before), so an allocation's invalidation of these pages
-  // comes before or after all three.
-  auto global_lock = global_critical_region_.Acquire();
+  {
+    auto global_lock = global_critical_region_.Acquire();
 
-  for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
-    uint64_t valid_bits = UINT64_MAX;
-    if (i == valid_block_first) {
-      valid_bits &= ~((uint64_t(1) << (valid_page_first & 63)) - 1);
+    for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
+      uint64_t valid_bits = UINT64_MAX;
+      if (i == valid_block_first) {
+        valid_bits &= ~((uint64_t(1) << (valid_page_first & 63)) - 1);
+      }
+      if (i == valid_block_last && (valid_page_last & 63) != 63) {
+        valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
+      }
+      system_page_flags_valid_[i] |= valid_bits;
+      uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
+      gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
     }
-    if (i == valid_block_last && (valid_page_last & 63) != 63) {
-      valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
-    }
-    system_page_flags_valid_[i] |= valid_bits;
-    uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
-    gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
   }
 
   if (memory_invalidation_callback_handle_) {
     memory().EnablePhysicalMemoryAccessCallbacks(
         valid_page_first << page_size_log2_,
         (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
-    // Patch 1110 (ReIGlue #64): memory that no view holds (a block released while a frame
-    // still queued reads it) cannot be watched, so a write after it is allocated again would
-    // never be seen: such pages are uploaded but not held as valid. Not for what the GPU wrote
-    // (a resolve), which is only in the GPU's copy; an allocation invalidates it
-    // (PhysicalHeap::InvalidateNewContents). Pages the guest holds read-only stay valid too:
-    // the protection change that makes them writable invalidates them.
-    if (!written_by_gpu) {
-      DropUnheldPages(valid_page_first, valid_page_last);
-    }
-  }
-}
-
-void SharedMemory::DropUnheldPages(uint32_t page_first, uint32_t page_last) {
-  const uint32_t page_size = uint32_t(1) << page_size_log2_;
-  const uint32_t end = (page_last + 1) << page_size_log2_;
-  uint32_t position = page_first << page_size_log2_;
-  uint32_t run_start, run_end;
-  while (position < end &&
-         memory().FindUncommittedPhysicalRun(position, end, &run_start, &run_end)) {
-    // Only pages no part of which is held: with host pages larger than the guest's 4 KB, a page
-    // partly held is watched through the view that holds that part, and its writes are seen.
-    const uint32_t drop_first = uint32_t((uint64_t(run_start) + page_size - 1) >> page_size_log2_);
-    const uint32_t drop_end = std::min(run_end >> page_size_log2_, page_last + 1);
-    for (uint32_t page = drop_first; page < drop_end;) {
-      const uint32_t block = page >> 6;
-      const uint32_t block_end = std::min(drop_end, (block + 1) << 6);
-      uint64_t bits = UINT64_MAX << (page & 63);
-      if (block_end & 63) {
-        bits &= (uint64_t(1) << (block_end & 63)) - 1;
-      }
-      system_page_flags_valid_[block] &= ~bits;
-      system_page_flags_valid_and_gpu_written_[block] &= ~bits;
-      page = block_end;
-    }
-    position = run_end;
   }
 }
 

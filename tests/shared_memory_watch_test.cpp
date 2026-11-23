@@ -4,22 +4,27 @@
 // A page the GPU copy holds as valid must be watched, or the first write to it after that must
 // invalidate it some other way. Memory released while a frame still queued reads it, or held
 // read-only, cannot be watched (EnablePhysicalMemoryAccessCallbacks skips pages a heap does not
-// hold or the guest may not write): such a page must not be held as valid, or the allocation
-// or protection change that makes it writable again must invalidate it.
+// hold or the guest may not write), so the GPU copy may hold it as valid with no watch: the
+// allocation that gives such pages new contents must invalidate them, and the protection change
+// that makes them writable must arm their watch.
 //
-// Its own process (ctest runs it apart from unit_tests): Memory maps 4.5GB, one per process. No
-// Catch2: its signal handler would take the access violations that guest stores to watched
-// pages raise. `--bench` (not run by ctest) times the paths the fix touches.
+// Its own process (ctest runs it apart from unit_tests): Memory maps 4.5GB, one per process.
+// `--view-granularity 0x10000` maps the views as on a host with that view offset granularity
+// (Windows; the 0xE0000000 heap then has a host address offset). No Catch2: its signal handler
+// would take the access violations that guest stores to watched pages raise. `--bench` (not run
+// by ctest) times the paths the fix touches.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
 
 #include <rex/graphics/shared_memory.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread/mutex.h>
 
@@ -137,37 +142,13 @@ void StaysAllocated() {
   CHECK(gpu.Uploads(physical, kBlock));
   CHECK_FALSE(gpu.Uploads(physical, kBlock));
 
-  REQUIRE(E0().Release(address));
-}
+  // An allocation next to it leaves it as it is.
+  REQUIRE(E0().AllocFixed(address + kBlock, kBlock, 0x1000, kCommit, kReadWrite));
+  CHECK(gpu.IsRangeValid(physical, kBlock));
+  CHECK_FALSE(gpu.Uploads(physical, kBlock));
 
-// Memory no view holds is uploaded but not held as valid.
-void NotHeldNotValid() {
-  {
-    current_case = "not held: released while a frame still reads it";
-    CountingSharedMemory gpu(TestMemory());
-    const uint32_t physical = 0x08100000;
-    ReleaseAfterRead(gpu, physical);
-    CHECK_FALSE(gpu.IsRangeValid(physical, kBlock));
-    CHECK(gpu.Uploads(physical, kBlock));
-  }
-  {
-    current_case = "not held: never allocated";
-    CountingSharedMemory gpu(TestMemory());
-    const uint32_t physical = 0x08200000;
-    CHECK(gpu.Uploads(physical, kBlock));
-    CHECK_FALSE(gpu.IsRangeValid(physical, kBlock));
-  }
-  {
-    current_case = "not held: only part of the range is held";
-    CountingSharedMemory gpu(TestMemory());
-    const uint32_t physical = 0x08300000;
-    REQUIRE(E0().AllocFixed(E0Address(physical), 0x1000, 0x1000, kCommit, kReadWrite));
-    CHECK(gpu.Uploads(physical, 0x3000));
-    CHECK(gpu.IsRangeValid(physical, 0x1000));
-    CHECK_FALSE(gpu.IsRangeValid(physical + 0x1000, 0x1000));
-    CHECK_FALSE(gpu.IsRangeValid(physical + 0x2000, 0x1000));
-    REQUIRE(E0().Release(E0Address(physical)));
-  }
+  REQUIRE(E0().Release(address + kBlock));
+  REQUIRE(E0().Release(address));
 }
 
 // Released, read once more, allocated again (`how`): a write after it is seen.
@@ -198,7 +179,7 @@ void AllocatedAgain(Again how) {
       REQUIRE(heap->AllocFixed(address, kBlock, kBlock, kCommit, kReadWrite));
       break;
   }
-  // The contents the allocation gives are not the GPU copy's either.
+  // The contents the allocation gives are not the GPU copy's.
   CHECK_FALSE(gpu.IsRangeValid(physical, kBlock));
   CHECK(gpu.Uploads(physical, kBlock));
   CHECK_FALSE(gpu.Uploads(physical, kBlock));
@@ -232,6 +213,25 @@ void AllocAgain() {
   REQUIRE(E0().Release(address));
 }
 
+// Committing pages again keeps their contents, also what the GPU wrote; the pages the same
+// commit adds get new ones.
+void CommittedAgain() {
+  current_case = "committed again";
+  CountingSharedMemory gpu(TestMemory());
+  const uint32_t physical = 0x08700000;
+  const uint32_t address = E0Address(physical);
+  REQUIRE(E0().AllocFixed(address, kBlock, 0x1000, kCommit, kReadWrite));
+  gpu.RangeWrittenByGpu(physical, kBlock);
+  ReleaseAfterRead(gpu, physical + kBlock);
+
+  REQUIRE(E0().AllocFixed(address, 2 * kBlock, 0x1000, kCommit, kReadWrite));
+  CHECK(gpu.IsRangeValid(physical, kBlock));
+  CHECK(gpu.IsRangeGpuWritten(physical, kBlock));
+  CHECK_FALSE(gpu.IsRangeValid(physical + kBlock, kBlock));
+
+  REQUIRE(E0().Release(address));
+}
+
 // A read-only block made writable: a write after it is seen.
 void ReadOnlyMadeWritable() {
   current_case = "read-only made writable";
@@ -244,6 +244,7 @@ void ReadOnlyMadeWritable() {
   CHECK(gpu.Uploads(physical, kBlock));
   CHECK_FALSE(gpu.Uploads(physical, kBlock));
   REQUIRE(E0().Protect(address, kBlock, kReadWrite));
+  CHECK_FALSE(gpu.Uploads(physical, kBlock));  // nothing written yet
   GuestStore(address + 0x20, 4);
   CHECK_FALSE(gpu.IsRangeValid(physical, 0x1000));
   CHECK(gpu.Uploads(physical, kBlock));
@@ -253,18 +254,21 @@ void ReadOnlyMadeWritable() {
   REQUIRE(E0().Release(address));
 }
 
-// What the GPU wrote where no view holds it stays valid until an allocation.
-void GpuWrittenNotHeld() {
-  current_case = "GPU-written, not held";
+// What the GPU wrote to a read-only block stays when the block is made writable, until a write.
+void GpuWrittenReadOnlyMadeWritable() {
+  current_case = "GPU-written read-only made writable";
   CountingSharedMemory gpu(TestMemory());
   const uint32_t physical = 0x08600000;
+  const uint32_t address = E0Address(physical);
+  REQUIRE(E0().AllocFixed(address, kBlock, 0x1000, kCommit, rex::memory::kMemoryProtectRead));
   gpu.RangeWrittenByGpu(physical, kBlock);
-  CHECK(gpu.IsRangeValid(physical, kBlock));
+  REQUIRE(E0().Protect(address, kBlock, kReadWrite));
+  CHECK(gpu.IsRangeGpuWritten(physical, kBlock));
   CHECK_FALSE(gpu.Uploads(physical, kBlock));
+  GuestStore(address + 0x40, 6);
+  CHECK_FALSE(gpu.IsRangeValid(physical, 0x1000));
 
-  REQUIRE(E0().AllocFixed(E0Address(physical), kBlock, 0x1000, kCommit, kReadWrite));
-  CHECK_FALSE(gpu.IsRangeValid(physical, kBlock));
-  REQUIRE(E0().Release(E0Address(physical)));
+  REQUIRE(E0().Release(address));
 }
 
 template <typename F>
@@ -301,12 +305,8 @@ void Bench() {
       gpu.MemoryInvalidationCallback(physical, length, true);
       gpu.RequestRange(physical, length);
     });
-    const double invalidate_only =
-        BestNanoseconds(100000, [&] { gpu.MemoryInvalidationCallback(physical, length, true); });
-    std::printf(
-        "%4u pages: request of valid pages %7.1f ns, invalidation + upload %7.1f ns "
-        "(the invalidation alone %7.1f ns)\n",
-        pages, valid, upload, invalidate_only);
+    std::printf("%4u pages: request of valid pages %7.1f ns, invalidation + upload %7.1f ns\n",
+                pages, valid, upload);
   }
   REQUIRE(E0().Release(E0Address(physical)));
 
@@ -318,27 +318,48 @@ void Bench() {
     });
     std::printf("AllocFixed + Release of %7u bytes: %8.1f ns\n", block, alloc);
   }
+  // Protect read-only, then writable, of a committed block.
+  REQUIRE(E0().AllocFixed(E0Address(physical), size, 0x1000, kCommit, kReadWrite));
+  for (uint32_t block : {0x1000u, kBlock, 0x400000u}) {
+    const uint32_t address = E0Address(physical);
+    const double protect = BestNanoseconds(20000, [&] {
+      E0().Protect(address, block, rex::memory::kMemoryProtectRead);
+      E0().Protect(address, block, kReadWrite);
+    });
+    std::printf("Protect read-only + read-write of %7u bytes: %8.1f ns\n", block, protect);
+  }
+  REQUIRE(E0().Release(E0Address(physical)));
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+  bool bench = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--bench") == 0) {
+      bench = true;
+    } else if (std::strcmp(argv[i], "--view-granularity") == 0 && i + 1 < argc) {
+      rex::memory::detail::SetHostViewOffsetGranularityForTesting(
+          std::strtoul(argv[++i], nullptr, 0));
+    }
+  }
+  if (bench) {
     Bench();
     return failures ? 1 : 0;
   }
   StaysAllocated();
-  NotHeldNotValid();
   AllocatedAgain(Again::kAllocFixed);
   AllocatedAgain(Again::kAllocRange);
   AllocatedAgain(Again::kOtherView);
   AllocAgain();
+  CommittedAgain();
   ReadOnlyMadeWritable();
-  GpuWrittenNotHeld();
+  GpuWrittenReadOnlyMadeWritable();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;
   }
-  std::printf("shared memory watch: all checks passed\n");
+  std::printf("shared memory watch (0xE0000000 host offset 0x%X): all checks passed\n",
+              TestMemory().LookupHeap(0xE0000000)->host_address_offset());
   return 0;
 }
