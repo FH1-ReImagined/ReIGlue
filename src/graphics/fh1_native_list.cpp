@@ -565,8 +565,9 @@ void CommandProcessor::Fh1ListEnd() {
   std::atomic_thread_fence(std::memory_order_acquire);
   const uint32_t generation_end = s.state ? fl::Word(s.state, 0) : 0;
   if (!fl::StableGeneration(s.generation, generation_end)) {
+    // The pool needs no invalidating: its generation is the run's start's, so the next run
+    // reads the slots again.
     ++g.skips[size_t(fl::Skip::kFixupDuringRun)];
-    s.binding->pool_valid = false;
     if (s.detailed < 32 && !(o.agree && s.run_agree)) {
       ++s.detailed;
       REXGPU_INFO(
