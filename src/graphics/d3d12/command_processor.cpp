@@ -3097,7 +3097,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     if (scaled_address < scaled_buffer_base) {
       return true;
     }
-    // 1130 (#962): the copy goes to written_address, the first tile of the written extent, which
+    // 1140 (#962): the copy goes to written_address, the first tile of the written extent, which
     // is past the current range's start (copy_dest_base) for an 8- or 16-bit copy whose first
     // tile is not on the base's coarser granularity and for a copy to a slice other than 0. Read
     // the scaled resolve from there, as Vulkan does (GetScaledResolveRange of written_address).
