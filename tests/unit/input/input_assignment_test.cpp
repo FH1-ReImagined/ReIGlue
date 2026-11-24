@@ -1,9 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -342,4 +344,81 @@ TEST_CASE("The stick deadzones still apply to a pad", "[input]") {
   driver->SetSticks(1, 0, 0, 20000, 0);
   REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
   CHECK(state.gamepad.thumb_rx == 20000);
+}
+
+TEST_CASE("The stick deadzones zero a drifting stick in every direction", "[input]") {
+  struct Deadzones {
+    Deadzones() {
+      REXCVAR_SET(left_stick_deadzone_percentage, 0.1);
+      REXCVAR_SET(right_stick_deadzone_percentage, 0.1);
+    }
+    ~Deadzones() {
+      REXCVAR_SET(left_stick_deadzone_percentage, 0.0);
+      REXCVAR_SET(right_stick_deadzone_percentage, 0.0);
+    }
+  } deadzones;
+  // The ranges the capabilities report: 0x7FFF (the nop driver and the tests above), 0xFFC0
+  // (XInput's resolution mask for a 360 pad) and 0xFFFF (the SDL driver). The deadzone's radius
+  // is the range times the percentage.
+  for (const uint16_t range : {uint16_t{0x7FFF}, uint16_t{0xFFC0}, uint16_t{0xFFFF}}) {
+    FakeDriver* driver = nullptr;
+    auto system = SharedSystem(&driver);
+    driver->Add(1);
+    const auto caps = static_cast<int16_t>(range);
+    driver->SetCapsSticks(1, caps, caps, caps, caps);
+    const double radius = range * 0.1;
+    X_INPUT_STATE state = {};
+    auto read = [&](int16_t x, int16_t y) {
+      driver->SetSticks(1, x, y, x, y);
+      REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+    };
+    // Every 45 degrees from right, round the circle: on both axes and in all four quadrants.
+    for (int step = 0; step < 8; ++step) {
+      const double angle = step * 3.14159265358979323846 / 4.0;
+      for (const double fraction : {0.6, 1.5}) {
+        const auto x = static_cast<int16_t>(std::lround(std::cos(angle) * radius * fraction));
+        const auto y = static_cast<int16_t>(std::lround(std::sin(angle) * radius * fraction));
+        INFO("range " << range << ", stick " << x << ", " << y);
+        read(x, y);
+        if (fraction < 1.0) {
+          CHECK(state.gamepad.thumb_lx == 0);
+          CHECK(state.gamepad.thumb_ly == 0);
+          CHECK(state.gamepad.thumb_rx == 0);
+          CHECK(state.gamepad.thumb_ry == 0);
+        } else {
+          // Past the deadzone the stick passes through as it is.
+          CHECK(state.gamepad.thumb_lx == x);
+          CHECK(state.gamepad.thumb_ly == y);
+          CHECK(state.gamepad.thumb_rx == x);
+          CHECK(state.gamepad.thumb_ry == y);
+        }
+      }
+    }
+    // A small drift off both axes, one of them negative.
+    for (const auto& [x, y] :
+         {std::pair<int16_t, int16_t>{300, -300}, {-300, 300}, {-300, -300}, {-1, 0}, {0, -1}}) {
+      INFO("range " << range << ", stick " << x << ", " << y);
+      read(x, y);
+      CHECK(state.gamepad.thumb_lx == 0);
+      CHECK(state.gamepad.thumb_ly == 0);
+      CHECK(state.gamepad.thumb_rx == 0);
+      CHECK(state.gamepad.thumb_ry == 0);
+    }
+    // The ends of the range, -32768 among them, pass through.
+    for (const auto& [x, y] : {std::pair<int16_t, int16_t>{-32768, 0},
+                               {32767, 0},
+                               {0, -32768},
+                               {0, 32767},
+                               {-32768, -32768},
+                               {32767, 32767},
+                               {-32768, 32767},
+                               {32767, -32768}}) {
+      INFO("range " << range << ", stick " << x << ", " << y);
+      read(x, y);
+      CHECK(state.gamepad.thumb_lx == x);
+      CHECK(state.gamepad.thumb_ly == y);
+      CHECK(state.gamepad.thumb_rx == x);
+      CHECK(state.gamepad.thumb_ry == y);
+    }
+  }
 }
