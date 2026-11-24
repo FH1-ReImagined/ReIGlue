@@ -113,11 +113,12 @@ enum VerifyField : uint32_t {
   kVerifyBinMask,      // the bin mask
   kVerifyShaders,      // the IM_LOAD words, and unsplit the shaders loaded
   kVerifyFull,         // the sampled compare of the whole register file from 0x2000
+  kVerifyDraws,        // unsplit, sampled: the program's registers at each draw, and whether it ran
   kVerifyFieldCount,
 };
 constexpr const char* kVerifyFieldNames[kVerifyFieldCount] = {
-    "record words", "registers", "record counters",    "noted stores",
-    "bin mask",     "shaders",   "whole register file"};
+    "record words", "registers", "record counters",     "noted stores",
+    "bin mask",     "shaders",   "whole register file", "draws"};
 // The runs timed, by which went first: [0] the packets, [1] the replay.
 struct VerifyTiming {
   uint64_t runs = 0, ops = 0, dwords = 0, draws = 0, ns_stock = 0, ns_replay = 0;
@@ -215,6 +216,9 @@ struct CommandProcessor::Fh1Lists {
     uint64_t header_perturbed = 0, header_caught = 0, value_perturbed = 0, value_caught = 0,
              tile_perturbed = 0, tile_effective = 0, tile_caught = 0;
     uint64_t compared = 0;  // verified runs compared, but the self-checks' and the dropped
+    // Unsplit, every Nth run (and every self-check's) also compares the state at each draw: the
+    // packets then run with the draw seam open, so these runs are not timed.
+    uint64_t draw_check_every = 8, draw_check_count = 0, draw_checked = 0;
     uint32_t detailed = 0;
   } v;
   std::unique_ptr<RegisterFile> scratch_regs;
@@ -224,6 +228,9 @@ struct CommandProcessor::Fh1Lists {
   std::vector<uint32_t> captured, scratch_draws, full_start, full_expected;
   size_t capture_from = 0;
   uint64_t capture_ns = 0;
+  // Unsplit draw checks: per draw whether it ran, then the program's registers.
+  std::vector<uint32_t> stock_draw_states, replay_draw_states;
+  const std::vector<uint32_t>* draw_ranges = nullptr;
   bool verifying = false;
   fl::ReplayProgram perturbed_program;
 };
@@ -471,6 +478,8 @@ void CommandProcessor::Fh1ListPacket(const uint32_t* words, uint32_t count) {
         s.v.perturb_value_every = std::strtoull(e, nullptr, 10);
       if (const char* e = std::getenv("FH1_NATIVE_LISTS_VERIFY_TILE"))
         s.v.perturb_tile_every = std::strtoull(e, nullptr, 10);
+      if (const char* e = std::getenv("FH1_NATIVE_LISTS_VERIFY_DRAWS_EVERY"))
+        s.v.draw_check_every = std::strtoull(e, nullptr, 10);
       if (const char* e = std::getenv("FH1_NATIVE_LISTS_VERIFY_FULL_EVERY"))
         s.v.full_every = std::strtoull(e, nullptr, 10);
       uint64_t best = ~uint64_t(0);
@@ -643,6 +652,16 @@ bool CommandProcessor::Fh1ListBegin(uint32_t ptr, uint32_t count, memory::RingBu
 
 void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
   auto& s = *fh1_lists_;
+  if (s.mode == Fh1Lists::Mode::kVerify) {
+    // 0660: an unsplit draw check (the replay's Snap, for the packets).
+    s.stock_draw_states.push_back(executed);
+    const uint32_t* values = register_file_->values;
+    for (size_t i = 0; i < s.draw_ranges->size(); i += 2) {
+      s.stock_draw_states.insert(s.stock_draw_states.end(), values + (*s.draw_ranges)[i],
+                                 values + (*s.draw_ranges)[i + 1]);
+    }
+    return;
+  }
   const uint64_t t0 = NowNs();
   const RegisterFile& regs = record_split_ ? *decode_register_file_ : *register_file_;
   const uint32_t k = s.run.next_draw();
@@ -676,14 +695,16 @@ void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
 }
 
 void CommandProcessor::Fh1ListNoteWrites(uint32_t first, uint32_t count) {
-  fh1_lists_->run.LiveWrites(first, count);
+  if (fh1_lists_->mode == Fh1Lists::Mode::kShadow)  // 0660: not a verify draw check's
+    fh1_lists_->run.LiveWrites(first, count);
 }
 
 // The write paths' cold halves, with a run open: PacketWriteRegister's unsplit path tail-calls
 // the first (so that path needs no stack frame), Fh1WritePlainRange's call sites call the second
 // (so Fh1WritePlainRangeFromRing stays main's).
 void CommandProcessor::Fh1ListWriteRegister(uint32_t index, uint32_t value) {
-  fh1_lists_->run.LiveWrites(index, 1);
+  if (fh1_lists_->mode == Fh1Lists::Mode::kShadow)
+    fh1_lists_->run.LiveWrites(index, 1);
   WriteRegister(index, value);
 }
 
@@ -692,7 +713,8 @@ bool CommandProcessor::Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t
   if (!Fh1WritePlainRangeFromRing(ring, base, count)) {
     return false;
   }
-  fh1_lists_->run.LiveWrites(base, count);
+  if (fh1_lists_->mode == Fh1Lists::Mode::kShadow)
+    fh1_lists_->run.LiveWrites(base, count);
   return true;
 }
 
@@ -771,6 +793,15 @@ struct CommandProcessor::Fh1ReplayMachine {
   bool split;
   std::vector<uint32_t>* draw_words;  // unsplit: the draws' records
   uint64_t draws = 0, skipped = 0;
+  // Unsplit draw checks: the state at each draw packet, before it writes its registers.
+  std::vector<uint32_t>* draw_states = nullptr;
+  const std::vector<uint32_t>* ranges = nullptr;
+  void Snap(bool executed) {
+    draw_states->push_back(executed);
+    const uint32_t* values = cp.register_file_->values;
+    for (size_t i = 0; i < ranges->size(); i += 2)
+      draw_states->insert(draw_states->end(), values + (*ranges)[i], values + (*ranges)[i + 1]);
+  }
   // Self-checks (FH1_NATIVE_LISTS_VERIFY_VALUE / _TILE).
   bool perturb_value = false, value_applied = false, perturb_tile = false, tile_effective = false;
 
@@ -848,6 +879,8 @@ struct CommandProcessor::Fh1ReplayMachine {
         shader;
   }
   void Draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
+    if (draw_states) [[unlikely]]
+      Snap(true);
     One(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator);
     One(XE_GPU_REG_VGT_DMA_BASE, dma_base);
     One(XE_GPU_REG_VGT_DMA_SIZE, dma_size);
@@ -877,7 +910,11 @@ struct CommandProcessor::Fh1ReplayMachine {
     const auto* w = reinterpret_cast<const uint32_t*>(&draw);
     draw_words->insert(draw_words->end(), w, w + sizeof(draw) / sizeof(uint32_t));
   }
-  void Skip() { ++skipped; }
+  void Skip() {
+    if (draw_states) [[unlikely]]
+      Snap(false);
+    ++skipped;
+  }
   uint32_t TileMask(uint32_t tile, uint32_t live) {
     if (perturb_tile && tile == 0) [[unlikely]] {
       perturb_tile = false;
@@ -1047,6 +1084,16 @@ bool CommandProcessor::Fh1ListVerify(uint32_t ptr, uint32_t count, memory::RingB
   m.perturb_tile = tiled && v.perturb_tile_every && n % v.perturb_tile_every == 0;
   const bool tile_perturbed = m.perturb_tile;
   s.scratch_draws.clear();
+  const bool draw_check =
+      !split && (perturb_header || m.perturb_value || m.perturb_tile ||
+                 (v.draw_check_every && ++v.draw_check_count % v.draw_check_every == 0));
+  if (draw_check) {
+    s.stock_draw_states.clear();
+    s.replay_draw_states.clear();
+    s.draw_ranges = &ranges;
+    m.draw_states = &s.replay_draw_states;
+    m.ranges = &ranges;
+  }
 
   // The replay into scratch state; the real state as it is around it.
   fl::ReplayEnd end;
@@ -1117,6 +1164,8 @@ bool CommandProcessor::Fh1ListVerify(uint32_t ptr, uint32_t count, memory::RingB
     }
     const uint64_t published_before = record_published_;
     s.verifying = true;
+    if (draw_check)
+      fh1_list_reader_ = reader;  // the draw seam (and the write seams, which do nothing here)
     const uint64_t ts = NowNs();
     do {
       if (!ExecutePacket(reader)) {
@@ -1126,6 +1175,7 @@ bool CommandProcessor::Fh1ListVerify(uint32_t ptr, uint32_t count, memory::RingB
       }
     } while (reader->read_count());
     ns_stock = NowNs() - ts - s.capture_ns;
+    fh1_list_reader_ = nullptr;
     published = record_published_ - published_before;
     s.verifying = false;
     if (split) {
@@ -1210,6 +1260,11 @@ bool CommandProcessor::Fh1ListVerify(uint32_t ptr, uint32_t count, memory::RingB
   }
   if (bin_mask_ != m.bin_mask)
     fields |= 1u << kVerifyBinMask;
+  if (draw_check) {
+    v.draw_checked += !perturbed;
+    if (s.stock_draw_states != s.replay_draw_states)
+      fields |= 1u << kVerifyDraws;
+  }
   for (uint32_t stage = 0; stage < 2; ++stage) {
     if (s.shaders.valid[stage] != end_shaders.valid[stage] ||
         s.shaders.address[stage] != end_shaders.address[stage] ||
@@ -1264,7 +1319,7 @@ bool CommandProcessor::Fh1ListVerify(uint32_t ptr, uint32_t count, memory::RingB
         split ? s.scratch_batch->words.size() : 0);
   }
   // Timed: only the runs whose replay is the real program (a perturbed one is not).
-  if (!perturbed) {
+  if (!perturbed && !draw_check) {
     for (VerifyTiming* timing :
          {&v.timing[replay_first], published ? nullptr : &v.quiet[replay_first]}) {
       if (!timing)
@@ -1302,10 +1357,11 @@ void LogVerify(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t f
   const uint64_t compared = v.compared;
   REXGPU_INFO(
       "FH1 native lists (verify, {}, {} frames): runs verified {}: compared {}, agree {} "
-      "({:.4f}%), differ in:{} | handovers:{} | not verified:{} other buffers {}, misses at a "
+      "({:.4f}%; unsplit runs with every draw compared {}), differ in:{} | handovers:{} | not "
+      "verified:{} other buffers {}, misses at a "
       "dropped list's address {} | programs:{} | self-checks: header {} perturbed {} caught, "
       "value {} perturbed {} caught, tile mask {} perturbed ({} change a window) {} caught",
-      when, frames, v.runs, compared, v.agree, pct(v.agree, compared),
+      when, frames, v.runs, compared, v.agree, pct(v.agree, compared), v.draw_checked,
       fields.empty() ? " none" : fields, handovers.empty() ? " none" : handovers,
       skips.empty() ? " none;" : skips, v.other_buffers, v.dropped_address_misses,
       compiles.empty() ? " none" : compiles, v.header_perturbed, v.header_caught, v.value_perturbed,
