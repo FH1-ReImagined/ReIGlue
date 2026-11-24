@@ -429,6 +429,14 @@ class CommandProcessor {
   void Fh1ListShader(uint32_t address_type, uint32_t start_size);
   void Fh1ListsSwap();
   void Fh1ListsShutdown();
+  // FH1 (0660): verify mode (the game's native_lists=verify, kOpListMode): a registered list's
+  // run is the packets' as always and, beside them, its template's replay into scratch state
+  // (the register file, the record words, the bin mask, the shaders), compared with what the
+  // packets left and timed against them. True when it ran the buffer (the caller returns).
+  bool Fh1ListVerify(uint32_t ptr, uint32_t count, memory::RingBuffer* reader);
+  // The replay's packet handlers (fh1_native_list.cpp), with the command processor's writers.
+  struct Fh1ReplayMachine;
+  REX_FH1_LIST_COLD bool Fh1ListPublishing();
 
   // (type-0 packet, SET_CONSTANT of registers, SET_CONSTANT2) made only of such registers from
   // the ring itself, without the two virtual calls and the backend's sorting of the range (most
@@ -548,6 +556,11 @@ class CommandProcessor {
 
   bool record_split_ = false;
   bool record_elide_ = false;  // gpu_split_elide_unchanged_registers
+  // FH1 (0660): PublishRecordBatch while a verified run is open (in the padding after the two
+  // flags, so no member moves): 1 the packets' run (their record words so far are kept for the
+  // compare, then the batch is published), 2 the replay's (its words stay in the scratch batch:
+  // nothing is published).
+  uint8_t fh1_list_capture_ = 0;
   std::unique_ptr<RegisterFile> decode_register_file_;
   std::unique_ptr<RecordBatch> record_batch_;
   std::mutex record_mutex_;
