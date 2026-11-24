@@ -35,17 +35,40 @@ int main() {
   // within kLeverSettleMs keeps the gear, whatever wheel_shifter_neutral_ms is.
   for (double hold_ms : {400.0, 0.0}) {
     LeverHold h;
-    int g = EngageLeverGear(h, 3, 0, 0, hold_ms, true, 1, .5f);
+    double t = 0;
+    int g = EngageLeverGear(h, 3, 0, t, hold_ms, true, 1, .5f);
     assert(g == 3);
-    g = EngageLeverGear(h, 3, g, 100, hold_ms, true, 0, .5f);  // clutch out
+    g = EngageLeverGear(h, 3, g, t += 100, hold_ms, true, 0, .5f);  // clutch out
     for (int misread : {kGearNeutral, 2, 4, kGearReverse}) {
-      g = EngageLeverGear(h, misread, g, 200, hold_ms, true, 0, .5f);
+      g = EngageLeverGear(h, misread, g, t += 100, hold_ms, true, 0, .5f);
       assert(g == 3);
-      g = EngageLeverGear(h, 3, g, 210, hold_ms, true, 0, .5f);
+      g = EngageLeverGear(h, 3, g, t += 10, hold_ms, true, 0, .5f);
       assert(g == 3);
-      g = EngageLeverGear(h, 3, g, 1000, hold_ms, true, 0, .5f);
+      g = EngageLeverGear(h, 3, g, t += 800, hold_ms, true, 0, .5f);
       assert(g == 3);
     }
+  }
+  for (double hold_ms : {400.0, 0.0}) {
+    // A lever left in neutral that now and then reads another gear (near a gate) is neutral after
+    // the hold and kLeverSettleMs from when it left the slot: the misreads do not restart the hold.
+    LeverHold h;
+    double t = 0;
+    int g = EngageLeverGear(h, 3, 0, t, hold_ms, true, 1, .5f);
+    g = EngageLeverGear(h, 3, g, t += 100, hold_ms, true, 0, .5f);
+    const double left = t + 5;
+    double neutral_at = -1;
+    for (t = left; t < left + 3000; t += 5) {
+      const int lever = static_cast<int>(t - left) % 100 == 50 ? 4 : kGearNeutral;
+      g = EngageLeverGear(h, lever, g, t, hold_ms, true, 0, .5f);
+      if (g == kGearNeutral && neutral_at < 0) {
+        neutral_at = t - left;
+      }
+      assert(g == 3 || g == kGearNeutral);
+      assert(neutral_at < 0 || g == kGearNeutral);
+    }
+    assert(neutral_at >= 0 && neutral_at <= hold_ms + kLeverSettleMs + 5);
+    // The clutch then down with the lever in neutral engages nothing.
+    assert(EngageLeverGear(h, kGearNeutral, g, t, hold_ms, true, 1, .5f) == kGearNeutral);
   }
   {
     // A lever that misread a gear and then reads neutral carries the engaged gear through neutral,

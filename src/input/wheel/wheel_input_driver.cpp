@@ -326,7 +326,7 @@ std::string GearName(int g) {
          : g == kGearNeutral ? std::string("N")
                              : std::to_string(g);
 }
-constexpr int kLeverLogLines = 400;  // H-pattern lever reads logged per wheel (#952)
+constexpr int kLeverLogLines = 1000;  // H-pattern lever reads logged per wheel (#952)
 
 // The H-pattern gear to report on thumb_rx (wheel_gear_request.h): on lever moves only, or the
 // engaged gear all the time with wheel_shifter_follow_slot. A new request is logged.

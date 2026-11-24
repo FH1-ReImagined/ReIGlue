@@ -59,6 +59,7 @@ struct LeverHold {
   int gear = kGearNeutral;      // the gear reported for the lever
   double neutral_since = -1.0;  // when the lever left that gear for neutral; -1: it has not
   double change_since = -1.0;   // when the lever first read a change without the clutch; -1: none
+  double away_since = -1.0;     // when the lever last left the engaged gear's slot; -1: in it
 };
 
 // The lever's gear as the game should see it: neutral for less than `hold_ms` after a gear is still
@@ -93,6 +94,11 @@ inline int LeverThroughNeutral(LeverHold& h, int lever, double now_ms, double ho
 // without the clutch.
 inline int EngageLeverGear(LeverHold& h, int lever, int engaged, double now_ms,
                            double hold_ms, bool need_clutch, float clutch, float threshold) {
+  if (lever == engaged) {
+    h.away_since = -1.0;
+  } else if (h.away_since < 0.0) {
+    h.away_since = now_ms;
+  }
   const int filtered = LeverThroughNeutral(h, lever, now_ms, hold_ms);
   if (need_clutch && clutch < threshold && engaged != kGearNeutral && filtered != engaged) {
     if (h.change_since < 0.0) {
@@ -100,9 +106,11 @@ inline int EngageLeverGear(LeverHold& h, int lever, int engaged, double now_ms,
     }
     if (now_ms - h.change_since < kLeverSettleMs) {
       if (filtered != kGearNeutral) {
-        // The gear to carry through neutral is the engaged one, not one the clutch never let in.
+        // The gear to carry through neutral is the engaged one, not one the clutch never let in,
+        // and only for what is left of the hold since the lever left its slot: a lever that sits
+        // in neutral and now and then reads another gear does not keep the gear for ever.
         h.gear = engaged;
-        h.neutral_since = -1.0;
+        h.neutral_since = h.away_since;
       }
       return engaged;
     }
@@ -112,6 +120,9 @@ inline int EngageLeverGear(LeverHold& h, int lever, int engaged, double now_ms,
   if (result != filtered) {
     h.gear = result;
     h.neutral_since = -1.0;
+  }
+  if (result != engaged) {
+    h.away_since = lever == result ? -1.0 : now_ms;
   }
   return result;
 }
