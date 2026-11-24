@@ -649,15 +649,23 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   length = std::min(length, kBufferSize - physical_address_start);
   uint32_t physical_address_last = physical_address_start + (length - 1);
   // FH1 (#614): CPU writes to watched memory and the time handling them (frame cost CSV).
+  // Only a guest write's fault passes a range that may be widened (exact_range false); the
+  // allocations, protection changes, releases, decommits and file reads that also call this are
+  // counted apart (ReIGlue #75).
   struct FaultTimer {
+    bool fault;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~FaultTimer() {
-      fh1_frame_cost::GetBackground().AddCpuWriteFault(uint64_t(
-          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
-                                                                start)
-              .count()));
+      const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - start)
+                                       .count());
+      if (fault) {
+        fh1_frame_cost::GetBackground().AddCpuWriteFault(us);
+      } else {
+        fh1_frame_cost::GetBackground().AddCpuInvalidation(us);
+      }
     }
-  } fault_timer;
+  } fault_timer{!exact_range};
 
   uint32_t page_first = physical_address_start >> page_size_log2_;
   uint32_t page_last = physical_address_last >> page_size_log2_;
