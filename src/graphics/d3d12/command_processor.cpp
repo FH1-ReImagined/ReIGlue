@@ -53,6 +53,14 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_readback_box_filter, true, "GPU/D3D12",
+                    "With draw resolution scaling, an unsigned 8:8:8:8 or 2:10:10:10 color copy to "
+                    "guest memory gives each guest pixel the average of its host pixels (a photo, "
+                    "a Big Shot's tiles, a replay movie's frames). Off: one host pixel each (the "
+                    "top-left one, or the centre with readback_resolve_half_pixel_offset), for "
+                    "comparisons; vulkan_readback_box_filter on Vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(d3d12_submission_draw_limit, -1, "GPU/D3D12",
                      "End a GPU submission after this many draws (a frame then reaches the GPU in "
                      "several parts, so no single part can run into Windows' 2 s GPU timeout): "
@@ -3089,7 +3097,18 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     if (scaled_address < scaled_buffer_base) {
       return true;
     }
-    uint64_t source_offset = scaled_address - scaled_buffer_base;
+    // 1140 (#962): the copy goes to written_address, the first tile of the written extent, which
+    // is past the current range's start (copy_dest_base) for an 8- or 16-bit copy whose first
+    // tile is not on the base's coarser granularity and for a copy to a slice other than 0. Read
+    // the scaled resolve from there, as Vulkan does (GetScaledResolveRange of written_address).
+    uint64_t written_scaled = uint64_t(written_address) *
+                              texture_cache_->draw_resolution_scale_x() *
+                              texture_cache_->draw_resolution_scale_y();
+    if (written_scaled < scaled_address || written_scaled - scaled_address >= scaled_length) {
+      return true;
+    }
+    uint64_t source_offset = written_scaled - scaled_buffer_base;
+    uint32_t source_length = scaled_length - uint32_t(written_scaled - scaled_address);
 
     ui::d3d12::util::DescriptorCpuGpuHandlePair downscale_descriptors[2];
     if (!RequestOneUseSingleViewDescriptors(2, downscale_descriptors)) {
@@ -3098,10 +3117,10 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 
     const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
     ID3D12Device* device = provider.GetDevice();
-    uint32_t aligned_scaled_length =
-        rex::align(scaled_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
+    uint32_t aligned_source_length =
+        rex::align(source_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
     ui::d3d12::util::CreateBufferRawSRV(device, downscale_descriptors[0].first,
-                                        scaled_resolve_buffer, aligned_scaled_length,
+                                        scaled_resolve_buffer, aligned_source_length,
                                         source_offset);
     uint32_t aligned_written_length =
         rex::align(written_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
@@ -3124,6 +3143,29 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                    (constants.scale_x > 1 || constants.scale_y > 1))
                                       ? 1u
                                       : 0u;
+    // 1120 (#905, #962): every unsigned normalized 8:8:8:8 or 2:10:10:10 color copy (a photo and
+    // its thumbnail, a Big Shot's tiles, a replay movie's frames at render scale 2 or a 1440p
+    // output) gives each guest pixel the average of its host pixels, as on Vulkan. Signed and
+    // integer values would not average this way, and an endianness that swaps pixels within the
+    // 16-byte quad (8in64, 8in128) moves them across the host pixels the filter reads.
+    reg::RB_COPY_CONTROL copy_control = register_file_->Get<reg::RB_COPY_CONTROL>();
+    if (REXCVAR_GET(d3d12_readback_box_filter) && copy_control.copy_src_select < 4 &&
+        copy_dest_info.copy_dest_number == xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
+        copy_dest_info.copy_dest_endian <= xenos::Endian128::k16in32) {
+      switch (copy_dest_info.copy_dest_format) {
+        case xenos::ColorFormat::k_8_8_8_8:
+        case xenos::ColorFormat::k_8_8_8_8_A:
+        case xenos::ColorFormat::k_8_8_8_8_AS_16_16_16_16:
+          constants.half_pixel_offset = 2u;
+          break;
+        case xenos::ColorFormat::k_2_10_10_10:
+        case xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16:
+          constants.half_pixel_offset = 4u | (uint32_t(copy_dest_info.copy_dest_endian) << 4);
+          break;
+        default:
+          break;
+      }
+    }
     deferred_command_list_.D3DSetComputeRoot32BitConstants(
         UINT(ResolveDownscaleRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t),
         &constants, 0);

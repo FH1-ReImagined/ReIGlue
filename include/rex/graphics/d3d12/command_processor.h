@@ -599,6 +599,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t scale_y;
     uint32_t pixel_size_log2;
     uint32_t tile_count;
+    // Bit 0: center sample; bit 1: RGBA8 box filter (8:8:8:8 color copies); bit 2: 2:10:10:10
+    // box filter, its endianness (up to 16in32) in bits 4-5.
     uint32_t half_pixel_offset;
   };
   enum class ResolveDownscaleRootParameter : UINT {
