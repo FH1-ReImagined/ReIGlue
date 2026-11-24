@@ -12,7 +12,8 @@
 // `--view-granularity 0x10000` maps the views as on a host with that view offset granularity
 // (Windows; the 0xE0000000 heap then has a host address offset). No Catch2: its signal handler
 // would take the access violations that guest stores to watched pages raise. `--bench` (not run
-// by ctest) times the paths the fix touches.
+// by ctest) times the paths the fix touches. The frame cost CSV's counters (ReIGlue #75) are
+// checked too: a guest write's fault is a CPU write fault, an invalidation with no fault is not.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -27,6 +28,8 @@
 #include <rex/memory/utils.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread/mutex.h>
+
+#include "../src/graphics/fh1_frame_cost.h"
 
 namespace {
 
@@ -254,6 +257,13 @@ void ReadOnlyMadeWritable() {
 
 // What the GPU wrote: a block made writable is invalidated whether it was watched (writable
 // before, made read-only) or not (read-only from the start), as before 1110 for a watched one.
+// The read-only one is a trade-off, not an oversight: what the GPU wrote there while the page
+// was read-only in every view (a resolve or memexport never copied back to guest memory) is
+// dropped, and the next read uploads the guest's bytes over it. Before 1110 it was kept, but the
+// page was then writable with no watch, so every CPU write after the protection change was
+// missed (ReIGlue #64). Keeping it exactly needs a watch armed on the GPU-written pages only,
+// which SharedMemory would have to tell the heap about (a change of the invalidation callback);
+// the reviews of #73 counted no such page in FH1 (benchmark, free roam, photo mode).
 void GpuWrittenMadeWritable() {
   current_case = "GPU-written made writable";
   CountingSharedMemory gpu(TestMemory());
@@ -272,6 +282,56 @@ void GpuWrittenMadeWritable() {
 
   REQUIRE(E0().Release(address + kBlock));
   REQUIRE(E0().Release(address));
+}
+
+// The frame cost CSV's counters (ReIGlue #75): only a guest write's fault is a CPU write fault;
+// allocations, protection changes, file reads and releases are invalidations with no fault.
+void FaultCounters() {
+  current_case = "fault counters";
+  using rex::graphics::fh1_frame_cost::Frame;
+  using rex::graphics::fh1_frame_cost::GetBackground;
+  const auto take = [] {
+    Frame frame;
+    GetBackground().Take(frame);
+    return frame;
+  };
+  CountingSharedMemory gpu(TestMemory());
+  const uint32_t physical = 0x08800000;
+  const uint32_t address = E0Address(physical);
+  take();
+
+  REQUIRE(E0().AllocFixed(address, kBlock, 0x1000, kCommit, kReadWrite));
+  Frame frame = take();
+  CHECK(frame.cpu_write_faults == 0);
+  CHECK(frame.cpu_invalidations == 1);
+
+  CHECK(gpu.Uploads(physical, kBlock));  // watched from here on
+  take();
+  GuestStore(address + 0x100, 5);
+  frame = take();
+  CHECK(frame.cpu_write_faults == 1);
+  CHECK(frame.cpu_invalidations == 0);
+
+  CHECK(gpu.Uploads(physical, kBlock));  // the fault unwatched more than its page
+  take();
+  KernelWrite(address + 0x2000, 0x1000);
+  frame = take();
+  CHECK(frame.cpu_write_faults == 0);
+  CHECK(frame.cpu_invalidations == 1);
+
+  CHECK(gpu.Uploads(physical, kBlock));
+  REQUIRE(E0().Protect(address, kBlock, rex::memory::kMemoryProtectRead));
+  REQUIRE(E0().Protect(address, kBlock, kReadWrite));
+  frame = take();
+  CHECK(frame.cpu_write_faults == 0);
+  CHECK(frame.cpu_invalidations >= 1);
+
+  CHECK(gpu.Uploads(physical, kBlock));
+  take();
+  REQUIRE(E0().Release(address));
+  frame = take();
+  CHECK(frame.cpu_write_faults == 0);
+  CHECK(frame.cpu_invalidations == 1);
 }
 
 template <typename F>
@@ -358,6 +418,7 @@ int main(int argc, char** argv) {
   CommittedAgain();
   ReadOnlyMadeWritable();
   GpuWrittenMadeWritable();
+  FaultCounters();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

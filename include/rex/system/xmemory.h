@@ -392,6 +392,12 @@ class PhysicalHeap : public BaseHeap {
   // so the GPU's copy may hold it as up to date. Called after an allocation commits pages that
   // were not committed (new contents) and after a protection change makes pages writable (as
   // the watched ones are). Takes the global critical region; call it without heap_mutex_.
+  // Known limits (ReIGlue #75): a protection change to writable also drops what the GPU wrote to
+  // pages that were read-only or no-access in every view (no watch there; keeping it exactly
+  // would need SharedMemory to say which pages are GPU-written, a change of the invalidation
+  // callback); the reviews of #73 counted no such page in FH1. On a host with 16 or 64 KB pages,
+  // a 4 KB allocation or protection change invalidates its whole host page, GPU-written
+  // neighbours included, as write faults and Release already do there.
   void InvalidateWhetherWatched(uint32_t address, uint32_t size);
 
   uint32_t system_page_size_;
