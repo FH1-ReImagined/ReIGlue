@@ -82,6 +82,7 @@ class InputSystem : public system::IInputSystem {
 
   void UpdateConnectedUser(uint32_t user_index, bool connected);
   void AdjustDeadzoneLevels(uint32_t user_index, X_INPUT_GAMEPAD* gamepad) const;
+  bool IsWheel(DeviceId id) const;  // a racing wheel (subtype XINPUT_DEVSUBTYPE_WHEEL)
   X_INPUT_VIBRATION ModifyVibrationLevel(const X_INPUT_VIBRATION* vibration) const;
 
   rex::ui::Window* window_ = nullptr;

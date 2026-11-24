@@ -1,11 +1,14 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/input/device_assignment.h>
+#include <rex/input/flags.h>
 #include <rex/input/input_system.h>
 
 // The X_STATUS_* / X_ERROR_* macros cast through these unqualified, so
@@ -49,12 +52,27 @@ class FakeDriver final : public InputDriver {
 
   X_STATUS Setup() override { return X_STATUS_SUCCESS; }
 
-  void Add(uint64_t id, bool synthetic = false) {
+  void Add(uint64_t id, bool synthetic = false,
+           uint8_t subtype = rex::input::XINPUT_DEVSUBTYPE_GAMEPAD) {
     DeviceInfo info;
     info.id = static_cast<DeviceId>(id);
     info.synthetic = synthetic;
+    info.subtype = subtype;
     devices_.push_back(info);
     states_[static_cast<DeviceId>(id)] = {};
+  }
+
+  void SetSticks(uint64_t id, int16_t lx, int16_t ly, int16_t rx, int16_t ry) {
+    auto& g = states_[static_cast<DeviceId>(id)].gamepad;
+    g.thumb_lx = lx;
+    g.thumb_ly = ly;
+    g.thumb_rx = rx;
+    g.thumb_ry = ry;
+  }
+
+  // The stick ranges the capabilities report (the deadzones scale against them).
+  void SetCapsSticks(uint64_t id, int16_t lx, int16_t ly, int16_t rx, int16_t ry) {
+    caps_sticks_[static_cast<DeviceId>(id)] = {lx, ly, rx, ry};
   }
 
   void Remove(uint64_t id) {
@@ -90,6 +108,12 @@ class FakeDriver final : public InputDriver {
     *out = {};
     // Stamp the id so the test can tell which device answered.
     out->sub_type = static_cast<uint8_t>(id);
+    if (auto it = caps_sticks_.find(id); it != caps_sticks_.end()) {
+      out->gamepad.thumb_lx = it->second[0];
+      out->gamepad.thumb_ly = it->second[1];
+      out->gamepad.thumb_rx = it->second[2];
+      out->gamepad.thumb_ry = it->second[3];
+    }
     return X_ERROR_SUCCESS;
   }
 
@@ -113,6 +137,7 @@ class FakeDriver final : public InputDriver {
   std::vector<DeviceInfo> devices_;
   std::map<DeviceId, X_INPUT_STATE> states_;
   std::map<DeviceId, X_INPUT_KEYSTROKE> keystrokes_;
+  std::map<DeviceId, std::array<int16_t, 4>> caps_sticks_;
 };
 
 std::unique_ptr<InputSystem> SharedSystem(FakeDriver** out_driver) {
@@ -235,4 +260,86 @@ TEST_CASE("A synthetic device does not push the first pad off guest user 0", "[i
   REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
   REQUIRE(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
   REQUIRE(system->GetState(1, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+}
+
+TEST_CASE("The stick deadzones leave a racing wheel's gear and clutch alone (FH1 #952)",
+          "[input]") {
+  // The wheel driver's state: steering on the left stick X, the H-pattern gear on the right stick
+  // X (-1 reverse, 1 to 7) and the clutch on the right stick Y; its capabilities report the
+  // number of forward gears in thumb_rx's high byte and no right stick Y range.
+  struct Deadzones {
+    Deadzones(double left, double right) {
+      REXCVAR_SET(left_stick_deadzone_percentage, left);
+      REXCVAR_SET(right_stick_deadzone_percentage, right);
+    }
+    ~Deadzones() {
+      REXCVAR_SET(left_stick_deadzone_percentage, 0.0);
+      REXCVAR_SET(right_stick_deadzone_percentage, 0.0);
+    }
+  } deadzones(0.1, 0.1);
+
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1, false, rex::input::XINPUT_DEVSUBTYPE_WHEEL);
+  driver->SetCapsSticks(1, 0x7FFF, 0, 6 << 8, 0);
+
+  X_INPUT_STATE state = {};
+  for (int16_t gear : {int16_t(1), int16_t(3), int16_t(6), int16_t(-1)}) {
+    driver->SetSticks(1, 200, 0, gear, 0);  // clutch up, steering a hair off centre
+    REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+    CHECK(state.gamepad.thumb_rx == gear);
+    CHECK(state.gamepad.thumb_ry == 0);
+    CHECK(state.gamepad.thumb_lx == 200);
+  }
+  driver->SetSticks(1, 0, 0, 3, 300);  // the clutch just touched
+  REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 3);
+  CHECK(state.gamepad.thumb_ry == 300);
+
+  // The gear's no-request value (10, sent with the gear on lever moves only and out of focus).
+  driver->SetSticks(1, 0, 0, 10, 0);
+  REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 10);
+}
+
+TEST_CASE("A pad next to a racing wheel keeps its own stick deadzone (FH1 #952)", "[input]") {
+  struct Deadzones {
+    Deadzones() { REXCVAR_SET(right_stick_deadzone_percentage, 0.1); }
+    ~Deadzones() { REXCVAR_SET(right_stick_deadzone_percentage, 0.0); }
+  } deadzones;
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1, false, rex::input::XINPUT_DEVSUBTYPE_WHEEL);  // the wheel first
+  driver->SetCapsSticks(1, 0x7FFF, 0, 6 << 8, 0);
+  driver->Add(2);
+  driver->SetCapsSticks(2, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF);
+  // A drifting right stick, inside the pad's 10 percent (3276) but past the wheel's range's (153).
+  driver->SetSticks(2, 0, 0, 1000, 1000);
+  driver->SetSticks(1, 0, 0, 3, 0);
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 3);
+  CHECK(state.gamepad.thumb_ry == 0);
+  driver->SetSticks(1, 0, 0, 0, 0);
+  REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 0);
+  CHECK(state.gamepad.thumb_ry == 0);
+}
+
+TEST_CASE("The stick deadzones still apply to a pad", "[input]") {
+  struct Deadzones {
+    Deadzones() { REXCVAR_SET(right_stick_deadzone_percentage, 0.1); }
+    ~Deadzones() { REXCVAR_SET(right_stick_deadzone_percentage, 0.0); }
+  } deadzones;
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  driver->SetCapsSticks(1, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF);
+  driver->SetSticks(1, 0, 0, 1000, 0);
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 0);
+  driver->SetSticks(1, 0, 0, 20000, 0);
+  REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 20000);
 }

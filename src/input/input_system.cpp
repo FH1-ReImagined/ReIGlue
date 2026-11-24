@@ -256,6 +256,17 @@ std::optional<DeviceInfo> InputSystem::DeviceInfoFor(DeviceId id) const {
   return std::nullopt;
 }
 
+// The caller holds the input system's lock (GetStateForUI, once per device and poll;
+// UpdateConnectedUser).
+bool InputSystem::IsWheel(DeviceId id) const {
+  for (const auto& device : devices_) {
+    if (device.id == id) {
+      return device.subtype == XINPUT_DEVSUBTYPE_WHEEL;
+    }
+  }
+  return false;
+}
+
 DeviceId InputSystem::ChooseDeviceForUser(uint32_t user_index) const {
   auto lock = LockInputSystem(this);
   if (!assignment_) {
@@ -320,8 +331,19 @@ void InputSystem::UpdateConnectedUser(uint32_t user_index, bool connected) {
     return;
   }
 
-  // Deadzone percentages scale against the device's own range.
+  // Deadzone percentages scale against the device's own range: a pad's, as the deadzones are
+  // only for pads (a wheel's capabilities report its shifter's gears, not a stick range).
   DeviceId chosen = ChooseDeviceForUser(user_index);
+  if (IsWheel(chosen)) {
+    std::vector<DeviceId> ids;
+    assignment_->DevicesForUser(user_index, ids);
+    for (DeviceId id : ids) {
+      if (!IsWheel(id)) {
+        chosen = id;
+        break;
+      }
+    }
+  }
   auto* driver = DriverForDevice(chosen);
   if (!driver) {
     return;
@@ -370,8 +392,12 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
 
-  X_INPUT_STATE merged = {};
-  bool any = false;
+  // The stick deadzones are for thumbsticks, so they apply to the pads' merged state and not to
+  // a wheel's. A wheel's sticks are its steering, handbrake, H-pattern gear (right X: -1 reverse,
+  // 1 to 7) and clutch (right Y): the radial right stick deadzone zeroed a forward gear whenever
+  // the clutch was up, so the car fell to neutral the moment the clutch came out (FH1 #952).
+  X_INPUT_STATE pads = {}, wheels = {};
+  bool any_pad = false, any_wheel = false;
   for (DeviceId id : ids) {
     auto* driver = DriverForDevice(id);
     if (!driver) {
@@ -382,20 +408,29 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
       continue;
     }
     active_devices_.Observe(user_index, id, state.gamepad);
-    if (!any) {
-      merged = state;
-      any = true;
+    const bool wheel = IsWheel(id);
+    X_INPUT_STATE& into = wheel ? wheels : pads;
+    bool& seen = wheel ? any_wheel : any_pad;
+    if (!seen) {
+      into = state;
+      seen = true;
     } else {
-      MergeInto(merged, state);
+      MergeInto(into, state);
     }
   }
 
-  if (!any) {
+  if (!any_pad && !any_wheel) {
     UpdateConnectedUser(user_index, false);
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   UpdateConnectedUser(user_index, true);
-  AdjustDeadzoneLevels(user_index, &merged.gamepad);
+  if (any_pad) {
+    AdjustDeadzoneLevels(user_index, &pads.gamepad);
+  }
+  X_INPUT_STATE merged = any_pad ? pads : wheels;
+  if (any_pad && any_wheel) {
+    MergeInto(merged, wheels);
+  }
   if (static_cast<uint16_t>(merged.gamepad.buttons) != 0 && user_index < kMaxGuestUsers) {
     last_used_user_ = user_index;
   }
