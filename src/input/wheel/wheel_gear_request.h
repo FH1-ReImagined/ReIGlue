@@ -25,6 +25,13 @@
  * for wheel_shifter_neutral_ms in neutral: a lever that reaches another gate in that time is one
  * change, 2 > 3; one that stays in neutral longer is neutral then.
  *
+ * With wheel_shifter_clutch a gear the clutch did not let in is neutral (EngageGear), so with the
+ * clutch up a lever that read another gear for a moment took the car out of its gear for good, the
+ * lever back in its slot not being a gear the clutch let in (#952). EngageLeverGear therefore
+ * leaves an engaged gear without the clutch only once the lever has read something else for
+ * kLeverSettleMs: a misread that short keeps the gear. A change with the clutch down, or with
+ * wheel_shifter_clutch off, is taken at once, and no gear ever engages without the clutch.
+ *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */
@@ -38,6 +45,7 @@ constexpr int kGearNoRequest = 10;  // the game's own "no request"; 9 and up rea
 constexpr double kNeutralTransitMs = 400.0;  // wheel_shifter_neutral_ms's default
 constexpr double kGearRequestMs = 250.0;
 constexpr int kGearRequestReads = 4;
+constexpr double kLeverSettleMs = 50.0;  // a change without the clutch must last this long (#952)
 
 // The car's gear number in the game for a lever gear: R 0, 1 to 8, neutral 9 (#468).
 inline int GameGearNumber(int gear) {
@@ -50,13 +58,16 @@ inline bool GameUpshift(int from, int to) { return GameGearNumber(to) > GameGear
 struct LeverHold {
   int gear = kGearNeutral;      // the gear reported for the lever
   double neutral_since = -1.0;  // when the lever left that gear for neutral; -1: it has not
+  double change_since = -1.0;   // when the lever first read a change without the clutch; -1: none
+  double away_since = -1.0;     // when the lever last left the engaged gear's slot; -1: in it
 };
 
 // The lever's gear as the game should see it: neutral for less than `hold_ms` after a gear is still
 // that gear. `lever` is LeverGear's; now_ms a steady clock in milliseconds. hold_ms 0: as it is.
 inline int LeverThroughNeutral(LeverHold& h, int lever, double now_ms, double hold_ms) {
   if (lever != kGearNeutral || hold_ms <= 0.0) {
-    h = LeverHold{lever, -1.0};
+    h.gear = lever;
+    h.neutral_since = -1.0;
     return lever;
   }
   if (h.gear == kGearNeutral) {
@@ -68,19 +79,50 @@ inline int LeverThroughNeutral(LeverHold& h, int lever, double now_ms, double ho
   if (now_ms - h.neutral_since < hold_ms) {
     return h.gear;
   }
-  h = LeverHold{};
+  h.gear = kGearNeutral;
+  h.neutral_since = -1.0;
   return kGearNeutral;
 }
 
-// A clutch-rejected slot is not a gear to carry through neutral. Otherwise
-// pressing the clutch after leaving that slot would engage it with the lever
-// already in neutral.
+// The engaged gear for this read of the lever: LeverThroughNeutral's gear, then EngageGear.
+// A clutch-rejected slot is not a gear to carry through neutral. Otherwise pressing the clutch
+// after leaving that slot would engage it with the lever already in neutral.
+// With the clutch needed and up, an engaged gear is left only once the lever has read something
+// else for kLeverSettleMs (#952): a lever that misread for a moment and is back in its slot keeps
+// the gear, which the clutch would otherwise have to let in again. That only delays leaving a gear
+// (for neutral, or for a gear the clutch did not let in, which is neutral too); nothing engages
+// without the clutch.
 inline int EngageLeverGear(LeverHold& h, int lever, int engaged, double now_ms,
                            double hold_ms, bool need_clutch, float clutch, float threshold) {
+  if (lever == engaged) {
+    h.away_since = -1.0;
+  } else if (h.away_since < 0.0) {
+    h.away_since = now_ms;
+  }
   const int filtered = LeverThroughNeutral(h, lever, now_ms, hold_ms);
+  if (need_clutch && clutch < threshold && engaged != kGearNeutral && filtered != engaged) {
+    if (h.change_since < 0.0) {
+      h.change_since = now_ms;
+    }
+    if (now_ms - h.change_since < kLeverSettleMs) {
+      if (filtered != kGearNeutral) {
+        // The gear to carry through neutral is the engaged one, not one the clutch never let in,
+        // and only for what is left of the hold since the lever left its slot: a lever that sits
+        // in neutral and now and then reads another gear does not keep the gear for ever.
+        h.gear = engaged;
+        h.neutral_since = h.away_since;
+      }
+      return engaged;
+    }
+  }
+  h.change_since = -1.0;
   const int result = EngageGear(filtered, engaged, need_clutch, clutch, threshold);
   if (result != filtered) {
-    h = LeverHold{result, -1.0};
+    h.gear = result;
+    h.neutral_since = -1.0;
+  }
+  if (result != engaged) {
+    h.away_since = lever == result ? -1.0 : now_ms;
   }
   return result;
 }
