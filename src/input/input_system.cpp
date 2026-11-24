@@ -479,7 +479,8 @@ void InputSystem::AdjustDeadzoneLevels(uint32_t user_index, X_INPUT_GAMEPAD* gam
   }
 
   // Radial: the cutoff follows the stick's angle, so a diagonal is not held to
-  // a larger displacement than a cardinal push.
+  // a larger displacement than a cardinal push. The cutoffs are the angle's cosine and sine
+  // unsigned: signed, they were negative for a stick left or down and no value fell inside them.
   auto apply = [](double percentage, const JoystickValue& max, int16_t& axis_x, int16_t& axis_y) {
     if (percentage <= 0.0 || percentage >= 1.0) {
       return;
@@ -487,8 +488,8 @@ void InputSystem::AdjustDeadzoneLevels(uint32_t user_index, X_INPUT_GAMEPAD* gam
     const double deadzone_x = max.first * percentage;
     const double deadzone_y = max.second * percentage;
     const double theta = std::atan2(static_cast<double>(axis_y), static_cast<double>(axis_x));
-    const double cutoff_x = std::cos(theta) * deadzone_x;
-    const double cutoff_y = std::sin(theta) * deadzone_y;
+    const double cutoff_x = std::abs(std::cos(theta)) * deadzone_x;
+    const double cutoff_y = std::abs(std::sin(theta)) * deadzone_y;
     if (axis_x > -cutoff_x && axis_x < cutoff_x) {
       axis_x = 0;
     }
