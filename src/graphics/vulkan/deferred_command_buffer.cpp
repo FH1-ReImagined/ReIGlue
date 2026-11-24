@@ -395,6 +395,15 @@ VkCommandBuffer DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buf
         }
       } break;
 
+      case Command::kFh1SetupBreadcrumb: {
+        const auto& args = *reinterpret_cast<const ArgsFh1Breadcrumb*>(stream);
+        const Fh1Breadcrumbs* b = fh1_breadcrumbs_;
+        if (b && b->write_buffer_marker) {
+          b->write_buffer_marker(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b->buffer, 8,
+                                 args.seq);
+        }
+      } break;
+
       case Command::kFh1FillBuffer: {
         const auto& args = *reinterpret_cast<const ArgsFh1FillBuffer*>(stream);
         args.fill(command_buffer, args.buffer, args.offset, args.size, args.data);
@@ -528,13 +537,103 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
 }
 
 void DeferredCommandBuffer::Fh1GpuZoneMark() {
-  fh1_gpu_zone_pending_ = false;
+  fh1_write_hooks_.zone_pending = false;
   fh1_gpu_profile_->Mark(*this, fh1_gpu_zone_);
 }
 
+void DeferredCommandBuffer::Fh1WriteHook(Command command) {
+  if (write_stream_ != &command_stream_) {
+    return;  // the hoisted stream: no zones, and its uploads are counted at their hoist point
+  }
+  if (fh1_write_hooks_.zone_pending) {
+    Fh1GpuZoneMark();  // writes a timestamp first (not counted as work)
+  }
+  if (fh1_write_hooks_.count_work) {
+    Fh1CountWork(command);
+  }
+}
+
+void DeferredCommandBuffer::Fh1CountWork(Command command) {
+  uint16_t* counter = nullptr;
+  switch (command) {
+    case Command::kVkBeginRenderPass:
+    case Command::kVkBeginRendering:
+      counter = &fh1_work_.render_passes;
+      break;
+    case Command::kVkEndRenderPass:
+    case Command::kVkEndRendering:
+      counter = &fh1_work_.render_pass_ends;
+      break;
+    case Command::kVkDraw:
+    case Command::kVkDrawIndexed:
+      counter = &fh1_work_.draws;
+      break;
+    case Command::kVkDispatch:
+      counter = &fh1_work_.dispatches;
+      break;
+    case Command::kVkPipelineBarrier:
+      counter = &fh1_work_.barriers;
+      break;
+    case Command::kVkCopyBuffer:
+    case Command::kVkCopyBufferToImage:
+    case Command::kVkCopyQueryPoolResults:
+    case Command::kVkBlitImage:
+    case Command::kFh1NativeCubeBlit:
+    case Command::kVkClearColorImage:
+    case Command::kFh1FillBuffer:
+      counter = &fh1_work_.copies;
+      break;
+    case Command::kVkClearAttachments:
+      counter = &fh1_work_.clears;
+      break;
+    case Command::kVkBeginQuery:
+    case Command::kVkEndQuery:
+    case Command::kVkResetQueryPool:
+      counter = &fh1_work_.queries;
+      break;
+    case Command::kFh1BeginConditionalRendering:
+      counter = &fh1_work_.conditional;
+      break;
+    case Command::kHoistedCommands:
+      counter = &fh1_work_.uploads;
+      break;
+    case Command::kFh1Dlss:
+      counter = &fh1_work_.upscales;
+      break;
+    case Command::kFh1TestHang:
+      counter = &fh1_work_.test_hangs;
+      break;
+    // No work of their own: state (binds, dynamic state, push constants), the breadcrumbs, the
+    // profile's timestamps. Every kind is listed (no default), so that -Wswitch names a new one.
+    case Command::kVkBindDescriptorSets:
+    case Command::kVkBindIndexBuffer:
+    case Command::kVkBindPipeline:
+    case Command::kVkBindVertexBuffers:
+    case Command::kVkPushConstants:
+    case Command::kVkSetBlendConstants:
+    case Command::kVkSetDepthBias:
+    case Command::kVkSetScissor:
+    case Command::kVkSetStencilCompareMask:
+    case Command::kVkSetStencilReference:
+    case Command::kVkSetStencilWriteMask:
+    case Command::kVkSetViewport:
+    case Command::kFh1Breadcrumb:
+    case Command::kFh1SetupBreadcrumb:
+    case Command::kFh1Timestamp:
+    case Command::kFh1EndConditionalRendering:
+      return;
+  }
+  if (!counter)
+    return;
+  if (*counter != UINT16_MAX)
+    ++*counter;
+}
+
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
-  if (fh1_gpu_zone_pending_ && write_stream_ == &command_stream_) {
-    Fh1GpuZoneMark();
+  // FH1 (#640, #913): a profile zone's timestamp, the device-lost trail's count of the work. Only
+  // the flags' test is inline (a 16-bit compare and a branch); the stream is checked out of line.
+  if (Fh1AnyWriteHook()) [[unlikely]] {
+    Fh1WriteHook(command);
   }
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
