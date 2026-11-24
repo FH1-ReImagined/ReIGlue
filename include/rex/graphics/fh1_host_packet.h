@@ -66,8 +66,19 @@ enum Op : uint32_t {
   kOpListBind = 0x21,
   // The list at a physical address is unloaded: [2] the address, [3] its dwords.
   kOpListDrop = 0x22,
+  // 0660: what the command processor does with a registered list's runs: [2] kListModeShadow
+  // (the compare, as without this op) or kListModeVerify (FH1 native_lists=verify: the replay
+  // of the list's template into scratch state beside the packets, compared and timed). Sent
+  // once, before the first define.
+  kOpListMode = 0x23,
 };
-constexpr uint32_t kListDefineWords = 8, kListBindWords = 12, kListDropWords = 4;
+constexpr uint32_t kListDefineWords = 8, kListBindWords = 12, kListDropWords = 4,
+                   kListModeWords = 4;
+constexpr uint32_t kListModeShadow = 0, kListModeVerify = 1;
+// 0660: set in a list's state word (with its generation below it) by the game's fixup hook in
+// verify mode when a fixup of the list ran inside another fixup: the generation's seqlock does
+// not cover a nested writer of the same word, so verify mode leaves such a list's runs out.
+constexpr uint32_t kListStateNested = 0x80000000u;
 constexpr uint32_t kListRefused = 0xFFFFFFFFu;
 constexpr uint32_t kListGroupNone = 0xFF;
 // The game converted the list from a copy with its tile-bound packets put back (it was untiled

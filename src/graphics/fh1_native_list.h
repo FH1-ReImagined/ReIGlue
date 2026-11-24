@@ -394,6 +394,363 @@ inline void Resolve(const uint32_t* t, const uint8_t* pm4, uint32_t* pool) {
   }
 }
 
+// ---- Replay (patch 0660) ------------------------------------------------------------------------
+//
+// A template's ops, compiled once against a list whose key is the template's: per packet its
+// dword, its header as guest memory holds it, and the type-2 padding before it. A replay walks
+// that program over the live list in stream order: it checks each header (and each padding word,
+// and the static words of a tile block and of a constant load) as it reaches it, reads every
+// value from the live list, and hands what the packets do to a machine, in the calls and the
+// order the command processor's packet handlers make them (command_processor.cpp). It never
+// decodes a packet. Where a check fails it stops before the packet does anything, and says where
+// the PM4 interpreter would go on (the dword after the previous packet).
+
+// A word of guest memory as it is loaded (guest byte order), and the guest order of a host word.
+inline uint32_t RawWord(const uint8_t* guest, size_t index) {
+  uint32_t v;
+  std::memcpy(&v, guest + index * 4, 4);
+  return v;
+}
+constexpr uint32_t ToRaw(uint32_t host) {
+  return __builtin_bswap32(host);
+}
+// A zero word or a type-2 packet: what the packet loop skips as padding.
+constexpr bool PadRaw(uint32_t raw) {
+  return raw == 0 || (raw & 0xC0) == 0x80;
+}
+constexpr uint32_t kHostMagicRaw = ToRaw(0x4648314Eu);  // a host packet's first word, "FH1N"
+
+enum ReplayKind : uint8_t {
+  kReplayRegs,      // a type-0 packet: consecutive registers
+  kReplayMarks,     // a type-0 packet of one register (D3D's marks): each word to it
+  kReplayTile,      // a tile block (27 words)
+  kReplayShader,    // IM_LOAD
+  kReplayLiterals,  // LOAD_ALU_CONSTANT
+  kReplayDraw,      // DRAW_INDX from an index buffer
+};
+constexpr uint8_t kReplayTileBound = 1;   // kReplayRegs: scene_msaa makes it a NOP
+constexpr uint8_t kReplayPredicated = 2;  // kReplayDraw: the header's predicate bit
+struct ReplayOp {
+  uint32_t dword;   // the packet's header
+  uint32_t header;  // the header, guest order (RawWord)
+  uint16_t first;   // the first register (regs, marks, literals)
+  uint16_t count;   // registers (regs), words (marks, literals)
+  uint16_t gap;     // padding words just before the header
+  uint8_t kind, flags;
+};
+static_assert(sizeof(ReplayOp) == 16);
+
+// A tile block's words that are not values (the masks and the windows are, read live), as the
+// game's converter checks them: the bin mask packets, each tile's SET_CONSTANT header and target.
+constexpr uint32_t kTileBlockWords = 27;
+constexpr uint32_t kTileWindowHeader = 0xC0032D01u, kTileWindowTarget = 0x00040080u;
+constexpr uint32_t kTileStatic[][2] = {
+    {0, 0xC0006100u},
+    {1, 0},
+    {2, 0xC0006000u},
+    {4, kTileWindowHeader},
+    {5, kTileWindowTarget},
+    {9, 0xC0006000u},
+    {11, kTileWindowHeader},
+    {12, kTileWindowTarget},
+    {16, 0xC0006000u},
+    {18, kTileWindowHeader},
+    {19, kTileWindowTarget},
+    {23, 0xC0006000u},
+    {24, 0xFFFFFFFFu},
+    {25, 0xC0006100u},
+    {26, 0},
+};
+
+enum class CompileFail : uint32_t {
+  kNone,
+  kLength,    // the list is not the template's length
+  kExtra,     // a packet after the template's last op
+  kMissing,   // the list ends before the template's last op
+  kRegs,      // a type-0 packet that is not the op's
+  kTile,      // a tile block that is not the op's
+  kShader,    // an IM_LOAD that is not the op's
+  kLiterals,  // a LOAD_ALU_CONSTANT that is not the op's
+  kDraw,      // a DRAW_INDX that is not the op's
+  kPadding,   // more padding in a row than an op can say
+  kCount,
+};
+constexpr const char* CompileFailName(CompileFail f) {
+  constexpr const char* names[] = {"none", "length", "extra",    "missing", "regs",
+                                   "tile", "shader", "literals", "draw",    "padding"};
+  static_assert(sizeof(names) / sizeof(names[0]) == size_t(CompileFail::kCount));
+  return f < CompileFail::kCount ? names[size_t(f)] : "?";
+}
+
+struct ReplayProgram {
+  std::vector<ReplayOp> ops;
+  uint32_t list_words = 0, tail_gap = 0, draws = 0;
+  // The registers the ops write, as sorted [first, end) pairs that do not touch.
+  std::vector<uint32_t> ranges;
+};
+
+// Program `p` of template t from list `pm4` (`words` dwords; its key is the template's, tiled or
+// untiled). A tile-bound packet's header is the one the template recorded, whichever form the
+// list has now.
+inline CompileFail Compile(const uint32_t* t, const uint8_t* pm4, uint32_t words,
+                           ReplayProgram* p) {
+  p->ops.clear();
+  p->ranges.clear();
+  p->draws = 0;
+  const uint32_t n = t[kTListWords];
+  if (n != words)
+    return CompileFail::kLength;
+  p->list_words = n;
+  const uint32_t* bound = t + t[kTTileBound];
+  const uint32_t* bound_end = bound + t[kTTileBoundCount] * 2;
+  std::vector<std::pair<uint32_t, uint32_t>> writes;
+  uint32_t k = 0, gap = 0;
+  for (uint32_t d = 0; d < n;) {
+    const uint32_t w = Word(pm4, d);
+    if (w == 0 || w >> 30 == 2) {
+      if (++gap > 0xFFFF)
+        return CompileFail::kPadding;
+      ++d;
+      continue;
+    }
+    if (k == t[kTOpCount])
+      return CompileFail::kExtra;
+    const uint32_t* o = Op(t, k);
+    ReplayOp r{};
+    r.dword = d;
+    r.gap = uint16_t(gap);
+    gap = 0;
+    uint32_t header = w;
+    const uint32_t count = ((w >> 16) & 0x3FFF) + 1, opcode = (w >> 8) & 0x7F;
+    const auto type3 = [&](uint32_t want_opcode, uint32_t want_count) {
+      return w >> 30 == 3 && opcode == want_opcode && count == want_count && !(w & 0x80FE) &&
+             !(w & 1) && d + 1 + count <= n;
+    };
+    switch (o[0] & 0xFF) {
+      case kOpRegs: {
+        if (o[0] & kOpTileBound) {
+          while (bound != bound_end && bound[0] < d)
+            bound += 2;
+          if (bound == bound_end || bound[0] != d || (w != bound[1] && w != NopPacket(bound[1])))
+            return CompileFail::kRegs;
+          header = bound[1];
+          r.flags = kReplayTileBound;
+        }
+        const uint32_t c = ((header >> 16) & 0x3FFF) + 1;
+        const bool one = (header & 0x8000) != 0;
+        if (header >> 30 != 0 || (header & 0x7FFF) != o[1] || c != o[2] ||
+            one != ((o[0] & kOpOneRegister) != 0) || d + 1 + c > n) {
+          return CompileFail::kRegs;
+        }
+        r.kind = one ? kReplayMarks : kReplayRegs;
+        r.first = uint16_t(o[1]);
+        r.count = uint16_t(c);
+        writes.push_back({o[1], one ? 1 : c});
+        d += 1 + c;
+        break;
+      }
+      case kOpTile: {
+        if (o[2] != d || d + kTileBlockWords > n)
+          return CompileFail::kTile;
+        for (const auto& s : kTileStatic) {
+          const uint32_t live = Word(pm4, d + s[0]);
+          if (live != s[1] && !(s[1] == kTileWindowHeader && live == NopPacket(s[1])))
+            return CompileFail::kTile;
+        }
+        header = kTileStatic[0][1];
+        r.kind = kReplayTile;
+        writes.push_back({kRegWindowOffset, 3});
+        d += kTileBlockWords;
+        break;
+      }
+      case kOpShader:
+        if (!type3(0x27, 2))
+          return CompileFail::kShader;
+        r.kind = kReplayShader;
+        d += 3;
+        break;
+      case kOpLiterals:
+        // ALU constants only (LOAD_ALU_CONSTANT's type 0 and its 11-bit index).
+        if (!type3(0x2F, 3) || o[1] < 0x4000 || uint64_t(o[1]) + o[2] > 0x4800 ||
+            Word(pm4, d + 2) != o[1] - 0x4000 || Word(pm4, d + 3) != o[2]) {
+          return CompileFail::kLiterals;
+        }
+        r.kind = kReplayLiterals;
+        r.first = uint16_t(o[1]);
+        r.count = uint16_t(o[2]);
+        writes.push_back({o[1], o[2]});
+        d += 4;
+        break;
+      case kOpDraw: {
+        // Opcode 0x22, four words, the predicate bit as the template's draw has it.
+        const uint32_t* rec = DrawRecord(t, o[1]);
+        if (w >> 30 != 3 || opcode != 0x22 || count != 4 || (w & 0x80FE) || d + 5 > n ||
+            rec[kDPacket] != d || (w & 1) != (rec[kDFlags] & kDrawPredicated)) {
+          return CompileFail::kDraw;
+        }
+        r.kind = kReplayDraw;
+        r.flags = (w & 1) ? kReplayPredicated : 0;
+        writes.push_back({kRegDmaBase, 3});
+        ++p->draws;
+        d += 5;
+        break;
+      }
+      default:
+        return CompileFail::kExtra;
+    }
+    r.header = ToRaw(header);
+    p->ops.push_back(r);
+    ++k;
+  }
+  if (k != t[kTOpCount])
+    return CompileFail::kMissing;
+  if (gap > 0xFFFF)
+    return CompileFail::kPadding;
+  p->tail_gap = gap;
+  std::sort(writes.begin(), writes.end());
+  for (const auto& [first, c] : writes) {
+    if (!p->ranges.empty() && first <= p->ranges.back()) {
+      p->ranges.back() = std::max(p->ranges.back(), first + c);
+    } else {
+      p->ranges.push_back(first);
+      p->ranges.push_back(first + c);
+    }
+  }
+  return CompileFail::kNone;
+}
+
+// Why a replay stopped before the list's end; the PM4 interpreter goes on from ReplayEnd::dword.
+enum class Handover : uint32_t {
+  kNone,
+  kPadding,     // a padding word that is a packet now
+  kHeader,      // a header that is not the program's
+  kTile,        // a tile block's static word changed
+  kHostPacket,  // an untiled packet's NOP whose first word is a host packet's magic
+  kLiterals,    // a constant load's target or size changed
+  kShader,      // an IM_LOAD of a shader type other than vertex or pixel
+  kDraw,        // a draw whose indices are not from an index buffer
+  kCount,
+};
+constexpr const char* HandoverName(Handover h) {
+  constexpr const char* names[] = {"none",        "padding",  "header", "tile",
+                                   "host-packet", "literals", "shader", "draw"};
+  static_assert(sizeof(names) / sizeof(names[0]) == size_t(Handover::kCount));
+  return h < Handover::kCount ? names[size_t(h)] : "?";
+}
+struct ReplayEnd {
+  Handover why = Handover::kNone;
+  uint32_t op = 0;     // the op it stopped at (ops.size(): the padding after the last)
+  uint32_t dword = 0;  // where the interpreter goes on: the padding before that op
+};
+
+// One run of program p over the live list `pm4`. The machine has the decoder's bin select and bin
+// mask (bin_select, bin_mask) and takes, as the packet handlers make them:
+//   Range(first, guest, count, last)   type-0 registers and a tile's window (SET_CONSTANT): the
+//                                      payload from the list (guest order); `last`: it ends the
+//                                      buffer (the plain path is not taken there)
+//   One(index, value)                  a one-register packet's word
+//   Literals(first, address, count)    LOAD_ALU_CONSTANT of ALU constants from physical memory
+//   Shader(address_type, start_size)   IM_LOAD's two words
+//   Draw(initiator, dma_base, dma_size) a draw that runs (its predicate passed)
+//   Skip()                             a draw its predicate skips
+//   TileMask(tile, live)               the mask tile `tile` of a tile block sets (live as a rule)
+template <typename Machine>
+inline ReplayEnd Replay(const ReplayProgram& p, const uint8_t* pm4, Machine& m) {
+  const ReplayOp* const ops = p.ops.data();
+  const uint32_t n = uint32_t(p.ops.size());
+  for (uint32_t k = 0; k < n; ++k) {
+    const ReplayOp& op = ops[k];
+    const uint32_t at = op.dword;
+    const auto stop = [&](Handover why) { return ReplayEnd{why, k, at - op.gap}; };
+    for (uint32_t g = at - op.gap; g < at; ++g) {
+      if (!PadRaw(RawWord(pm4, g)))
+        return stop(Handover::kPadding);
+    }
+    const uint32_t raw = RawWord(pm4, at);
+    switch (op.kind) {
+      case kReplayRegs:
+        if (raw != op.header) [[unlikely]] {
+          if (!(op.flags & kReplayTileBound) || raw != ToRaw(NopPacket(ToRaw(op.header))))
+            return stop(Handover::kHeader);
+          // Untiled: a NOP, which the interpreter skips unless it reads as a host packet.
+          if (op.count >= 2 && RawWord(pm4, at + 1) == kHostMagicRaw)
+            return stop(Handover::kHostPacket);
+          break;
+        }
+        m.Range(op.first, pm4 + size_t(at + 1) * 4, op.count, at + 1 + op.count == p.list_words);
+        break;
+      case kReplayMarks:
+        if (raw != op.header) [[unlikely]]
+          return stop(Handover::kHeader);
+        for (uint32_t i = 0; i < op.count; ++i)
+          m.One(op.first, Word(pm4, at + 1 + i));
+        break;
+      case kReplayTile: {
+        // Every static word first: a tile block is applied whole or not at all.
+        uint32_t untiled = 0;
+        for (uint32_t s = 0; s < sizeof(kTileStatic) / sizeof(kTileStatic[0]); ++s) {
+          const uint32_t live = RawWord(pm4, at + kTileStatic[s][0]);
+          if (live != ToRaw(kTileStatic[s][1])) [[unlikely]] {
+            if (kTileStatic[s][1] != kTileWindowHeader ||
+                live != ToRaw(NopPacket(kTileWindowHeader))) {
+              return stop(Handover::kTile);
+            }
+            untiled |= 1u << ((kTileStatic[s][0] - 4) / 7);
+          }
+        }
+        m.bin_mask = (m.bin_mask & 0xFFFFFFFFull) | uint64_t(Word(pm4, at + 1)) << 32;
+        for (uint32_t tile = 0; tile < kTiles; ++tile) {
+          const uint32_t base = at + 2 + tile * 7;
+          m.bin_mask = (m.bin_mask & 0xFFFFFFFF00000000ull) | m.TileMask(tile, Word(pm4, base + 1));
+          if (!(untiled >> tile & 1) && (m.bin_select & m.bin_mask) != 0)
+            m.Range(kRegWindowOffset, pm4 + size_t(base + 4) * 4, 3, false);
+        }
+        m.bin_mask = (m.bin_mask & 0xFFFFFFFF00000000ull) | Word(pm4, at + 24);
+        m.bin_mask = (m.bin_mask & 0xFFFFFFFFull) | uint64_t(Word(pm4, at + 26)) << 32;
+        break;
+      }
+      case kReplayShader: {
+        if (raw != op.header) [[unlikely]]
+          return stop(Handover::kHeader);
+        const uint32_t address_type = Word(pm4, at + 1);
+        if ((address_type & 3) > 1) [[unlikely]]
+          return stop(Handover::kShader);
+        m.Shader(address_type, Word(pm4, at + 2));
+        break;
+      }
+      case kReplayLiterals:
+        if (raw != op.header) [[unlikely]]
+          return stop(Handover::kHeader);
+        if (RawWord(pm4, at + 2) != ToRaw(op.first - 0x4000u) ||
+            RawWord(pm4, at + 3) != ToRaw(op.count)) [[unlikely]] {
+          return stop(Handover::kLiterals);
+        }
+        m.Literals(op.first, Word(pm4, at + 1) & 0x3FFFFFFFu, op.count);
+        break;
+      case kReplayDraw: {
+        if (raw != op.header) [[unlikely]]
+          return stop(Handover::kHeader);
+        if ((op.flags & kReplayPredicated) && !(m.bin_select & m.bin_mask)) {
+          m.Skip();
+          break;
+        }
+        const uint32_t initiator = Word(pm4, at + 2);
+        if ((initiator >> 6) & 3) [[unlikely]]
+          return stop(Handover::kDraw);
+        m.Draw(initiator, Word(pm4, at + 3), Word(pm4, at + 4));
+        break;
+      }
+      default:
+        return stop(Handover::kHeader);
+    }
+  }
+  for (uint32_t g = p.list_words - p.tail_gap; g < p.list_words; ++g) {
+    if (!PadRaw(RawWord(pm4, g)))
+      return ReplayEnd{Handover::kPadding, n, p.list_words - p.tail_gap};
+  }
+  return ReplayEnd{};
+}
+
 // ---- The registry -------------------------------------------------------------------------------
 
 // Why a run at a registered address is not compared (the buffer is decoded as today, which in
@@ -432,6 +789,10 @@ constexpr const char* SkipName(Skip s) {
 
 struct Template {
   std::vector<uint32_t> words;
+  // 0660 (verify mode): its replay program, compiled at the first run whose key is the
+  // template's.
+  ReplayProgram program;
+  enum : uint8_t { kProgramNone, kProgramReady, kProgramFailed } program_state = kProgramNone;
 };
 
 struct Binding {
@@ -443,6 +804,9 @@ struct Binding {
   uint32_t pool_generation = 0;
   // A key check since the bind found the template's key (KeyCheck).
   bool key_matched = false;
+  // 0660 (verify mode): which of the two goes first in this list's next run, the replay or the
+  // packets (alternated per list, so a list's runs do not all find the cache the same way).
+  bool replay_first = false;
 };
 
 // The lookup's key check of a run of binding b: kNone when the live key is the template's;
@@ -473,6 +837,10 @@ class Registry {
     return DefineResult::kNew;
   }
   const Template* FindTemplate(uint32_t id) const {
+    auto it = templates_.find(id);
+    return it == templates_.end() ? nullptr : &it->second;
+  }
+  Template* FindTemplate(uint32_t id) {
     auto it = templates_.find(id);
     return it == templates_.end() ? nullptr : &it->second;
   }

@@ -19,6 +19,11 @@
 //   also when the values agree: a tile block's mask that is another tile's while the register
 //   file already holds the selected tile's window, a write the template puts on another
 //   register whose value both already hold.
+// - the replay (0660): a template's program, compiled from its list, walked over the live list
+//   makes the calls the command processor's packet handlers make, in their order (for each tile's
+//   bin select, the bin masks a list starts with, untiled, the predicate both ways, slots and a
+//   payload word written), and so the same record words with elision on and off; it hands over
+//   at the op whose header, padding or static word changed, before the packet does anything.
 #include "../src/graphics/fh1_native_list.h"
 
 #include <cstdio>
@@ -601,6 +606,417 @@ void TestStableGeneration() {
         std::string(fl::SkipName(fl::Skip::kFixupDuringRun)) == "fixup-during-run");
 }
 
+// ---- 0660: the replay ---------------------------------------------------------------------------
+
+// What a replay or the packets hand the command processor's writers, in order (Replay's machine).
+struct CallLog {
+  uint64_t bin_select = 0xFFFFFFFF, bin_mask = 0xFFFFFFFF;
+  std::vector<uint32_t> calls;
+  std::vector<uint32_t> regs = std::vector<uint32_t>(fl::kRegisterLimit, 0);
+  std::vector<uint32_t> draw_packets;  // the executed draws' (initiator, base, size)
+  uint32_t skipped = 0;
+  void Range(uint32_t first, const uint8_t* guest, uint32_t count, bool last) {
+    calls.insert(calls.end(), {1u, first, count, uint32_t(last)});
+    for (uint32_t i = 0; i < count; ++i) {
+      calls.push_back(fl::Word(guest, i));
+      regs[first + i] = fl::Word(guest, i);
+    }
+  }
+  void One(uint32_t index, uint32_t value) {
+    calls.insert(calls.end(), {2u, index, value});
+    regs[index] = value;
+  }
+  void Literals(uint32_t first, uint32_t address, uint32_t count) {
+    calls.insert(calls.end(), {3u, first, address, count});
+    const uint8_t* block = Memory(nullptr, address);
+    for (uint32_t i = 0; i < count; ++i)
+      regs[first + i] = fl::Word(block, i);
+  }
+  void Shader(uint32_t address_type, uint32_t start_size) {
+    calls.insert(calls.end(), {4u, address_type, start_size});
+  }
+  void Draw(uint32_t initiator, uint32_t base, uint32_t size) {
+    calls.insert(calls.end(), {5u, initiator, base, size});
+    regs[0x21FC] = initiator;
+    regs[0x21FA] = base;
+    regs[0x21FB] = size;
+    draw_packets.insert(draw_packets.end(), {initiator, base, size});
+  }
+  void Skip() {
+    calls.push_back(6u);
+    ++skipped;
+  }
+  uint32_t TileMask(uint32_t, uint32_t live) { return live; }
+};
+
+// The calls the command processor's handlers make for a list's packets (command_processor.cpp:
+// ExecutePacket's padding loop, ExecutePacketType0, ExecutePacketType3's predicate and its
+// handlers), in the dwords [0, end).
+void Packets(const std::vector<uint32_t>& pm4, uint32_t end, CallLog& m) {
+  const std::vector<uint8_t> g = Guest(pm4);
+  const uint32_t n = uint32_t(pm4.size());
+  for (uint32_t d = 0; d < end;) {
+    const uint32_t h = pm4[d];
+    if (h == 0 || h >> 30 == 2) {
+      ++d;
+      continue;
+    }
+    const uint32_t count = ((h >> 16) & 0x3FFF) + 1;
+    const uint32_t* p = &pm4[d + 1];
+    if (h >> 30 == 0) {
+      const uint32_t first = h & 0x7FFF;
+      if (h & 0x8000) {
+        for (uint32_t i = 0; i < count; ++i)
+          m.One(first, p[i]);
+      } else {
+        m.Range(first, g.data() + (d + 1) * 4, count, d + 1 + count == n);
+      }
+      d += 1 + count;
+      continue;
+    }
+    CHECK(h >> 30 == 3);
+    const uint32_t opcode = (h >> 8) & 0x7F;
+    if ((h & 1) && !(m.bin_select & m.bin_mask)) {
+      if (opcode == 0x22)
+        m.Skip();
+      d += 1 + count;
+      continue;
+    }
+    switch (opcode) {
+      case 0x10:
+        CHECK(!(count >= 2 && p[0] == 0x4648314Eu));
+        break;
+      case 0x60:
+        m.bin_mask = (m.bin_mask & 0xFFFFFFFF00000000ull) | p[0];
+        break;
+      case 0x61:
+        m.bin_mask = (m.bin_mask & 0xFFFFFFFFull) | uint64_t(p[0]) << 32;
+        break;
+      case 0x2D:
+        CHECK(((p[0] >> 16) & 0xFF) == 4);
+        m.Range(0x2000 + (p[0] & 0x7FF), g.data() + (d + 2) * 4, count - 1, d + 1 + count == n);
+        break;
+      case 0x2F:
+        CHECK(((p[1] >> 16) & 0xFF) == 0);
+        m.Literals(0x4000 + (p[1] & 0x7FF), p[0] & 0x3FFFFFFF, p[2] & 0xFFF);
+        break;
+      case 0x27:
+        m.Shader(p[0], p[1]);
+        break;
+      case 0x22:
+        CHECK(((p[1] >> 6) & 3) == 0);
+        m.Draw(p[1], p[2], p[3]);
+        break;
+      default:
+        CHECK(false);
+    }
+    d += 1 + count;
+  }
+}
+
+// The decode/record split's record words for a call log (command_processor.cpp's
+// PacketWriteRegistersFromMem and PacketWriteRegister, elision on or off): equal calls give equal
+// words, and what elision leaves out depends on the decoder's register file at the list's start.
+std::vector<uint32_t> RecordWords(const std::vector<uint32_t>& calls, std::vector<uint32_t> shadow,
+                                  bool elide) {
+  std::vector<uint32_t> out;
+  const auto one = [&](uint32_t index, uint32_t value) {
+    const bool elidable = index >= 0x2000 && index != 0x21FC && index != 0x21F9;
+    if (elide && elidable && shadow[index] == value)
+      return;
+    shadow[index] = value;
+    out.insert(out.end(), {2u, index, value});
+  };
+  const auto range = [&](uint32_t first, const uint32_t* values, uint32_t count) {
+    if (!(elide && first >= 0x2000 && !(first <= 0x21FC && first + count > 0x21F9))) {
+      out.insert(out.end(), {0u, first, count});
+      out.insert(out.end(), values, values + count);
+      for (uint32_t i = 0; i < count; ++i)
+        shadow[first + i] = values[i];
+      return;
+    }
+    uint32_t run_first = UINT32_MAX, run_last = 0;
+    const auto flush = [&]() {
+      out.insert(out.end(), {0u, first + run_first, run_last - run_first + 1});
+      for (uint32_t k = run_first; k <= run_last; ++k) {
+        out.push_back(values[k]);
+        shadow[first + k] = values[k];
+      }
+    };
+    for (uint32_t i = 0; i < count; ++i) {
+      if (shadow[first + i] == values[i])
+        continue;
+      if (run_first == UINT32_MAX) {
+        run_first = i;
+      } else if (i - run_last - 1 > 8) {
+        flush();
+        run_first = i;
+      }
+      run_last = i;
+    }
+    if (run_first != UINT32_MAX)
+      flush();
+  };
+  for (size_t i = 0; i < calls.size();) {
+    switch (calls[i]) {
+      case 1:
+        range(calls[i + 1], &calls[i + 4], calls[i + 2]);
+        i += 4 + calls[i + 2];
+        break;
+      case 2:
+        one(calls[i + 1], calls[i + 2]);
+        i += 3;
+        break;
+      case 3: {
+        std::vector<uint32_t> v(calls[i + 3]);
+        const uint8_t* block = Memory(nullptr, calls[i + 2]);
+        for (uint32_t k = 0; k < v.size(); ++k)
+          v[k] = fl::Word(block, k);
+        range(calls[i + 1], v.data(), uint32_t(v.size()));
+        i += 4;
+        break;
+      }
+      case 4:
+        out.insert(out.end(), {4u, calls[i + 1] & 3, calls[i + 1] & ~3u, calls[i + 2] & 0xFFFF});
+        i += 3;
+        break;
+      case 5:
+        one(0x21FC, calls[i + 1]);
+        one(0x21FA, calls[i + 2]);
+        one(0x21FB, calls[i + 3]);
+        out.insert(out.end(), {3u, calls[i + 1], calls[i + 2], calls[i + 3]});
+        i += 4;
+        break;
+      default:
+        i += 1;
+        break;
+    }
+  }
+  return out;
+}
+
+fl::ReplayProgram Program(const Case& c) {
+  fl::ReplayProgram p;
+  const std::vector<uint8_t> g = Guest(c.pm4);
+  CHECK(fl::Compile(c.tmpl.data(), g.data(), uint32_t(c.pm4.size()), &p) == fl::CompileFail::kNone);
+  return p;
+}
+
+// A replay of `pm4` with program p against the packets, from the same bin state: the same calls
+// in the same order, the same bin mask after; and against the value interpreter: the same
+// register file and the same draws.
+fl::ReplayEnd ReplayAgainstPackets(const fl::ReplayProgram& p, const std::vector<uint32_t>& pm4,
+                                   uint64_t select, uint64_t mask, CallLog* replay_out = nullptr,
+                                   CallLog* packets_out = nullptr) {
+  const std::vector<uint8_t> g = Guest(pm4);
+  CallLog replay, packets;
+  replay.bin_select = packets.bin_select = select;
+  replay.bin_mask = packets.bin_mask = mask;
+  const fl::ReplayEnd end = fl::Replay(p, g.data(), replay);
+  Packets(pm4, end.why == fl::Handover::kNone ? uint32_t(pm4.size()) : end.dword, packets);
+  CHECK(replay.calls == packets.calls);
+  CHECK(replay.bin_mask == packets.bin_mask);
+  CHECK(replay.skipped == packets.skipped);
+  if (end.why == fl::Handover::kNone) {
+    Interpreter in;
+    in.select = select;
+    in.mask = mask;
+    std::vector<uint32_t> draws;
+    in.Run(pm4, [&](uint32_t d, bool executed, uint32_t) {
+      if (executed)
+        draws.insert(draws.end(), {pm4[d + 2], pm4[d + 3], pm4[d + 4]});
+    });
+    CHECK(in.mask == replay.bin_mask);
+    CHECK(draws == replay.draw_packets);
+    for (uint32_t r = 0; r < fl::kRegisterLimit; ++r)
+      CHECK(in.regs[r] == replay.regs[r]);
+  }
+  if (replay_out)
+    *replay_out = replay;
+  if (packets_out)
+    *packets_out = packets;
+  return end;
+}
+
+void TestReplay() {
+  constexpr uint64_t kSelects[] = {0x1, 0x4, 0x10, 0x80000001, 0x80000000, 0x40, 0x0, 0xFFFFFFFF};
+  constexpr uint64_t kMasks[] = {0xFFFFFFFF, 0x80000000, 0x8, 0xA, 0x2};
+  for (const Case& base : {Depth(), Scene()}) {
+    const fl::ReplayProgram p = Program(base);
+    const uint32_t* t = base.tmpl.data();
+    CHECK(p.ops.size() == t[fl::kTOpCount] && p.draws == t[fl::kTDrawCount]);
+    // The program's write ranges hold every register the list writes.
+    for (uint32_t seed : {1u, 2u}) {
+      Case c = base;
+      FixUp(c, seed);  // slots written, as a fixup does
+      for (const bool untiled : {false, true}) {
+        if (untiled && !(t[fl::kTFlags] & fl::kTemplateTiled))
+          continue;
+        const std::vector<uint32_t> pm4 = untiled ? Untile(c.pm4, c.tmpl) : c.pm4;
+        for (uint64_t select : kSelects) {
+          for (uint64_t mask : kMasks) {
+            CallLog replay, packets;
+            const fl::ReplayEnd end = ReplayAgainstPackets(p, pm4, select, mask, &replay, &packets);
+            CHECK(end.why == fl::Handover::kNone);
+            for (uint32_t r = 0; r < fl::kRegisterLimit; ++r) {
+              bool in = false;
+              for (size_t i = 0; i < p.ranges.size(); i += 2)
+                in |= r >= p.ranges[i] && r < p.ranges[i + 1];
+              CHECK(in || replay.regs[r] == 0);
+            }
+            // The split's record words, elision off and on, from two register files.
+            std::vector<uint32_t> shadow(fl::kRegisterLimit, 0);
+            for (const bool elide : {false, true}) {
+              for (int start = 0; start < 2; ++start) {
+                if (start)
+                  shadow = replay.regs;  // the list's own values already there
+                CHECK(RecordWords(replay.calls, shadow, elide) ==
+                      RecordWords(packets.calls, shadow, elide));
+              }
+            }
+            CHECK(RecordWords(replay.calls, replay.regs, true).size() <
+                  RecordWords(replay.calls, replay.regs, false).size());
+          }
+        }
+      }
+      // A payload word written without a fixup: the replay reads it from the list.
+      Case w = c;
+      for (uint32_t d = 0; d < w.pm4.size(); ++d) {
+        if (w.pm4[d] >> 30 == 0 && w.pm4[d] && (w.pm4[d] & 0x7FFF) == 0x4000) {
+          w.pm4[d + 2] ^= 0x00400000u;
+          break;
+        }
+      }
+      CallLog changed;
+      CHECK(ReplayAgainstPackets(p, w.pm4, 0x1, 0xFFFFFFFF, &changed).why == fl::Handover::kNone);
+    }
+    // A header changed at op k: the replay stops there, before the packet does anything, at the
+    // padding before it; what it did up to there is what the packets did up to there.
+    for (uint32_t k = 0; k < p.ops.size(); ++k) {
+      Case c = base;
+      FixUp(c, 3);
+      c.pm4[p.ops[k].dword] ^= 0x00010000u;  // one more word
+      const fl::ReplayEnd end = ReplayAgainstPackets(p, c.pm4, 0x1, 0xFFFFFFFF);
+      CHECK(end.why ==
+            (p.ops[k].kind == fl::kReplayTile ? fl::Handover::kTile : fl::Handover::kHeader));
+      CHECK(end.op == k && end.dword == p.ops[k].dword - p.ops[k].gap);
+    }
+    // Padding that is a packet now.
+    for (uint32_t k = 0; k <= p.ops.size(); ++k) {
+      const uint32_t gap = k < p.ops.size() ? p.ops[k].gap : p.tail_gap;
+      if (!gap)
+        continue;
+      Case c = base;
+      const uint32_t at = k < p.ops.size() ? p.ops[k].dword - 1 : p.list_words - 1;
+      c.pm4[at] = 0x00002000u;
+      const fl::ReplayEnd end = ReplayAgainstPackets(p, c.pm4, 0x1, 0xFFFFFFFF);
+      CHECK(end.why == fl::Handover::kPadding && end.op == k);
+    }
+    // The other checks, op by op.
+    for (uint32_t k = 0; k < p.ops.size(); ++k) {
+      Case c = base;
+      const uint32_t at = p.ops[k].dword;
+      fl::Handover want = fl::Handover::kNone;
+      switch (p.ops[k].kind) {
+        case fl::kReplayLiterals:
+          c.pm4[at + 2] += 0x10;  // another target
+          want = fl::Handover::kLiterals;
+          break;
+        case fl::kReplayShader:
+          c.pm4[at + 1] = (c.pm4[at + 1] & ~3u) | 2;
+          want = fl::Handover::kShader;
+          break;
+        case fl::kReplayDraw:
+          c.pm4[at + 2] |= 2u << 6;  // auto-indexed
+          want = fl::Handover::kDraw;
+          break;
+        case fl::kReplayTile:
+          c.pm4[at + 5] ^= 1;  // the first window's target
+          want = fl::Handover::kTile;
+          break;
+        case fl::kReplayRegs:
+          // As the NOP handler: a host packet needs two words at least.
+          if ((p.ops[k].flags & fl::kReplayTileBound) && p.ops[k].count >= 2) {
+            c.pm4 = Untile(c.pm4, c.tmpl);
+            c.pm4[at + 1] = 0x4648314Eu;  // a NOP that reads as a host packet
+            want = fl::Handover::kHostPacket;
+          }
+          break;
+        default:
+          break;
+      }
+      if (want == fl::Handover::kNone)
+        continue;
+      const std::vector<uint8_t> g = Guest(c.pm4);
+      CallLog m;
+      const fl::ReplayEnd end = fl::Replay(p, g.data(), m);
+      CHECK(end.why == want && end.op == k);
+    }
+    // Compile: only a list with the template's packets.
+    {
+      fl::ReplayProgram q;
+      std::vector<uint8_t> g = Guest(base.pm4);
+      CHECK(fl::Compile(t, g.data(), uint32_t(base.pm4.size()) - 1, &q) ==
+            fl::CompileFail::kLength);
+      Case c = base;
+      c.pm4[p.ops.back().dword] ^= 0x00010000u;
+      g = Guest(c.pm4);
+      CHECK(fl::Compile(t, g.data(), uint32_t(c.pm4.size()), &q) != fl::CompileFail::kNone);
+      c = base;
+      for (uint32_t k = 0; k <= p.ops.size(); ++k) {
+        const uint32_t gap = k < p.ops.size() ? p.ops[k].gap : p.tail_gap;
+        if (!gap)
+          continue;
+        c.pm4[k < p.ops.size() ? p.ops[k].dword - 1 : p.list_words - 1] = 0x00002000u;
+        break;
+      }
+      g = Guest(c.pm4);
+      CHECK(fl::Compile(t, g.data(), uint32_t(c.pm4.size()), &q) != fl::CompileFail::kNone);
+      // A constant load whose target is not an ALU constant (the converter never makes one).
+      for (uint32_t k = 0; k < t[fl::kTOpCount]; ++k) {
+        std::vector<uint32_t> bad = base.tmpl;
+        uint32_t* o = bad.data() + bad[fl::kTOps] + k * fl::kOpWords;
+        if ((o[0] & 0xFF) != fl::kOpLiterals)
+          continue;
+        o[1] = 0x47F8;  // past the ALU constants' end
+        g = Guest(base.pm4);
+        CHECK(fl::Compile(bad.data(), g.data(), uint32_t(base.pm4.size()), &q) ==
+              fl::CompileFail::kLiterals);
+      }
+      if (t[fl::kTFlags] & fl::kTemplateTiled) {
+        // From the untiled form: the same program.
+        g = Guest(Untile(base.pm4, base.tmpl));
+        CHECK(fl::Compile(t, g.data(), uint32_t(base.pm4.size()), &q) == fl::CompileFail::kNone);
+        CHECK(q.ops.size() == p.ops.size());
+        for (size_t k = 0; k < q.ops.size(); ++k)
+          CHECK(std::memcmp(&q.ops[k], &p.ops[k], sizeof(fl::ReplayOp)) == 0);
+      }
+    }
+  }
+  // D3D's marks: the depth list with its last packet (SCRATCH_REG7) as a one-register packet of
+  // two words, each written to the register.
+  {
+    Case c = Depth();
+    CHECK(c.pm4[c.pm4.size() - 2] == 0x0000057Fu);
+    c.pm4[c.pm4.size() - 2] = 0x0001857Fu;
+    c.pm4.push_back(0x00000008u);
+    uint32_t* t = c.tmpl.data();
+    t[fl::kTListWords] = uint32_t(c.pm4.size());
+    uint32_t* o = t + t[fl::kTOps] + (t[fl::kTOpCount] - 1) * fl::kOpWords;
+    CHECK((o[0] & 0xFF) == fl::kOpRegs && o[1] == 0x57F && o[2] == 1);
+    o[0] |= fl::kOpOneRegister;
+    o[2] = 2;
+    const fl::ReplayProgram p = Program(c);
+    CHECK(p.ops.back().kind == fl::kReplayMarks && p.ops.back().count == 2);
+    CallLog replay;
+    CHECK(ReplayAgainstPackets(p, c.pm4, 0x1, 0xFFFFFFFF, &replay).why == fl::Handover::kNone);
+    CHECK(replay.regs[0x57F] == 8 && replay.calls.size() > 6 &&
+          replay.calls[replay.calls.size() - 6] == 2 && replay.calls.back() == 8);
+  }
+  CHECK(fl::PadRaw(0) && fl::PadRaw(fl::ToRaw(0x80000000u)) && fl::PadRaw(fl::ToRaw(0xBFFFFFFFu)) &&
+        !fl::PadRaw(fl::ToRaw(0x00002000u)) && !fl::PadRaw(fl::ToRaw(0xC0001000u)));
+}
+
 }  // namespace
 
 int main() {
@@ -612,6 +1028,7 @@ int main() {
   TestKeyCheck();
   TestCompare();
   TestWrites();
+  TestReplay();
   std::printf("fh1 native list: all tests passed\n");
   return 0;
 }

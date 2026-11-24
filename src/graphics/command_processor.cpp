@@ -868,6 +868,12 @@ void CommandProcessor::RecordStore(uint32_t address, uint32_t guest_value) {
 }
 
 void CommandProcessor::PublishRecordBatch() {
+  // FH1 (0660): a verified run of a model list is open (verify mode only).
+  if (fh1_list_capture_) [[unlikely]] {
+    if (Fh1ListPublishing()) {
+      return;
+    }
+  }
   if (!record_split_ || record_batch_->words.empty()) {
     return;
   }
@@ -1565,6 +1571,11 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       (record_split_ ? decode_register_file_.get() : register_file_)->values};
   fh1_list_trace::IndirectScope fh1_list_scope(ptr, count, fh1_list_sources);
 #endif
+  // FH1 (0660): in verify mode a model list's run is the packets' and its replay's, both run
+  // by Fh1ListVerify.
+  if (fh1_lists_ && Fh1ListVerify(ptr, count, &reader)) [[unlikely]] {
+    return;
+  }
   // FH1 (0650): a model list the game registered is compared with its template as it runs.
   const bool fh1_list = fh1_lists_ && Fh1ListBegin(ptr, count, &reader);
   do {
@@ -2155,7 +2166,7 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
       for (uint32_t i = 1; i < count; ++i) words[i] = peek.ReadAndSwap<uint32_t>();
       reader->AdvanceRead(count * sizeof(uint32_t));
       // FH1 (0650): the model list registry's ops, on the decoder.
-      if (words[1] >= fh1_host::kOpListDefine && words[1] <= fh1_host::kOpListDrop) {
+      if (words[1] >= fh1_host::kOpListDefine && words[1] <= fh1_host::kOpListMode) {
         Fh1ListPacket(words.data(), count);
         return true;
       }
