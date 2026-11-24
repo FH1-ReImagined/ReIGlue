@@ -320,6 +320,14 @@ FfStrengths Strengths() {
   return s;
 }
 
+// An H-pattern gear for the log: R, N or its number.
+std::string GearName(int g) {
+  return g == kGearReverse   ? std::string("R")
+         : g == kGearNeutral ? std::string("N")
+                             : std::to_string(g);
+}
+constexpr int kLeverLogLines = 1000;  // H-pattern lever reads logged per wheel (#952)
+
 // The H-pattern gear to report on thumb_rx (wheel_gear_request.h): on lever moves only, or the
 // engaged gear all the time with wheel_shifter_follow_slot. A new request is logged.
 int GearRequestOf(GearRequest& r, int engaged, bool game_read, double now_ms) {
@@ -327,10 +335,7 @@ int GearRequestOf(GearRequest& r, int engaged, bool game_read, double now_ms) {
   const int out =
       GearToReport(r, engaged, now_ms, game_read, REXCVAR_GET(wheel_shifter_follow_slot));
   if (r.request != before && r.request != kGearNoRequest) {
-    REXLOG_INFO("Wheel: the lever moved: gear {} asked of the game",
-                engaged == kGearReverse   ? std::string("R")
-                : engaged == kGearNeutral ? std::string("N")
-                                          : std::to_string(engaged));
+    REXLOG_INFO("Wheel: the lever moved: gear {} asked of the game", GearName(engaged));
   }
   return out;
 }
@@ -779,6 +784,9 @@ struct WheelInputDriver::Wheel {
   GearRequest gear_request;  // what thumb_rx asks of the game (wheel_gear_request.h)
   LeverHold lever_hold;      // the lever crossing neutral between two gates (#468)
   int gears_logged = 0;      // H-pattern gear changes logged so far
+  int lever = kGearNeutral;       // the H-pattern lever's last logged read (LeverGear) ...
+  int lever_gear = kGearNeutral;  // ... and the gear it gave
+  int levers_logged = 0;     // lever reads logged so far (kLeverLogLines)
   bool keystroke_poll = false;  // ComputeStateLocked for a keystroke: not a state the game reads
   bool shifter_logged = false;  // where the shifter is read was logged
   bool title_caps = false;  // the game read the capabilities, so it takes this for a wheel
@@ -1722,18 +1730,27 @@ void WheelInputDriver::ComputeStateLocked(Wheel& w, X_INPUT_GAMEPAD* out) {
       // A lever crossing neutral between two gates goes from one gear to the other (#468).
       const double crossing_since = w.lever_hold.neutral_since;
       const int before = w.gear;
-      w.gear = EngageLeverGear(w.lever_hold, LeverGear(m, held), w.gear, now_ms,
+      const int lever = LeverGear(m, held);
+      w.gear = EngageLeverGear(w.lever_hold, lever, w.gear, now_ms,
                                REXCVAR_GET(wheel_shifter_neutral_ms),
                                REXCVAR_GET(wheel_shifter_clutch), clutch,
                                static_cast<float>(REXCVAR_GET(wheel_clutch_threshold)));
+      if (!w.keystroke_poll && (lever != w.lever || w.gear != w.lever_gear)) {
+        // What the lever read and the gear it gave, in both modes (#952: the gear changes below
+        // stop after 16, and the lever's own reads were never logged).
+        if (w.levers_logged < kLeverLogLines) {
+          REXLOG_INFO("Wheel: H-pattern lever {}, gear {}, clutch {:.2f}{}", GearName(lever),
+                      GearName(w.gear), clutch,
+                      ++w.levers_logged == kLeverLogLines ? "; the next reads are not logged"
+                                                          : "");
+        }
+        w.lever = lever;
+        w.lever_gear = w.gear;
+      }
       if (w.gear != before && !w.keystroke_poll && w.gears_logged < 16) {
         // How the game takes the change, which its paddle animation shows (#468). A change into
         // neutral plays none; one out of it is a downshift for the game whatever the gear.
-        auto name = [](int g) {
-          return g == kGearReverse ? std::string("R")
-                 : g == kGearNeutral ? std::string("N")
-                                     : std::to_string(g);
-        };
+        auto name = GearName;
         std::string how;
         if (w.gear == kGearNeutral) {
           how = "";
