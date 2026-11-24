@@ -231,6 +231,22 @@ struct CommandProcessor::Fh1Lists {
   // Unsplit draw checks: per draw whether it ran, then the program's registers.
   std::vector<uint32_t> stock_draw_states, replay_draw_states;
   const std::vector<uint32_t>* draw_ranges = nullptr;
+  // Unsplit draw checks also time each executed draw packet of the packets' run: from its seam to
+  // the next seam after its own three register writes (the draw's issue, plus the next packet's
+  // decode up to its first write; an IM_LOAD in between is in it too).
+  uint64_t draw_span_start = 0, draw_span_ns = 0, draw_spans = 0;
+  uint32_t draw_span_skip = 0;
+  void CloseDrawSpan() {
+    if (!draw_span_start)
+      return;
+    if (draw_span_skip) {
+      --draw_span_skip;
+      return;
+    }
+    draw_span_ns += NowNs() - draw_span_start;
+    ++draw_spans;
+    draw_span_start = 0;
+  }
   bool verifying = false;
   fl::ReplayProgram perturbed_program;
 };
@@ -654,6 +670,12 @@ void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
   auto& s = *fh1_lists_;
   if (s.mode == Fh1Lists::Mode::kVerify) {
     // 0660: an unsplit draw check (the replay's Snap, for the packets).
+    s.draw_span_skip = 0;
+    s.CloseDrawSpan();
+    if (executed) {
+      s.draw_span_skip = 3;
+      s.draw_span_start = NowNs();
+    }
     s.stock_draw_states.push_back(executed);
     const uint32_t* values = register_file_->values;
     for (size_t i = 0; i < s.draw_ranges->size(); i += 2) {
@@ -697,6 +719,8 @@ void CommandProcessor::Fh1ListDraw(uint32_t packet_offset, bool executed) {
 void CommandProcessor::Fh1ListNoteWrites(uint32_t first, uint32_t count) {
   if (fh1_lists_->mode == Fh1Lists::Mode::kShadow)  // 0660: not a verify draw check's
     fh1_lists_->run.LiveWrites(first, count);
+  else
+    fh1_lists_->CloseDrawSpan();
 }
 
 // The write paths' cold halves, with a run open: PacketWriteRegister's unsplit path tail-calls
@@ -705,6 +729,8 @@ void CommandProcessor::Fh1ListNoteWrites(uint32_t first, uint32_t count) {
 void CommandProcessor::Fh1ListWriteRegister(uint32_t index, uint32_t value) {
   if (fh1_lists_->mode == Fh1Lists::Mode::kShadow)
     fh1_lists_->run.LiveWrites(index, 1);
+  else
+    fh1_lists_->CloseDrawSpan();
   WriteRegister(index, value);
 }
 
@@ -715,6 +741,8 @@ bool CommandProcessor::Fh1ListWritePlainRange(memory::RingBuffer* ring, uint32_t
   }
   if (fh1_lists_->mode == Fh1Lists::Mode::kShadow)
     fh1_lists_->run.LiveWrites(base, count);
+  else
+    fh1_lists_->CloseDrawSpan();
   return true;
 }
 
@@ -1175,6 +1203,10 @@ bool CommandProcessor::Fh1ListVerify(uint32_t ptr, uint32_t count, memory::RingB
       }
     } while (reader->read_count());
     ns_stock = NowNs() - ts - s.capture_ns;
+    if (draw_check) {
+      s.draw_span_skip = 0;
+      s.CloseDrawSpan();
+    }
     fh1_list_reader_ = nullptr;
     published = record_published_ - published_before;
     s.verifying = false;
@@ -1392,10 +1424,11 @@ void LogVerify(const CommandProcessor::Fh1Lists& s, const char* when, uint64_t f
   REXGPU_INFO(
       "FH1 native lists (verify): {} decoder; lookup and checks before a run {:.4f} ms a frame "
       "({:.1f} ns a run), compiles {:.1f} ms in all, snapshot and compare {:.4f} ms a frame; "
-      "a clock read pair {:.1f} ns",
+      "a clock read pair {:.1f} ns; unsplit draw checks: {} draws issued, {:.1f} ns a draw",
       s.v.timing[0].runs + s.v.timing[1].runs ? "" : "no runs timed;",
       double(v.ns_begin) * per_frame, v.runs ? double(v.ns_begin) / double(v.runs) : 0.0,
-      double(v.ns_compile) * 1e-6, double(v.ns_check) * per_frame, v.clock_ns);
+      double(v.ns_compile) * 1e-6, double(v.ns_check) * per_frame, v.clock_ns, s.draw_spans,
+      s.draw_spans ? double(s.draw_span_ns) / double(s.draw_spans) : 0.0);
 }
 
 }  // namespace
