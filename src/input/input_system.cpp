@@ -256,7 +256,8 @@ std::optional<DeviceInfo> InputSystem::DeviceInfoFor(DeviceId id) const {
   return std::nullopt;
 }
 
-// The caller holds the input system's lock (GetStateForUI, once per device and poll).
+// The caller holds the input system's lock (GetStateForUI, once per device and poll;
+// UpdateConnectedUser).
 bool InputSystem::IsWheel(DeviceId id) const {
   for (const auto& device : devices_) {
     if (device.id == id) {
@@ -330,8 +331,19 @@ void InputSystem::UpdateConnectedUser(uint32_t user_index, bool connected) {
     return;
   }
 
-  // Deadzone percentages scale against the device's own range.
+  // Deadzone percentages scale against the device's own range: a pad's, as the deadzones are
+  // only for pads (a wheel's capabilities report its shifter's gears, not a stick range).
   DeviceId chosen = ChooseDeviceForUser(user_index);
+  if (IsWheel(chosen)) {
+    std::vector<DeviceId> ids;
+    assignment_->DevicesForUser(user_index, ids);
+    for (DeviceId id : ids) {
+      if (!IsWheel(id)) {
+        chosen = id;
+        break;
+      }
+    }
+  }
   auto* driver = DriverForDevice(chosen);
   if (!driver) {
     return;

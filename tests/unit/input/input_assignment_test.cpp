@@ -296,20 +296,41 @@ TEST_CASE("The stick deadzones leave a racing wheel's gear and clutch alone (FH1
   CHECK(state.gamepad.thumb_rx == 3);
   CHECK(state.gamepad.thumb_ry == 300);
 
-  // A pad next to the wheel still has its deadzone, and the wheel's gear survives the merge.
+  // The gear's no-request value (10, sent with the gear on lever moves only and out of focus).
+  driver->SetSticks(1, 0, 0, 10, 0);
+  REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.gamepad.thumb_rx == 10);
+}
+
+TEST_CASE("A pad next to a racing wheel keeps its own stick deadzone (FH1 #952)", "[input]") {
+  struct Deadzones {
+    Deadzones() { REXCVAR_SET(right_stick_deadzone_percentage, 0.1); }
+    ~Deadzones() { REXCVAR_SET(right_stick_deadzone_percentage, 0.0); }
+  } deadzones;
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1, false, rex::input::XINPUT_DEVSUBTYPE_WHEEL);  // the wheel first
+  driver->SetCapsSticks(1, 0x7FFF, 0, 6 << 8, 0);
   driver->Add(2);
   driver->SetCapsSticks(2, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF);
-  driver->SetSticks(2, 0, 0, 100, 0);  // a drifting right stick, inside the deadzone
+  // A drifting right stick, inside the pad's 10 percent (3276) but past the wheel's range's (153).
+  driver->SetSticks(2, 0, 0, 1000, 1000);
   driver->SetSticks(1, 0, 0, 3, 0);
+  X_INPUT_STATE state = {};
   REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
   CHECK(state.gamepad.thumb_rx == 3);
+  CHECK(state.gamepad.thumb_ry == 0);
   driver->SetSticks(1, 0, 0, 0, 0);
   REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
   CHECK(state.gamepad.thumb_rx == 0);
+  CHECK(state.gamepad.thumb_ry == 0);
 }
 
 TEST_CASE("The stick deadzones still apply to a pad", "[input]") {
-  REXCVAR_SET(right_stick_deadzone_percentage, 0.1);
+  struct Deadzones {
+    Deadzones() { REXCVAR_SET(right_stick_deadzone_percentage, 0.1); }
+    ~Deadzones() { REXCVAR_SET(right_stick_deadzone_percentage, 0.0); }
+  } deadzones;
   FakeDriver* driver = nullptr;
   auto system = SharedSystem(&driver);
   driver->Add(1);
@@ -321,5 +342,4 @@ TEST_CASE("The stick deadzones still apply to a pad", "[input]") {
   driver->SetSticks(1, 0, 0, 20000, 0);
   REQUIRE(system->GetStateForUI(0, &state) == X_ERROR_SUCCESS);
   CHECK(state.gamepad.thumb_rx == 20000);
-  REXCVAR_SET(right_stick_deadzone_percentage, 0.0);
 }
