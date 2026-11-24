@@ -232,8 +232,8 @@ struct CommandProcessor::Fh1Lists {
   std::vector<uint32_t> stock_draw_states, replay_draw_states;
   const std::vector<uint32_t>* draw_ranges = nullptr;
   // Unsplit draw checks also time each executed draw packet of the packets' run: from its seam to
-  // the next seam after its own three register writes (the draw's issue, plus the next packet's
-  // decode up to its first write; an IM_LOAD in between is in it too).
+  // the next register write or IM_LOAD after its own three register writes (the draw's issue,
+  // plus the next packet's decode).
   uint64_t draw_span_start = 0, draw_span_ns = 0, draw_spans = 0;
   uint32_t draw_span_skip = 0;
   void CloseDrawSpan() {
@@ -1445,6 +1445,9 @@ void CommandProcessor::Fh1ListsSwap() {
 
 void CommandProcessor::Fh1ListShader(uint32_t address_type, uint32_t start_size) {
   auto& s = *fh1_lists_;
+  // 0660: an unsplit draw check's draw ends before the next IM_LOAD's shader lookup.
+  if (s.draw_span_start && s.mode == Fh1Lists::Mode::kVerify && fh1_list_reader_)
+    s.CloseDrawSpan();
   const uint32_t stage = address_type & 1;  // 0 vertex, 1 pixel
   s.shaders.address[stage] = address_type;
   s.shaders.size[stage] = start_size;
