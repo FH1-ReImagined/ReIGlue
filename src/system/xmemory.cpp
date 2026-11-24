@@ -2322,7 +2322,14 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   }
   // Patch 1110: the invalidation above only reaches pages that were watched. A page that was
   // read-only had no watch (EnableAccessCallbacks skips it), and the GPU may hold it as up to date:
-  // it is invalidated as a watched page is.
+  // it is invalidated as a watched page is. When a page of the range was watched, the call above
+  // has invalidated the whole range already, and this one invalidates it again on purpose: while
+  // the heaps were being updated, the GPU may have read a page of the range that was still
+  // read-only (valid again, no watch armed), or armed a watch whose read-only host protection the
+  // update then replaced (a watch that never fires). Only a call after the update catches both.
+  // For the few ranges that had a watched page, every invalidation callback (SharedMemory's
+  // bits and watches, the primitive processor's) then runs twice, counted twice in the frame cost
+  // CSV's cpu_invalidations.
   if (protect & memory::kMemoryProtectWrite) {
     InvalidateWhetherWatched(address, size);
   }
@@ -2338,11 +2345,14 @@ void PhysicalHeap::InvalidateWhetherWatched(uint32_t address, uint32_t size) {
   // updated (the update sets the host protection without the global critical region): the page
   // is then marked as watched with the protection the update gave it, and its watch would never
   // fire. TriggerCallbacks unwatches it, setting the protection the page table gives, and tells
-  // the callbacks. With no page watched, the common case, it tells nobody: tell them here.
+  // the callbacks. With no page watched, the common case, it tells nobody: tell them here. One
+  // hold of the global critical region for both steps (it is recursive: TriggerCallbacks takes
+  // and drops a lock of its own), so no watch is armed between them on pages that are then
+  // invalidated, which would cost a needless fault later.
+  auto global_lock = global_critical_region_.Acquire();
   if (TriggerCallbacks(global_critical_region_.Acquire(), address, size, true, true)) {
     return;
   }
-  auto global_lock = global_critical_region_.Acquire();
   const uint32_t physical_address = GetPhysicalAddress(address);
   for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
     invalidation_callback->first(invalidation_callback->second, physical_address, size, true);

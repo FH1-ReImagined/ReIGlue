@@ -1284,7 +1284,7 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
             "readback_ms,readback_wait_ms,readbacks_skipped,cpu_per_frame,readbacks_deferred,"
             "bg_pipelines,bg_pipeline_ms,bg_pipeline_max_ms,cpu_write_faults,cpu_write_fault_ms,"
             "held,skipped_draws,queued_ahead,readback_buffers_created,readback_buffers_freed,"
-            "readback_free_ms\n",
+            "readback_free_ms,cpu_invalidations,cpu_invalidation_ms\n",
             state.csv);
       }
     }
@@ -1304,7 +1304,7 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
     std::fprintf(state.csv,
                  "%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%u,%u,%llu,%.3f,%u,%llu,%.3f,%u,%llu,%llu,%.3f,%u,"
                  "%.3f,%u,%.3f,%u,%llu,%.3f,%u,%.1f,%.1f,%u,%u,%llu,%.3f,%.3f,%u,%d,%u,"
-                 "%u,%.3f,%.3f,%u,%.3f,%u,%u,%u,%u,%u,%.3f\n",
+                 "%u,%.3f,%.3f,%u,%.3f,%u,%u,%u,%u,%u,%.3f,%u,%.3f\n",
                  std::chrono::duration<double>(
                      std::chrono::system_clock::now().time_since_epoch())
                      .count(),
@@ -1324,7 +1324,7 @@ void Fh1EndFrameCost(uint64_t frame_index, uint64_t render_target_bytes,
                  frame.bg_pipeline_max_ms, frame.cpu_write_faults, frame.cpu_write_fault_ms,
                  frame.held, frame.skipped_draws, frame.queued_ahead,
                  frame.readback_buffers_created, frame.readback_buffers_freed,
-                 frame.readback_free_ms);
+                 frame.readback_free_ms, frame.cpu_invalidations, frame.cpu_invalidation_ms);
     if (frame_index % 300 == 0) std::fflush(state.csv);
   }
   if (state.report.OnFrame(frame, t)) {

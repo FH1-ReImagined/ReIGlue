@@ -58,8 +58,8 @@ struct Frame {
   uint32_t bg_pipelines = 0;     // real pipelines built on any thread (placeholders not counted)
   double bg_pipeline_ms = 0;     // their driver time, summed
   double bg_pipeline_max_ms = 0; // the longest one
-  uint32_t cpu_write_faults = 0;  // CPU writes to watched guest memory (any thread)
-  double cpu_write_fault_ms = 0;  // their invalidation callbacks
+  uint32_t cpu_write_faults = 0;  // faults of guest writes to watched guest memory (any thread)
+  double cpu_write_fault_ms = 0;  // SharedMemory's invalidation callback for them
   uint32_t held = 0;           // not presented: draws were skipped for pipelines not ready
   uint32_t skipped_draws = 0;  // draws skipped for them
   uint32_t queued_ahead = 0;   // pipelines the lookahead started
@@ -68,6 +68,11 @@ struct Frame {
   uint32_t readback_buffers_created = 0;
   uint32_t readback_buffers_freed = 0;
   double readback_free_ms = 0;
+  // FH1 (ReIGlue #75): invalidations of the GPU's copy of guest memory with no fault (any
+  // thread): allocations and protection changes to writable (1110), releases, decommits and file
+  // reads. Not in cpu_write_faults.
+  uint32_t cpu_invalidations = 0;
+  double cpu_invalidation_ms = 0;  // SharedMemory's invalidation callback for them
 
   void Add(const Frame& o) {
     ms += o.ms;
@@ -111,6 +116,8 @@ struct Frame {
     readback_buffers_created += o.readback_buffers_created;
     readback_buffers_freed += o.readback_buffers_freed;
     readback_free_ms += o.readback_free_ms;
+    cpu_invalidations += o.cpu_invalidations;
+    cpu_invalidation_ms += o.cpu_invalidation_ms;
   }
 };
 
@@ -122,6 +129,8 @@ struct Background {
   std::atomic<uint64_t> pipeline_max_us{0};
   std::atomic<uint64_t> cpu_write_faults{0};
   std::atomic<uint64_t> cpu_write_fault_us{0};
+  std::atomic<uint64_t> cpu_invalidations{0};
+  std::atomic<uint64_t> cpu_invalidation_us{0};
 
   void AddPipeline(uint64_t us) {
     pipelines.fetch_add(1, std::memory_order_relaxed);
@@ -134,12 +143,19 @@ struct Background {
     cpu_write_faults.fetch_add(1, std::memory_order_relaxed);
     cpu_write_fault_us.fetch_add(us, std::memory_order_relaxed);
   }
+  void AddCpuInvalidation(uint64_t us) {
+    cpu_invalidations.fetch_add(1, std::memory_order_relaxed);
+    cpu_invalidation_us.fetch_add(us, std::memory_order_relaxed);
+  }
   void Take(Frame& f) {
     f.bg_pipelines = uint32_t(pipelines.exchange(0, std::memory_order_relaxed));
     f.bg_pipeline_ms = double(pipeline_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
     f.bg_pipeline_max_ms = double(pipeline_max_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
     f.cpu_write_faults = uint32_t(cpu_write_faults.exchange(0, std::memory_order_relaxed));
     f.cpu_write_fault_ms = double(cpu_write_fault_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+    f.cpu_invalidations = uint32_t(cpu_invalidations.exchange(0, std::memory_order_relaxed));
+    f.cpu_invalidation_ms =
+        double(cpu_invalidation_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
   }
 };
 
