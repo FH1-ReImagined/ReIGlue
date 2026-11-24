@@ -324,7 +324,8 @@ void FaultCounters() {
   REQUIRE(E0().Protect(address, kBlock, kReadWrite));
   frame = take();
   CHECK(frame.cpu_write_faults == 0);
-  CHECK(frame.cpu_invalidations >= 1);
+  // Protect's TriggerCallbacks, then InvalidateWhetherWatched (deliberate, see Protect).
+  CHECK(frame.cpu_invalidations == 2);
 
   CHECK(gpu.Uploads(physical, kBlock));
   take();

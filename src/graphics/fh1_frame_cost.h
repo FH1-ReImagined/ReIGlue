@@ -59,7 +59,7 @@ struct Frame {
   double bg_pipeline_ms = 0;     // their driver time, summed
   double bg_pipeline_max_ms = 0; // the longest one
   uint32_t cpu_write_faults = 0;  // faults of guest writes to watched guest memory (any thread)
-  double cpu_write_fault_ms = 0;  // their invalidation callbacks
+  double cpu_write_fault_ms = 0;  // SharedMemory's invalidation callback for them
   uint32_t held = 0;           // not presented: draws were skipped for pipelines not ready
   uint32_t skipped_draws = 0;  // draws skipped for them
   uint32_t queued_ahead = 0;   // pipelines the lookahead started
@@ -72,7 +72,7 @@ struct Frame {
   // thread): allocations and protection changes to writable (1110), releases, decommits and file
   // reads. Not in cpu_write_faults.
   uint32_t cpu_invalidations = 0;
-  double cpu_invalidation_ms = 0;  // their invalidation callbacks
+  double cpu_invalidation_ms = 0;  // SharedMemory's invalidation callback for them
 
   void Add(const Frame& o) {
     ms += o.ms;

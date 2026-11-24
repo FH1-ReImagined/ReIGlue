@@ -2326,8 +2326,10 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   // has invalidated the whole range already, and this one invalidates it again on purpose: while
   // the heaps were being updated, the GPU may have read a page of the range that was still
   // read-only (valid again, no watch armed), or armed a watch whose read-only host protection the
-  // update then replaced (a watch that never fires). Only a call after the update catches both;
-  // it costs one more pass over the range's bits, for the few ranges that have a watched page.
+  // update then replaced (a watch that never fires). Only a call after the update catches both.
+  // For the few ranges that had a watched page, every invalidation callback (SharedMemory's
+  // bits and watches, the primitive processor's) then runs twice, counted twice in the frame cost
+  // CSV's cpu_invalidations.
   if (protect & memory::kMemoryProtectWrite) {
     InvalidateWhetherWatched(address, size);
   }
