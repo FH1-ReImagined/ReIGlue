@@ -885,6 +885,7 @@ void CommandProcessor::PublishRecordBatch() {
     // Far ahead of the recorder: let it catch up halfway first (the queue's memory).
     ++record_syncs_[kSyncQueueFull];
     const uint64_t target = record_published_ - kRecordMaxQueued / 2;
+    const Fh1LedgerWait fh1_wait(this);  // FH1 (0670): not the class's time
     std::unique_lock<std::mutex> lock(record_mutex_);
     record_decoder_waiting_ = true;
     record_wake_at_ = target;
@@ -920,6 +921,7 @@ void CommandProcessor::RecordSync(RecordSyncReason reason) {
   ++record_syncs_[reason];
   PublishRecordBatch();
   const uint64_t target = record_published_;
+  const Fh1LedgerWait fh1_wait(this);  // FH1 (0670): not the class's time
   for (uint32_t i = 0;
        i < kRecordSpin && record_completed_.load(std::memory_order_acquire) < target; ++i) {
     SpinPause();
@@ -2276,6 +2278,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
       rexui_SetNextGuestOutputTag(0);
     });
+    if (fh1_ledger_dec_) [[unlikely]]
+      Fh1LedgerAfterSwap();  // FH1 (0670): the swap's own work, a label of its own
     PublishRecordBatch();
     LogRecordSplit();
 #if REX_FH1_PM4_TRACE
@@ -2290,6 +2294,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   rexui_SetNextGuestOutputTag(frame_tag);
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   rexui_SetNextGuestOutputTag(0);
+  if (fh1_ledger_dec_) [[unlikely]]
+    Fh1LedgerAfterSwap();     // FH1 (0670)
   fh1_frame_trace::OnSwap();  // patch 0396
 #if REX_FH1_PM4_TRACE
   fh1_pm4_trace::OnSwap();  // patch 0570

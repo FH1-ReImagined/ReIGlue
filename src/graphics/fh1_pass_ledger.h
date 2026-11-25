@@ -193,6 +193,7 @@ struct Totals {
   uint64_t dec_thread_ns = 0;  // the decoder thread's CPU time, swap to swap
   uint64_t rec_thread_ns = 0;  // the recorder thread's (split)
   uint64_t rec_idle_ns = 0;    // the recorder between batches (spinning or asleep)
+  uint64_t dec_idle_ns = 0;    // the decoder's CPU outside the ring (waiting for the game)
   uint64_t marks = 0;          // marks read on the decoder
   uint64_t stale_marks = 0;  // marks seen again (a tiled segment's replay): game numbers kept once
   void Add(const Totals& o) {
@@ -201,6 +202,7 @@ struct Totals {
     dec_thread_ns += o.dec_thread_ns;
     rec_thread_ns += o.rec_thread_ns;
     rec_idle_ns += o.rec_idle_ns;
+    dec_idle_ns += o.dec_idle_ns;
     marks += o.marks;
     stale_marks += o.stale_marks;
   }
@@ -227,6 +229,10 @@ inline std::string LabelName(uint32_t label) {
       break;
     case fh::kPassKindTail:
       return "tail";
+    case fh::kPassKindSwap:
+      return "swap";
+    case 0xFF:
+      return "unlabelled";
     default:
       std::snprintf(text, sizeof(text), "label %08X", label);
       return text;
@@ -308,7 +314,8 @@ inline std::string CsvHeader() {
       "window,epoch,frames,split,label,name,class,layer,segments,order,rdr_cpu_ms,other_device,"
       "rdr_flush_ms,rdr_flush_calls,submitted,runs,dec_ms,dec_draws,dec_skipped,rec_ms,"
       "rec_draws,rec_issue_ms,rec_copies,rec_copy_ms,rec_empty,rt_surface,rt_color,rt_depth,"
-      "frame_draws,dec_thread_ms,rec_thread_ms,rec_idle_ms,marks,stale_marks,delta_draws";
+      "frame_draws,dec_thread_ms,rec_thread_ms,rec_idle_ms,dec_idle_ms,marks,stale_marks,"
+      "delta_draws";
   for (uint32_t g = 0; g < rg::kGroupCount; ++g) {
     if (g == rg::kSystem || g == rg::kFetchConstants)
       continue;  // never counted
@@ -353,10 +360,11 @@ inline std::string CsvLines(uint64_t window, double epoch, bool split, const Row
     out.append(head);
     out.append(text, size_t(n > 0 ? n : 0));
     n = std::snprintf(text, sizeof(text),
-                      "%" PRIu64 ",%.4f,%.4f,%.4f,%" PRIu64 ",%" PRIu64 ",%" PRIu64,
+                      "%" PRIu64 ",%.4f,%.4f,%.4f,%.4f,%" PRIu64 ",%" PRIu64 ",%" PRIu64,
                       frame ? totals.frame_draws : 0, frame ? ms(totals.dec_thread_ns) : 0.0,
                       frame ? ms(totals.rec_thread_ns) : 0.0, frame ? ms(totals.rec_idle_ns) : 0.0,
-                      frame ? totals.marks : 0, frame ? totals.stale_marks : 0, c.delta_draws);
+                      frame ? ms(totals.dec_idle_ns) : 0.0, frame ? totals.marks : 0,
+                      frame ? totals.stale_marks : 0, c.delta_draws);
     out.append(text, size_t(n > 0 ? n : 0));
     for (uint32_t g = 0; g < rg::kGroupCount; ++g) {
       if (g == rg::kSystem || g == rg::kFetchConstants)
@@ -382,6 +390,34 @@ inline std::string CsvLines(uint64_t window, double epoch, bool split, const Row
   }
   line(nullptr, "frame", 0, none, false, true);
   return out;
+}
+
+// The decoder's CPU time of a segment (`cpu_ns`, its thread clock) split among the draw classes
+// by their ticks, less the ticks of the waits counted inside them (`wait_ticks`): all of it to
+// `current` if no class has ticks left. Adds to `out` (ns per slot) and clears both inputs.
+inline void SplitByTicks(uint64_t cpu_ns, uint64_t* ticks, uint64_t* wait_ticks, uint32_t current,
+                         uint64_t* out) {
+  uint64_t total = 0;
+  for (uint32_t s = 0; s < kSlots; ++s) {
+    ticks[s] = ticks[s] > wait_ticks[s] ? ticks[s] - wait_ticks[s] : 0;
+    wait_ticks[s] = 0;
+    total += ticks[s];
+  }
+  uint64_t given = 0;
+  uint32_t largest = current;
+  if (total) {
+    for (uint32_t s = 0; s < kSlots; ++s) {
+      const uint64_t share = uint64_t(double(cpu_ns) * double(ticks[s]) / double(total));
+      out[s] += share;
+      given += share;
+      if (ticks[s] > ticks[largest])
+        largest = s;
+    }
+  }
+  // The rounding (or everything, without ticks) to the largest class: the total is exact.
+  out[largest] += cpu_ns - given;
+  for (uint32_t s = 0; s < kSlots; ++s)
+    ticks[s] = 0;
 }
 
 // The decoder's comparison of the register groups at a draw: `now` the register file, `then`

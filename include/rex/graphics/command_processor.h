@@ -455,6 +455,26 @@ class CommandProcessor {
   REX_FH1_LIST_COLD void Fh1LedgerBatch(bool begin);
   REX_FH1_LIST_COLD void Fh1LedgerDecoderBusy(bool begin);
   REX_FH1_LIST_COLD void Fh1LedgerDecoderWaited(std::chrono::steady_clock::time_point start);
+  // The swap's own work (after its call): folded into a label of its own.
+  REX_FH1_LIST_COLD void Fh1LedgerAfterSwap();
+  // A wait of the decoder for the recorder (RecordSync, the queue full) while the ledger is on:
+  // its time is not the draw class's. Off, a null test at each end.
+  struct Fh1LedgerWait {
+    explicit Fh1LedgerWait(CommandProcessor* cp)
+        : cp_(cp->fh1_ledger_dec_ ? cp : nullptr),
+          start_(cp_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {
+    }
+    ~Fh1LedgerWait() {
+      if (cp_) [[unlikely]]
+        cp_->Fh1LedgerDecoderWaited(start_);
+    }
+    Fh1LedgerWait(const Fh1LedgerWait&) = delete;
+    Fh1LedgerWait& operator=(const Fh1LedgerWait&) = delete;
+
+   private:
+    CommandProcessor* cp_;
+    std::chrono::steady_clock::time_point start_;
+  };
   void Fh1LedgerRecorderMark(uint32_t op, uint32_t value);
   void Fh1LedgerShutdown();
   // The backend's part (the Vulkan one has it): after an IssueDraw, an identity of what each

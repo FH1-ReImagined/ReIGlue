@@ -145,6 +145,26 @@ void Accrual() {
   CHECK(ns[6] == 100);
 }
 
+void Split() {
+  uint64_t ticks[pl::kSlots] = {}, waits[pl::kSlots] = {}, out[pl::kSlots] = {};
+  // 1000 ns of CPU over three classes: 300 ticks, 600 ticks of which 100 a wait, 100 ticks.
+  ticks[1] = 300;
+  ticks[3] = 600;
+  waits[3] = 100;
+  ticks[5] = 100;
+  pl::SplitByTicks(1000, ticks, waits, 1, out);
+  CHECK(out[1] == 333 && out[3] == 556 && out[5] == 111);  // 333 + 555 + 111 + 1 rounding
+  CHECK(out[1] + out[3] + out[5] == 1000);                 // the segment's total is exact
+  for (uint32_t s = 0; s < pl::kSlots; ++s)
+    CHECK(ticks[s] == 0 && waits[s] == 0);
+  // No ticks (a segment of waits only): all to the class in progress.
+  uint64_t out2[pl::kSlots] = {};
+  ticks[2] = 50;
+  waits[2] = 80;
+  pl::SplitByTicks(400, ticks, waits, 6, out2);
+  CHECK(out2[6] == 400 && out2[2] == 0);
+}
+
 void Sequence() {
   pl::Sequence s;
   CHECK(s.New(1));
@@ -167,6 +187,8 @@ void Labels() {
   CHECK(pl::LabelName(fh::PassLabel(fh::kPassKindStart, 0, 0, 2)) == "start +2");
   CHECK(pl::LabelName(fh::PassLabel(fh::kPassKindTail, 0, 0, 0)) == "tail");
   CHECK(pl::LabelName(fh::PassLabel(fh::kPassKindCars, 2, 1, 0)) == "c2 #1");
+  CHECK(pl::LabelName(fh::PassLabel(fh::kPassKindSwap, 0, 0, 0)) == "swap");
+  CHECK(pl::LabelName(0xFF000000u) == "unlabelled");
 }
 
 int Columns(const std::string& line) {
@@ -224,6 +246,7 @@ int main() {
   Groups();
   Slots();
   Accrual();
+  Split();
   Sequence();
   Labels();
   Csv();

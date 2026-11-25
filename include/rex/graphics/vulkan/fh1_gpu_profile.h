@@ -135,6 +135,15 @@ class Fh1GpuProfile {
   std::function<std::string(uint64_t)> name_of_key_;
   // Per key (label << 8 | slot) and kind (a fixed zone, or kFirstDrawZone for all the draws).
   std::unordered_map<uint64_t, ZoneSum> tag_sums_[kFirstDrawZone + 1];
+  // Intervals whose segment had not ended when its results were read (a wait for the GPU in the
+  // middle of a segment): named at the next reading, or unlabelled at the report.
+  struct PendingTag {
+    uint32_t tag;
+    uint16_t kind;
+    double ms;
+  };
+  std::vector<PendingTag> pending_tags_;
+  void AddTagged(uint32_t tag, uint16_t kind, double ms);
 };
 
 }  // namespace rex::graphics::vulkan

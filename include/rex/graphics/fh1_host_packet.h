@@ -102,6 +102,7 @@ enum PassKind : uint32_t {
   kPassKindShadowMask = 3,    // a segment of the sun's shadow mask (its function to its resolve)
   kPassKindTail = 4,          // command processor only: after the last segment end
   kPassKindCars = 5,          // a segment with only cars' draws (their own pass numbers)
+  kPassKindSwap = 6,          // command processor only: the swap's own work (after its call)
 };
 constexpr uint32_t PassLabel(uint32_t kind, uint32_t pass, uint32_t occurrence, uint32_t after) {
   return (kind & 0xFF) << 24 | (pass & 0xFF) << 16 | (occurrence & 0xFF) << 8 | (after & 0xFF);

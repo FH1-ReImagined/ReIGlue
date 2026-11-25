@@ -33,6 +33,12 @@
 #include <vector>
 
 #if REX_PLATFORM_WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #if REX_ARCH_AMD64
 #include <intrin.h>
@@ -139,6 +145,7 @@ double MeasureNsPerTick() {
 
 constexpr uint32_t kLabelRing = 8192;
 const uint32_t kTailLabel = fh::PassLabel(fh::kPassKindTail, 0, 0, 0);
+const uint32_t kSwapLabel = fh::PassLabel(fh::kPassKindSwap, 0, 0, 0);
 
 // FNV-1a over 64-bit words (the recorder stages' identities).
 uint64_t Mix(uint64_t h, uint64_t v) {
@@ -171,8 +178,12 @@ struct CommandProcessor::Fh1PassLedger {
   pl::Accrual dec_clock;  // ticks, paused while the decoder waits
   pl::Cell dec_pending[pl::kSlots];
   uint64_t dec_ticks[pl::kSlots] = {};
-  uint64_t dec_wait_ns[pl::kSlots] = {};  // WAIT_REG_MEM inside the ticks
-  uint64_t dec_segment_cpu = 0;           // the thread CPU clock at the previous segment end
+  uint64_t dec_wait_ticks[pl::kSlots] = {};  // waits inside the ticks (WAIT_REG_MEM, syncs)
+  // The decoder's CPU outside the ring (spinning or polling for the game's next commands): not
+  // a segment's. Since the last segment end, and when the current stretch began.
+  uint64_t dec_idle_cpu = 0, dec_idle_start = 0;
+  bool first_frame_done = false;  // the frame the ledger started in is dropped
+  uint64_t dec_segment_cpu = 0;   // the thread CPU clock at the previous segment end
   std::unique_ptr<DecoderFrame> dec_frame = std::make_unique<DecoderFrame>();
   uint64_t dec_frame_cpu = 0;
   std::vector<uint32_t> dec_previous;  // the register file at the previous draw (delta)
@@ -205,20 +216,16 @@ struct CommandProcessor::Fh1PassLedger {
   // ticks (all of it to the class in progress if none were counted).
   void FoldDecoder(uint32_t label, uint64_t cpu) {
     pl::Row& row = dec_frame->rows.At(label);
-    const uint64_t cpu_ns = cpu > dec_segment_cpu ? cpu - dec_segment_cpu : 0;
+    uint64_t cpu_ns = cpu > dec_segment_cpu ? cpu - dec_segment_cpu : 0;
     dec_segment_cpu = cpu;
-    uint64_t total = 0;
+    const uint64_t idle = std::min(cpu_ns, dec_idle_cpu);
+    cpu_ns -= idle;
+    dec_frame->totals.dec_idle_ns += idle;
+    dec_idle_cpu = 0;
+    uint64_t ns[pl::kSlots] = {};
+    pl::SplitByTicks(cpu_ns, dec_ticks, dec_wait_ticks, dec_clock.slot(), ns);
     for (uint32_t s = 0; s < pl::kSlots; ++s) {
-      const uint64_t wait = uint64_t(double(dec_wait_ns[s]) / ns_per_tick);
-      dec_ticks[s] = dec_ticks[s] > wait ? dec_ticks[s] - wait : 0;
-      dec_wait_ns[s] = 0;
-      total += dec_ticks[s];
-    }
-    for (uint32_t s = 0; s < pl::kSlots; ++s) {
-      dec_pending[s].dec_ns += total
-                                   ? uint64_t(double(cpu_ns) * double(dec_ticks[s]) / double(total))
-                                   : (s == dec_clock.slot() ? cpu_ns : 0);
-      dec_ticks[s] = 0;
+      dec_pending[s].dec_ns += ns[s];
       if (!dec_pending[s].Empty())
         row.cells[s].Add(dec_pending[s]);
       dec_pending[s] = pl::Cell();
@@ -387,6 +394,14 @@ void CommandProcessor::Fh1LedgerDecoderSwap() {
     if (r.split)
       r.rec_clock.Mark(Ticks(), r.rec_ticks);
     r.FoldRecorder(kTailLabel);
+    if (!r.first_frame_done) {
+      // The ledger started in this frame (the game turns its marks on mid-frame): dropped.
+      r.first_frame_done = true;
+      r.rec_frame.Clear();
+      r.rec_idle_ns = 0;
+      r.rec_frame_cpu = ThreadCpuNs();
+      return;
+    }
     pl::Totals totals = decoded->totals;
     totals.frames = 1;
     totals.frame_draws = fh1_frame_cost::Current().draws;
@@ -473,19 +488,49 @@ void CommandProcessor::Fh1LedgerBatch(bool begin) {
 
 void CommandProcessor::Fh1LedgerDecoderWaited(std::chrono::steady_clock::time_point start) {
   Fh1PassLedger& l = *fh1_ledger_dec_;
-  l.dec_wait_ns[l.dec_clock.slot()] += uint64_t(
+  const double ns = double(
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
           .count());
+  l.dec_wait_ticks[l.dec_clock.slot()] += uint64_t(ns / l.ns_per_tick);
 }
 
 void CommandProcessor::Fh1LedgerDecoderBusy(bool begin) {
   Fh1PassLedger& l = *fh1_ledger_dec_;
   const uint64_t now = Ticks();
+  const uint64_t cpu = ThreadCpuNs();
   if (begin) {
     l.dec_clock.Resume(now);
+    if (l.dec_idle_start && cpu > l.dec_idle_start)
+      l.dec_idle_cpu += cpu - l.dec_idle_start;
+    l.dec_idle_start = 0;
   } else {
     l.dec_clock.Pause(now, l.dec_ticks);
+    l.dec_idle_start = cpu;
   }
+}
+
+void CommandProcessor::Fh1LedgerAfterSwap() {
+  Fh1PassLedger& l = *fh1_ledger_dec_;
+  if (!l.split) {
+    // One thread: the swap ran on it, after the frame's fold.
+    l.dec_clock.Mark(Ticks(), l.dec_ticks);
+    l.FoldDecoder(kSwapLabel, ThreadCpuNs());
+  }
+  RecordCall([this]() {
+    Fh1PassLedger* ledger = fh1_ledger_rec_;
+    if (!ledger)
+      return;
+    Fh1PassLedger& r = *ledger;
+    if (r.split)
+      r.rec_clock.Mark(Ticks(), r.rec_ticks);
+    r.FoldRecorder(kSwapLabel);
+    ++r.serial;
+    Fh1PassLedger::LabelEntry& e = r.labels[r.serial % kLabelRing];
+    e.serial = r.serial;
+    e.label = kSwapLabel;
+    e.valid = true;
+    Fh1PassLedgerTag((r.serial + 1) << 5 | r.rec_slot);
+  });
 }
 
 uint64_t CommandProcessor::Fh1PassLedgerTagKey(uint32_t tag) const {
