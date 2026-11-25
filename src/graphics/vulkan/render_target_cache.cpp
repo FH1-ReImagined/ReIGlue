@@ -6981,4 +6981,43 @@ bool VulkanRenderTargetCache::CopyHdrScene(VkImage destination, uint32_t width, 
   return true;
 }
 
+// FH1 (0680): see the header.
+bool VulkanRenderTargetCache::Fh1ResolveWithoutCopy(const memory::Memory& memory,
+                                                    VulkanTextureCache& texture_cache) {
+  draw_util::ResolveInfo resolve_info;
+  if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
+                                 draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
+                                 IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
+    return false;
+  }
+  if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8)
+    return true;
+  // As Resolve: the textures read from the destination load again (not on a scaled resolve,
+  // whose scaled memory a skipped copy never committed).
+  if (resolve_info.copy_dest_extent_length && !IsDrawResolutionScaled())
+    texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                      resolve_info.copy_dest_extent_length);
+  if (GetPath() != Path::kHostRenderTargets ||
+      !(resolve_info.IsClearingDepth() || resolve_info.IsClearingColor()))
+    return true;
+  // As Resolve's clearing, on the host render target path.
+  Transfer::Rectangle clear_rectangle;
+  RenderTarget* clear_render_targets[2];
+  if (PrepareHostRenderTargetsResolveClear(resolve_info, clear_rectangle, clear_render_targets[0],
+                                           clear_transfers_[0], clear_render_targets[1],
+                                           clear_transfers_[1])) {
+    uint64_t clear_values[2];
+    clear_values[0] = resolve_info.rb_depth_clear;
+    clear_values[1] = resolve_info.color_edram_info.format_is_64bpp
+                          ? resolve_info.rb_color_clear_lo |
+                                (uint64_t(resolve_info.rb_color_clear) << 32)
+                          : resolve_info.rb_color_clear;
+    Fh1GpuZoneScope gpu_zone(command_processor_.deferred_command_buffer(),
+                             Fh1GpuProfile::kResolveClear);
+    PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
+                                     &clear_rectangle);
+  }
+  return true;
+}
+
 }  // namespace rex::graphics::vulkan

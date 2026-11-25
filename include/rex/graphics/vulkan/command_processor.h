@@ -943,6 +943,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t Fh1PassLedgerWork() override;
   void Fh1PassLedgerTag(uint32_t tag) override;
   void Fh1PassLedgerStarted() override;
+  // FH1 (0680): a draw FORZA_TEST_SKIP_PASS skips, without `copies`: its render targets bound.
+  bool Fh1PassLedgerSkippedDraw() override;
+  bool Fh1PassLedgerSkippedCopy() override;
   Fh1StereoDraw Fh1StereoClassify() override;
   void Fh1StereoBegin() override;
   bool Fh1StereoLeftDone() override;
