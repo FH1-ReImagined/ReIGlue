@@ -56,6 +56,7 @@ bool Fh1GpuProfile::Initialize(const ui::vulkan::VulkanDevice* device, double pe
       return false;
     }
     slot.zones.resize(kQueriesPerSlot);
+    slot.tags.resize(kQueriesPerSlot);
   }
   results_.resize(kQueriesPerSlot);
   sums_.resize(kFirstDrawZone);
@@ -128,6 +129,7 @@ void Fh1GpuProfile::Mark(DeferredCommandBuffer& commands, uint16_t zone) {
     return;
   }
   slot->zones[slot->count] = zone;
+  slot->tags[slot->count] = tag_;
   commands.CmdFh1Timestamp(write_timestamp_, slot->pool, slot->count);
   ++slot->count;
 }
@@ -166,6 +168,12 @@ void Fh1GpuProfile::Completed(uint64_t completed) {
       sums_[zone].ms += ms;
       ++sums_[zone].intervals;
       busy_ms_ += ms;
+      if (key_of_tag_) {
+        ZoneSum& sum =
+            tag_sums_[std::min<uint16_t>(zone, kFirstDrawZone)][key_of_tag_(slot.tags[i - 1])];
+        sum.ms += ms;
+        ++sum.intervals;
+      }
     }
   }
   const auto now = std::chrono::steady_clock::now();
@@ -222,9 +230,26 @@ void Fh1GpuProfile::Report() {
                      busy_ms_ / frames, name.c_str(), sums_[z].ms / frames,
                      double(sums_[z].intervals) / frames);
       }
+      // FH1 (0670): by pass ledger key and kind of work.
+      if (name_of_key_) {
+        for (uint16_t kind = 0; kind <= kFirstDrawZone; ++kind) {
+          const char* kind_name = kind < kFixedCount ? kFixedNames[kind] : "draws";
+          if (kind >= kFixedCount && kind < kFirstDrawZone)
+            continue;
+          for (const auto& [key, sum] : tag_sums_[kind]) {
+            std::string name = "pass|" + name_of_key_(key) + "|" + kind_name;
+            std::replace(name.begin(), name.end(), ',', ' ');
+            std::fprintf(file_, "%u,%.1f,%" PRIu64 ",%.3f,%s,%.4f,%.2f\n", window_, t, frames_,
+                         busy_ms_ / frames, name.c_str(), sum.ms / frames,
+                         double(sum.intervals) / frames);
+          }
+        }
+      }
       std::fflush(file_);
     }
   }
+  for (auto& sums : tag_sums_)
+    sums.clear();
   ++window_;
   for (ZoneSum& sum : sums_) sum = ZoneSum();
   busy_ms_ = 0.0;

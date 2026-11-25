@@ -66,7 +66,46 @@ enum Op : uint32_t {
   kOpListBind = 0x21,
   // The list at a physical address is unloaded: [2] the address, [3] its dwords.
   kOpListDrop = 0x22,
+  // 0670: the pass ledger's marks (fh1_pass_ledger.h; FH1 docs/rendering.md "Pass ledger").
+  // Handled on the decoder when it reads them and again on the recorder in stream order, so each
+  // thread's time and draws go to the pass and draw class the game was in when it wrote the
+  // commands. The game sends them at its D3D flush points only while the ledger is on.
+  // The draw class changes: [2] the mark's sequence number, [3] the new class (kPassClass*,
+  // with the layer << 4 for the model lists), [4] the class that ends, then the game's numbers
+  // for that class's flush calls since the previous mark (render thread): [5] ns in the D3D
+  // flush points, [6] their calls, [7] the draws submitted, [8] the command lists run.
+  kOpPassClass = 0x30,
+  // A segment of the frame ends (after a resolve, and before the swap): [2] sequence, [3] its
+  // label (PassLabel), [4] the render thread's CPU time since the previous segment end (ns, 0
+  // if unknown), [5] the class that ends, [6..9] as kOpPassClass's [5..8], [10] the flush calls
+  // made on another D3D device in the segment (not counted as submitted).
+  kOpPassEnd = 0x31,
 };
+constexpr uint32_t kPassClassWords = 9, kPassEndWords = 11;
+// The draw classes of the pass ledger: who made the draws (FH1's D3D flush points).
+enum PassClass : uint32_t {
+  kPassClassD3D = 0,         // DrawVertices, DrawIndexedVertices
+  kPassClassUp = 1,          // DrawVerticesUP, DrawIndexedVerticesUP (vertices copied in)
+  kPassClassClear = 2,       // the clear's rectangle draw
+  kPassClassTrack = 3,       // RunCommandBuffer of the track's model lists
+  kPassClassProcedural = 4,  // RunCommandBuffer of the procedural models' lists
+  kPassClassCar = 5,         // RunCommandBuffer of a car's models (the clones)
+  kPassClassOtherList = 6,   // any other RunCommandBuffer
+  kPassClassNone = 7,        // nothing marked yet (the command processor's own start)
+  kPassClassCount = 8,
+};
+// A label: [31:24] kind, [23:16] the game's presentation pass, [15:8] its occurrence in the
+// frame, [7:0] segments since the named one (0: the named segment itself).
+enum PassKind : uint32_t {
+  kPassKindStart = 1,         // before the frame's first named segment
+  kPassKindPresentation = 2,  // a segment with the track, procedural or car draws of a pass
+  kPassKindShadowMask = 3,    // a segment of the sun's shadow mask (its function to its resolve)
+  kPassKindTail = 4,          // command processor only: after the last segment end
+  kPassKindCars = 5,          // a segment with only cars' draws (their own pass numbers)
+};
+constexpr uint32_t PassLabel(uint32_t kind, uint32_t pass, uint32_t occurrence, uint32_t after) {
+  return (kind & 0xFF) << 24 | (pass & 0xFF) << 16 | (occurrence & 0xFF) << 8 | (after & 0xFF);
+}
 constexpr uint32_t kListDefineWords = 8, kListBindWords = 12, kListDropWords = 4;
 constexpr uint32_t kListRefused = 0xFFFFFFFFu;
 constexpr uint32_t kListGroupNone = 0xFF;

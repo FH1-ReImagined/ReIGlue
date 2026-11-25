@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -78,6 +79,17 @@ class Fh1GpuProfile {
   }
   uint16_t AddZone(uint64_t key, std::string name);
 
+  // FH1 (0670): the pass ledger's tag of the commands recorded from now on (the caller makes the
+  // next command write a timestamp: DeferredCommandBuffer::Fh1ForceGpuZoneMark). With names set,
+  // every interval is also summed by the tag's key (its segment label and draw class), and each
+  // report adds a CSV row per key and kind of work, its zone "pass|<label>|<class>|<layer>|<kind>".
+  void SetTag(uint32_t tag) { tag_ = tag; }
+  void SetTagNames(std::function<uint64_t(uint32_t)> key_of_tag,
+                   std::function<std::string(uint64_t)> name_of_key) {
+    key_of_tag_ = std::move(key_of_tag);
+    name_of_key_ = std::move(name_of_key);
+  }
+
  private:
   static constexpr uint32_t kSlots = 16;
   static constexpr uint32_t kQueriesPerSlot = 8192;
@@ -88,6 +100,7 @@ class Fh1GpuProfile {
     uint32_t count = 0;
     bool pending = false;
     std::vector<uint16_t> zones;
+    std::vector<uint32_t> tags;  // FH1 (0670)
   };
   struct ZoneSum {
     double ms = 0.0;
@@ -116,6 +129,12 @@ class Fh1GpuProfile {
   uint32_t window_ = 0;
   std::unordered_map<uint64_t, uint16_t> draw_zones_;
   std::vector<std::string> draw_names_;
+  // FH1 (0670): the pass ledger's tags.
+  uint32_t tag_ = 0;
+  std::function<uint64_t(uint32_t)> key_of_tag_;
+  std::function<std::string(uint64_t)> name_of_key_;
+  // Per key (label << 8 | slot) and kind (a fixed zone, or kFirstDrawZone for all the draws).
+  std::unordered_map<uint64_t, ZoneSum> tag_sums_[kFirstDrawZone + 1];
 };
 
 }  // namespace rex::graphics::vulkan

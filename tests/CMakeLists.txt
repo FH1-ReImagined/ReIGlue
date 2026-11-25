@@ -17,6 +17,11 @@ add_executable(fh1_native_list_test fh1_native_list_test.cpp)
 target_include_directories(fh1_native_list_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME fh1.native_list COMMAND fh1_native_list_test)
 
+# FH1 (0670): the pass ledger's pure parts and the register groups, header only.
+add_executable(fh1_pass_ledger_test fh1_pass_ledger_test.cpp)
+target_include_directories(fh1_pass_ledger_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME fh1.pass_ledger COMMAND fh1_pass_ledger_test)
+
 find_package(Threads REQUIRED)
 add_executable(pipeline_retirement_test pipeline_retirement_test.cpp)
 target_include_directories(pipeline_retirement_test PRIVATE ${PROJECT_SOURCE_DIR}/include)

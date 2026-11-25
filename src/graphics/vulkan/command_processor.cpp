@@ -48,6 +48,7 @@
 #include <rex/ui/vulkan/fh1_breadcrumbs.h>
 #include <rex/platform.h>
 #include "../fh1_frame_cost.h"
+#include "../fh1_pass_ledger.h"
 #include <rex/graphics/vulkan/fh1_gpu_profile.h>
 #if REX_PLATFORM_MAC
 #include <mach/mach.h>
@@ -8232,6 +8233,69 @@ void VulkanCommandProcessor::Fh1SetDrawGpuZone(uint64_t pixel_shader) {
   deferred_command_buffer_.SetFh1GpuZone(fh1_gpu_profile.DrawZone(
       key.key, width, height, uint32_t(key.msaa_samples), depth, colors, 4,
       fh1_gpu_profile_shaders_on ? pixel_shader : 0));
+}
+
+// FH1 (0670): the pass ledger's backend part (src/graphics/fh1_pass_ledger.cpp).
+namespace {
+uint64_t Fh1LedgerHash(uint64_t h, const void* data, size_t size) {
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    h ^= bytes[i];
+    h *= 0x100000001B3ull;
+  }
+  return h;
+}
+}  // namespace
+
+bool VulkanCommandProcessor::Fh1PassLedgerStages(uint64_t* stages) {
+  namespace pl = fh1_pass_ledger;
+  constexpr uint64_t kSeed = 0xCBF29CE484222325ull;
+  const uint64_t pipeline = uint64_t(current_guest_graphics_pipeline_);
+  stages[pl::kStagePipeline] = Fh1LedgerHash(kSeed, &pipeline, sizeof(pipeline));
+  const uint64_t render_pass_key = render_target_cache_->last_update_render_pass_key().key;
+  const VulkanRenderTargetCache::Framebuffer* framebuffer =
+      render_target_cache_->last_update_framebuffer();
+  stages[pl::kStageRenderPass] = Fh1LedgerHash(
+      Fh1LedgerHash(kSeed, &render_pass_key, sizeof(uint64_t)), &framebuffer, sizeof(framebuffer));
+  const VkDescriptorSet textures[2] = {
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex],
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel]};
+  stages[pl::kStageTextureSets] = Fh1LedgerHash(kSeed, textures, sizeof(textures));
+  uint64_t samplers = kSeed;
+  for (const auto* list : {&current_samplers_vertex_, &current_samplers_pixel_}) {
+    for (const auto& sampler : *list) {
+      samplers = Fh1LedgerHash(samplers, &sampler.second, sizeof(sampler.second));
+    }
+    samplers = Fh1LedgerHash(samplers, "|", 1);
+  }
+  stages[pl::kStageSamplers] = samplers;
+  const VkDescriptorSet constants =
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants];
+  stages[pl::kStageConstantSet] = Fh1LedgerHash(kSeed, &constants, sizeof(constants));
+  stages[pl::kStageDynamic] =
+      Fh1LedgerHash(Fh1LedgerHash(kSeed, &dynamic_viewport_, sizeof(dynamic_viewport_)),
+                    &dynamic_scissor_, sizeof(dynamic_scissor_));
+  stages[pl::kStageSystemConstants] =
+      Fh1LedgerHash(kSeed, &system_constants_, sizeof(system_constants_));
+  return true;
+}
+
+uint64_t VulkanCommandProcessor::Fh1PassLedgerWork() {
+  return deferred_command_buffer_.Fh1RecordedWords();
+}
+
+void VulkanCommandProcessor::Fh1PassLedgerTag(uint32_t tag) {
+  if (!fh1_gpu_profile.active())
+    return;
+  fh1_gpu_profile.SetTag(tag);
+  deferred_command_buffer_.Fh1ForceGpuZoneMark();
+}
+
+void VulkanCommandProcessor::Fh1PassLedgerStarted() {
+  if (!fh1_gpu_profile.active())
+    return;
+  fh1_gpu_profile.SetTagNames([this](uint32_t tag) { return Fh1PassLedgerTagKey(tag); },
+                              [](uint64_t key) { return Fh1PassLedgerKeyName(key); });
 }
 
 bool VulkanCommandProcessor::IssueCopy() {
