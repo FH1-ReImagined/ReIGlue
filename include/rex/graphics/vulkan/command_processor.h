@@ -937,6 +937,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   // before the right eye's pass) and both eyes, side by side, for the VR client.
   bool Fh1StereoWanted() override;
   void Fh1HostPacket(const uint32_t* words, uint32_t count) override;
+  // FH1 (0670): the pass ledger's backend part (fh1_pass_ledger.cpp): the recorder stages'
+  // choices after a draw, the deferred command buffer's size, the GPU profile's tags.
+  bool Fh1PassLedgerStages(uint64_t* stages) override;
+  uint64_t Fh1PassLedgerWork() override;
+  void Fh1PassLedgerTag(uint32_t tag) override;
+  void Fh1PassLedgerStarted() override;
   Fh1StereoDraw Fh1StereoClassify() override;
   void Fh1StereoBegin() override;
   bool Fh1StereoLeftDone() override;

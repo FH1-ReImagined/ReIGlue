@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -100,6 +101,8 @@ class CommandProcessor {
   // FH1 (0650): the native renderer's model list registry and its shadow compare
   // (fh1_native_list.cpp).
   struct Fh1Lists;
+  // FH1 (0670): the pass ledger (fh1_pass_ledger.cpp).
+  struct Fh1PassLedger;
 
   virtual bool Initialize();
   virtual void Shutdown();
@@ -430,6 +433,71 @@ class CommandProcessor {
   void Fh1ListsSwap();
   void Fh1ListsShutdown();
 
+  // FH1 (0670): the pass ledger (fh1_pass_ledger.cpp, src/graphics/fh1_pass_ledger.h). Null
+  // until the game's first pass mark arrives with fh1_pass_cost_csv set, so without the game's
+  // marks or the setting every hook below is a null test and a branch never taken. Two copies of
+  // the pointer: the decoder's, set when it reads the first mark, and the recorder's, set in
+  // stream order from a recorded call (on one thread, the same moment).
+  Fh1PassLedger* fh1_ledger_dec_ = nullptr;
+  Fh1PassLedger* fh1_ledger_rec_ = nullptr;
+  // A mark (kOpPassClass, kOpPassEnd), on the decoder when it reads it.
+  void Fh1PassPacket(const uint32_t* words, uint32_t count);
+  // The decoder ran a draw packet (executed) or a predicate skipped it.
+  REX_FH1_LIST_COLD void Fh1LedgerDecodedDraw(bool executed);
+  // The swap, on the decoder: its frame goes to the recorder.
+  REX_FH1_LIST_COLD void Fh1LedgerDecoderSwap();
+  // IssueDraw, timed and counted (the recorder, or the command processor unsplit).
+  REX_FH1_LIST_COLD bool Fh1LedgerIssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                            IndexBufferInfo* index_buffer_info,
+                                            bool major_mode_explicit);
+  // Around a batch on the recorder; around ExecutePrimaryBuffer on the decoder; a WAIT_REG_MEM
+  // that waited (since `start`).
+  REX_FH1_LIST_COLD void Fh1LedgerBatch(bool begin);
+  REX_FH1_LIST_COLD void Fh1LedgerDecoderBusy(bool begin);
+  REX_FH1_LIST_COLD void Fh1LedgerDecoderWaited(std::chrono::steady_clock::time_point start);
+  // The swap's own work (after its call): folded into a label of its own.
+  REX_FH1_LIST_COLD void Fh1LedgerAfterSwap();
+  // A wait of the decoder for the recorder (RecordSync, the queue full) while the ledger is on:
+  // its time is not the draw class's. Off, a null test at each end.
+  struct Fh1LedgerWait {
+    explicit Fh1LedgerWait(CommandProcessor* cp)
+        : cp_(cp->fh1_ledger_dec_ ? cp : nullptr),
+          start_(cp_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {
+    }
+    ~Fh1LedgerWait() {
+      if (cp_) [[unlikely]]
+        cp_->Fh1LedgerDecoderWaited(start_);
+    }
+    Fh1LedgerWait(const Fh1LedgerWait&) = delete;
+    Fh1LedgerWait& operator=(const Fh1LedgerWait&) = delete;
+
+   private:
+    CommandProcessor* cp_;
+    std::chrono::steady_clock::time_point start_;
+  };
+  void Fh1LedgerRecorderMark(uint32_t op, uint32_t value);
+  void Fh1LedgerShutdown();
+  // The backend's part (the Vulkan one has it): after an IssueDraw, an identity of what each
+  // recorder stage chose (fh1_pass_ledger::Stage; false: not known), and a count that grows with
+  // the commands recorded (a draw that recorded nothing leaves it as it was).
+  virtual bool Fh1PassLedgerStages(uint64_t* stages) {
+    (void)stages;
+    return false;
+  }
+  virtual uint64_t Fh1PassLedgerWork() { return 0; }
+  // The class and segment of the commands recorded from now on, for GPU timestamps (a tag:
+  // the segment's serial << 5 | its class slot), and the ledger's names for them.
+  virtual void Fh1PassLedgerTag(uint32_t tag) { (void)tag; }
+  virtual void Fh1PassLedgerStarted() {}
+
+ public:
+  // FH1 (0670): a tag's label and class slot (label << 8 | slot), ~0 while not known yet; and a
+  // key's name ("p4 #0|track|0"). For the GPU profile's report (any thread that reads results
+  // after the segment ended on the recorder).
+  uint64_t Fh1PassLedgerTagKey(uint32_t tag) const;
+  static std::string Fh1PassLedgerKeyName(uint64_t key);
+
+ protected:
   // (type-0 packet, SET_CONSTANT of registers, SET_CONSTANT2) made only of such registers from
   // the ring itself, without the two virtual calls and the backend's sorting of the range (most
   // of the render state writes, about 9 ranges a draw). Null: every write takes the backend.

@@ -238,7 +238,8 @@ void CommandProcessor::Shutdown() {
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
   Fh1NativeShadowShutdown();
-  Fh1ListsShutdown();  // FH1 (0650)
+  Fh1ListsShutdown();   // FH1 (0650)
+  Fh1LedgerShutdown();  // FH1 (0670)
 }
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
@@ -370,7 +371,11 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
+    if (fh1_ledger_dec_) [[unlikely]]
+      Fh1LedgerDecoderBusy(true);  // FH1 (0670): the decoder's time between the game's commands
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    if (fh1_ledger_dec_) [[unlikely]]
+      Fh1LedgerDecoderBusy(false);
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -480,7 +485,11 @@ void CommandProcessor::RecordThreadMain() {
       record_queue_.pop_front();
     }
     ++taken;
+    if (fh1_ledger_rec_) [[unlikely]]
+      Fh1LedgerBatch(true);  // FH1 (0670)
     ExecuteRecordBatch(*batch);
+    if (fh1_ledger_rec_) [[unlikely]]
+      Fh1LedgerBatch(false);
     batch->words.clear();
     batch->fns.clear();
     batch->actions = 0;
@@ -876,6 +885,7 @@ void CommandProcessor::PublishRecordBatch() {
     // Far ahead of the recorder: let it catch up halfway first (the queue's memory).
     ++record_syncs_[kSyncQueueFull];
     const uint64_t target = record_published_ - kRecordMaxQueued / 2;
+    const Fh1LedgerWait fh1_wait(this);  // FH1 (0670): not the class's time
     std::unique_lock<std::mutex> lock(record_mutex_);
     record_decoder_waiting_ = true;
     record_wake_at_ = target;
@@ -911,6 +921,7 @@ void CommandProcessor::RecordSync(RecordSyncReason reason) {
   ++record_syncs_[reason];
   PublishRecordBatch();
   const uint64_t target = record_published_;
+  const Fh1LedgerWait fh1_wait(this);  // FH1 (0670): not the class's time
   for (uint32_t i = 0;
        i < kRecordSpin && record_completed_.load(std::memory_order_acquire) < target; ++i) {
     SpinPause();
@@ -1788,6 +1799,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       // FH1 (0650): a list draw its predicate skips.
       if (fh1_list_reader_ == reader && opcode == PM4_DRAW_INDX)
         Fh1ListDraw(uint32_t(data_start_offset), false);
+      // FH1 (0670): a draw of another tile.
+      if (fh1_ledger_dec_ && (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2)) [[unlikely]]
+        Fh1LedgerDecodedDraw(false);
 #if REX_FH1_LIST_TRACE
       if (fh1_list_trace::g_on && opcode == PM4_INDIRECT_BUFFER) {  // patch 0640
         memory::RingBuffer peek = *reader;
@@ -2150,6 +2164,20 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
   if (count >= 2 && count <= fh1_host::kMaxWords) {
     memory::RingBuffer peek = *reader;
     if (peek.ReadAndSwap<uint32_t>() == fh1_host::kMagic) {
+      // FH1 (0670): the pass ledger's marks, on the decoder (and from there on the recorder).
+      if (count <= 16) {
+        memory::RingBuffer op_peek = peek;
+        const uint32_t op = op_peek.ReadAndSwap<uint32_t>();
+        if (op == fh1_host::kOpPassClass || op == fh1_host::kOpPassEnd) {
+          uint32_t mark[16];
+          mark[0] = fh1_host::kMagic;
+          for (uint32_t i = 1; i < count; ++i)
+            mark[i] = peek.ReadAndSwap<uint32_t>();
+          reader->AdvanceRead(count * sizeof(uint32_t));
+          Fh1PassPacket(mark, count);
+          return true;
+        }
+      }
       std::vector<uint32_t> words(count);
       words[0] = fh1_host::kMagic;
       for (uint32_t i = 1; i < count; ++i) words[i] = peek.ReadAndSwap<uint32_t>();
@@ -2236,6 +2264,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   }
   if (fh1_lists_)
     Fh1ListsSwap();  // FH1 (0650): the model lists' summary every 600 frames
+  if (fh1_ledger_dec_) [[unlikely]]
+    Fh1LedgerDecoderSwap();  // FH1 (0670): the frame's pass ledger, before the swap
 
   if (record_split_) {
     // #474: the swap on the recorder, after the frame's draws, with its tag; the time the
@@ -2248,6 +2278,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
       rexui_SetNextGuestOutputTag(0);
     });
+    if (fh1_ledger_dec_) [[unlikely]]
+      Fh1LedgerAfterSwap();  // FH1 (0670): the swap's own work, a label of its own
     PublishRecordBatch();
     LogRecordSplit();
 #if REX_FH1_PM4_TRACE
@@ -2262,6 +2294,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   rexui_SetNextGuestOutputTag(frame_tag);
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   rexui_SetNextGuestOutputTag(0);
+  if (fh1_ledger_dec_) [[unlikely]]
+    Fh1LedgerAfterSwap();     // FH1 (0670)
   fh1_frame_trace::OnSwap();  // patch 0396
 #if REX_FH1_PM4_TRACE
   fh1_pm4_trace::OnSwap();  // patch 0570
@@ -2414,6 +2448,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       decode_register_file_->values[poll_reg_addr] = register_file_->values[poll_reg_addr];
     }
   }
+  if (fh1_ledger_dec_ && wait_start != std::chrono::steady_clock::time_point{}) [[unlikely]]
+    Fh1LedgerDecoderWaited(wait_start);  // FH1 (0670): not the class's time
   if (wait_start != std::chrono::steady_clock::time_point{}) {
     if (record_split_) {
       record_guest_wait_ns_.fetch_add(
@@ -2775,6 +2811,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
+    if (fh1_ledger_dec_) [[unlikely]]
+      Fh1LedgerDecodedDraw(true);  // FH1 (0670)
     DrawRecord draw;
     draw.initiator = vgt_draw_initiator.value;
     draw.flags = (is_indexed ? kDrawIndexed : 0) |
@@ -2864,8 +2902,15 @@ bool CommandProcessor::ExecuteDraw(const DrawRecord& draw) {
     }
     bool major_mode_explicit =
         xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-    draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-                               is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+    if (fh1_ledger_rec_) [[unlikely]] {
+      // FH1 (0670): timed for the pass ledger.
+      draw_succeeded =
+          Fh1LedgerIssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                             is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+    } else {
+      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                                 is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+    }
     if (!draw_succeeded) {
       auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
       auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();

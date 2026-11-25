@@ -138,6 +138,10 @@ class DeferredCommandBuffer {
   uint16_t fh1_gpu_zone() const { return fh1_gpu_zone_; }
   Fh1GpuProfile* fh1_gpu_profile() const { return fh1_gpu_profile_; }
   bool fh1_gpu_profiling() const { return fh1_gpu_profile_ != nullptr; }
+  // FH1 (0670): a timestamp before the next command even in the same zone (the pass ledger's
+  // tag changed), and the words recorded so far (both streams).
+  void Fh1ForceGpuZoneMark() { fh1_write_hooks_.zone_pending = fh1_gpu_profile_ != nullptr; }
+  size_t Fh1RecordedWords() const { return command_stream_.size() + hoisted_stream_.size(); }
   // FH1 (#640): the stencil bit masks of render target transfers (render_target_cache.cpp).
   void CmdFh1FillBuffer(PFN_vkCmdFillBuffer fill, VkBuffer buffer, VkDeviceSize offset,
                         VkDeviceSize size, uint32_t data) {

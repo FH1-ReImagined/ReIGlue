@@ -20,6 +20,7 @@ set(REXGPU_XENOS_SOURCES
     command_processor.cpp
     fh1_native_shadow.cpp
     fh1_native_list.cpp
+    fh1_pass_ledger.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     packet_disassembler.cpp

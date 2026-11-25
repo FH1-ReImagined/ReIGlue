@@ -56,6 +56,7 @@ bool Fh1GpuProfile::Initialize(const ui::vulkan::VulkanDevice* device, double pe
       return false;
     }
     slot.zones.resize(kQueriesPerSlot);
+    slot.tags.resize(kQueriesPerSlot);
   }
   results_.resize(kQueriesPerSlot);
   sums_.resize(kFirstDrawZone);
@@ -128,12 +129,31 @@ void Fh1GpuProfile::Mark(DeferredCommandBuffer& commands, uint16_t zone) {
     return;
   }
   slot->zones[slot->count] = zone;
+  slot->tags[slot->count] = tag_;
   commands.CmdFh1Timestamp(write_timestamp_, slot->pool, slot->count);
   ++slot->count;
 }
 
+void Fh1GpuProfile::AddTagged(uint32_t tag, uint16_t kind, double ms) {
+  const uint64_t key = key_of_tag_(tag);
+  if (key == ~uint64_t(0)) {
+    pending_tags_.push_back({tag, kind, ms});
+    return;
+  }
+  ZoneSum& sum = tag_sums_[kind][key];
+  sum.ms += ms;
+  ++sum.intervals;
+}
+
 void Fh1GpuProfile::Completed(uint64_t completed) {
   if (!pools_ready_) return;
+  if (!pending_tags_.empty() && key_of_tag_) {
+    // The segments of the previous reading's open intervals may have ended since.
+    std::vector<PendingTag> pending;
+    pending.swap(pending_tags_);
+    for (const PendingTag& p : pending)
+      AddTagged(p.tag, p.kind, p.ms);
+  }
   const VkDevice device = device_->device();
   while (true) {
     // In submission order, so that frames are counted once.
@@ -166,6 +186,8 @@ void Fh1GpuProfile::Completed(uint64_t completed) {
       sums_[zone].ms += ms;
       ++sums_[zone].intervals;
       busy_ms_ += ms;
+      if (key_of_tag_)
+        AddTagged(slot.tags[i - 1], std::min<uint16_t>(zone, kFirstDrawZone), ms);
     }
   }
   const auto now = std::chrono::steady_clock::now();
@@ -222,9 +244,33 @@ void Fh1GpuProfile::Report() {
                      busy_ms_ / frames, name.c_str(), sums_[z].ms / frames,
                      double(sums_[z].intervals) / frames);
       }
+      // FH1 (0670): by pass ledger key and kind of work; what is still not named, unlabelled.
+      for (const PendingTag& p : pending_tags_) {
+        ZoneSum& sum = tag_sums_[p.kind][uint64_t(0xFF000000u) << 8 | (p.tag & 31)];
+        sum.ms += p.ms;
+        ++sum.intervals;
+      }
+      pending_tags_.clear();
+      if (name_of_key_) {
+        for (uint16_t kind = 0; kind <= kFirstDrawZone; ++kind) {
+          const char* kind_name = kind < kFixedCount ? kFixedNames[kind] : "draws";
+          if (kind >= kFixedCount && kind < kFirstDrawZone)
+            continue;
+          for (const auto& [key, sum] : tag_sums_[kind]) {
+            std::string name = "pass|" + name_of_key_(key) + "|" + kind_name;
+            std::replace(name.begin(), name.end(), ',', ' ');
+            std::fprintf(file_, "%u,%.1f,%" PRIu64 ",%.3f,%s,%.4f,%.2f\n", window_, t, frames_,
+                         busy_ms_ / frames, name.c_str(), sum.ms / frames,
+                         double(sum.intervals) / frames);
+          }
+        }
+      }
       std::fflush(file_);
     }
   }
+  for (auto& sums : tag_sums_)
+    sums.clear();
+  pending_tags_.clear();
   ++window_;
   for (ZoneSum& sum : sums_) sum = ZoneSum();
   busy_ms_ = 0.0;
