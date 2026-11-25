@@ -25,6 +25,15 @@
 // draw's: the change-mask counter. Nothing is skipped; the comparisons cost time, so a run that
 // times passes keeps them off.
 //
+// The deletion switch (patch 0680, test only, FH1 docs/rendering.md "Pass deletion"):
+// FORZA_TEST_SKIP_PASS=<kinds>[,copies] makes the recorder return at the top of IssueDraw for the
+// draws of those passes (SkipSpec names them by label; the game's class marks carry each draw's
+// pass id so far, since a segment's label is only known at its end); without `copies` a skipped
+// draw still binds its render targets (the EDRAM ownership transfers into and out of the pass's
+// surfaces stay) and the pass's resolves run; with `copies` neither. SkipTracker counts the draws
+// whose pass id was not their segment's final label. Read when the ledger starts; unset, nothing
+// of it exists.
+//
 // This header is the part without the runtime (fh1_pass_ledger.cpp has the command processor's):
 // cells and rows, label names, the time accrual at marks and the CSV lines, for
 // tests/fh1_pass_ledger_test.cpp.
@@ -103,6 +112,9 @@ struct Cell {
   uint64_t rec_copies = 0;    // IssueDraw calls that resolve (EDRAM copy mode)
   uint64_t rec_copy_ns = 0;
   uint64_t rec_empty = 0;  // draws that recorded nothing (nothing to draw, pipeline not ready)
+  // The deletion switch (0680): draws and resolves it skipped, and the time of what a skipped
+  // draw still does without `copies` (its render targets bound).
+  uint64_t rec_skipped = 0, rec_skipped_copies = 0, rec_skip_ns = 0;
   // The change-mask counter.
   uint64_t delta_draws = 0;
   uint64_t unchanged[rg::kGroupCount] = {};
@@ -123,6 +135,9 @@ struct Cell {
     rec_copies += o.rec_copies;
     rec_copy_ns += o.rec_copy_ns;
     rec_empty += o.rec_empty;
+    rec_skipped += o.rec_skipped;
+    rec_skipped_copies += o.rec_skipped_copies;
+    rec_skip_ns += o.rec_skip_ns;
     delta_draws += o.delta_draws;
     for (uint32_t g = 0; g < rg::kGroupCount; ++g)
       unchanged[g] += o.unchanged[g];
@@ -133,7 +148,8 @@ struct Cell {
   bool Empty() const {
     return !rdr_flush_ns && !rdr_flush_calls && !submitted && !runs && !dec_ns && !dec_draws &&
            !dec_skipped && !rec_ns && !rec_draws && !rec_issue_ns && !rec_copies && !rec_copy_ns &&
-           !rec_empty && !delta_draws && !stage_draws;
+           !rec_empty && !rec_skipped && !rec_skipped_copies && !rec_skip_ns && !delta_draws &&
+           !stage_draws;
   }
 };
 
@@ -196,6 +212,9 @@ struct Totals {
   uint64_t dec_idle_ns = 0;    // the decoder's CPU outside the ring (waiting for the game)
   uint64_t marks = 0;          // marks read on the decoder
   uint64_t stale_marks = 0;  // marks seen again (a tiled segment's replay): game numbers kept once
+  // The deletion switch (0680): draws (and resolves, with `copies`) skipped although their
+  // segment's final label is not one it names, and kept although it is.
+  uint64_t skip_wrong_skipped = 0, skip_wrong_kept = 0;
   void Add(const Totals& o) {
     frames += o.frames;
     frame_draws += o.frame_draws;
@@ -205,6 +224,8 @@ struct Totals {
     dec_idle_ns += o.dec_idle_ns;
     marks += o.marks;
     stale_marks += o.stale_marks;
+    skip_wrong_skipped += o.skip_wrong_skipped;
+    skip_wrong_kept += o.skip_wrong_kept;
   }
 };
 
@@ -327,6 +348,7 @@ inline std::string CsvHeader() {
     h += ",stage_same_";
     h += StageName(s);
   }
+  h += ",rec_skipped,rec_skipped_copies,rec_skip_ms,skip_wrong_skipped,skip_wrong_kept";
   return h + "\n";
 }
 
@@ -378,6 +400,10 @@ inline std::string CsvLines(uint64_t window, double epoch, bool split, const Row
       n = std::snprintf(text, sizeof(text), ",%" PRIu64, c.stage_same[s]);
       out.append(text, size_t(n > 0 ? n : 0));
     }
+    n = std::snprintf(text, sizeof(text), ",%" PRIu64 ",%" PRIu64 ",%.4f,%" PRIu64 ",%" PRIu64,
+                      c.rec_skipped, c.rec_skipped_copies, ms(c.rec_skip_ns),
+                      frame ? totals.skip_wrong_skipped : 0, frame ? totals.skip_wrong_kept : 0);
+    out.append(text, size_t(n > 0 ? n : 0));
     out.push_back('\n');
   };
   const Cell none;
@@ -464,5 +490,184 @@ inline void CompareGroups(const uint32_t* now, uint32_t* then, uint64_t* unchang
   for (uint32_t i = rg::kConstantsFirst; i < rg::kConstantsEnd; ++i)
     then[i] = now[i];
 }
+
+// FORZA_TEST_SKIP_PASS (0680): which segment labels the deletion switch skips. Parts separated
+// by commas: a pass kind by name (the pass numbers of the FH1 track, docs/rendering.md "Pass
+// ledger"), a label pattern, or `copies`:
+//   shadow   p6 (the sun's shadow maps, with the frame's start before them)
+//   prepass  p0 (the depth pre-pass)        cube  p1 (the reflection cube's six faces)
+//   scene    p4+0-3 (the 3D scene: its tiles and the tiles' resolves)
+//   tiles    p4+0-3 while its commands are read again (the second and later EDRAM tiles)
+//   post     p4+4-255 (everything after the scene's tiles: post-processing, bloom, the HUD)
+//   mask     every segment of the sun's shadow mask and those after it until the next pass
+//   cars     every cars-only segment (c<pass>)
+//   start    the frame's segments before its first named one
+//   none     nothing (the baseline: the game marks its pass ids as in the other runs)
+//   pN, cN   presentation (cars-only) pass N, its named segments; pN+A, pN+A-B the segments
+//            A to B after them (0 is the named segment itself)
+class SkipSpec {
+ public:
+  // False (and `bad` the first part it does not know) if a part is not one of the above.
+  bool Parse(const std::string& text, std::string* bad) {
+    rules_.clear();
+    copies_ = none_ = false;
+    size_t at = 0;
+    while (at <= text.size()) {
+      size_t end = text.find(',', at);
+      if (end == std::string::npos)
+        end = text.size();
+      std::string part = text.substr(at, end - at);
+      while (!part.empty() && part.front() == ' ')
+        part.erase(part.begin());
+      while (!part.empty() && part.back() == ' ')
+        part.pop_back();
+      if (!part.empty() && !AddPart(part)) {
+        if (bad)
+          *bad = part;
+        rules_.clear();
+        copies_ = none_ = false;
+        return false;
+      }
+      at = end + 1;
+    }
+    return true;
+  }
+  // A segment label, `repeat`: its commands are being read again (a tile after the first).
+  bool Matches(uint32_t label, bool repeat) const {
+    const uint32_t kind = label >> 24, pass = (label >> 16) & 0xFF, after = label & 0xFF;
+    for (const Rule& r : rules_) {
+      if (r.kind == kind && (r.pass < 0 || uint32_t(r.pass) == pass) && after >= r.after_min &&
+          after <= r.after_max && (!r.repeats_only || repeat))
+        return true;
+    }
+    return false;
+  }
+  bool copies() const { return copies_; }
+  bool empty() const { return rules_.empty(); }
+  bool none() const { return none_; }
+
+ private:
+  struct Rule {
+    uint32_t kind = 0;
+    int32_t pass = -1;  // any
+    uint32_t after_min = 0, after_max = 0;
+    bool repeats_only = false;
+  };
+  bool AddPart(const std::string& part) {
+    const auto add = [&](uint32_t kind, int32_t pass, uint32_t lo, uint32_t hi, bool repeats) {
+      rules_.push_back(Rule{kind, pass, lo, hi, repeats});
+      return true;
+    };
+    if (part == "none") {  // nothing skipped: the baseline run, with the pass ids marked
+      none_ = true;
+      return true;
+    }
+    if (part == "copies") {
+      copies_ = true;
+      return true;
+    }
+    if (part == "shadow")
+      return add(fh::kPassKindPresentation, 6, 0, 0, false);
+    if (part == "prepass")
+      return add(fh::kPassKindPresentation, 0, 0, 0, false);
+    if (part == "cube")
+      return add(fh::kPassKindPresentation, 1, 0, 0, false);
+    if (part == "scene")
+      return add(fh::kPassKindPresentation, 4, 0, 3, false);
+    if (part == "tiles")
+      return add(fh::kPassKindPresentation, 4, 0, 3, true);
+    if (part == "post")
+      return add(fh::kPassKindPresentation, 4, 4, 255, false);
+    if (part == "mask")
+      return add(fh::kPassKindShadowMask, -1, 0, 255, false);
+    if (part == "cars")
+      return add(fh::kPassKindCars, -1, 0, 0, false);
+    if (part == "start")
+      return add(fh::kPassKindStart, -1, 0, 255, false);
+    if (part.size() < 2 || (part[0] != 'p' && part[0] != 'c'))
+      return false;
+    size_t i = 1;
+    uint32_t pass = 0, lo = 0, hi = 0;
+    if (!Number(part, i, &pass) || pass > 255)
+      return false;
+    if (i < part.size()) {
+      if (part[i++] != '+' || !Number(part, i, &lo) || lo > 255)
+        return false;
+      hi = lo;
+      if (i < part.size() && (part[i++] != '-' || !Number(part, i, &hi) || hi > 255 || hi < lo))
+        return false;
+      if (i != part.size())
+        return false;
+    }
+    return add(part[0] == 'p' ? fh::kPassKindPresentation : fh::kPassKindCars, int32_t(pass), lo,
+               hi, false);
+  }
+  static bool Number(const std::string& s, size_t& i, uint32_t* out) {
+    const size_t start = i;
+    uint32_t v = 0;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9' && i - start < 4)
+      v = v * 10 + uint32_t(s[i++] - '0');
+    *out = v;
+    return i > start;
+  }
+  std::vector<Rule> rules_;
+  bool copies_ = false, none_ = false;
+};
+
+// The recorder's decisions for FORZA_TEST_SKIP_PASS, in stream order: a class mark gives the
+// pass id the game knows so far (0: none, the game's marks carry none), a segment end its final
+// label. A draw is skipped if its pass id is one the spec names; a resolve too with `copies`. At
+// the segment's end the draws (and with `copies` the resolves) whose decision the final label
+// contradicts are counted (the game's prediction of a label missed: the frame's structure
+// changed). Until the next class mark after a segment end nothing is skipped.
+class SkipTracker {
+ public:
+  explicit SkipTracker(const SkipSpec& spec) : spec_(spec) {}
+  void ClassMark(uint32_t pass_id, bool repeat) {
+    current_ = pass_id && spec_.Matches(pass_id, repeat);
+  }
+  // A draw (`copy`: a resolve) to record: true to skip it.
+  bool Draw(bool copy) {
+    if (copy && !spec_.copies())
+      return false;  // not a thing the switch skips: not counted either
+    if (current_) {
+      ++segment_skipped_;
+      ++skipped_[copy];
+    } else {
+      ++segment_kept_;
+    }
+    return current_;
+  }
+  // `keep`: the command processor's own segment ends (the tail before the swap, the swap's
+  // work), which the game does not mark: the pass id the game sent last stays.
+  void SegmentEnd(uint32_t label, bool repeat, bool keep = false) {
+    if (spec_.Matches(label, repeat)) {
+      wrong_kept_ += segment_kept_;
+    } else {
+      wrong_skipped_ += segment_skipped_;
+    }
+    segment_skipped_ = segment_kept_ = 0;
+    if (!keep)
+      current_ = false;
+  }
+  const SkipSpec& spec() const { return spec_; }
+  // Since the previous call: the wrong decisions (into a window's totals).
+  void TakeWrong(uint64_t* wrong_skipped, uint64_t* wrong_kept) {
+    *wrong_skipped += wrong_skipped_;
+    *wrong_kept += wrong_kept_;
+    all_wrong_ += wrong_skipped_ + wrong_kept_;
+    wrong_skipped_ = wrong_kept_ = 0;
+  }
+  uint64_t skipped_draws() const { return skipped_[0]; }
+  uint64_t skipped_copies() const { return skipped_[1]; }
+  uint64_t all_wrong() const { return all_wrong_; }
+
+ private:
+  SkipSpec spec_;
+  bool current_ = false;
+  uint64_t segment_skipped_ = 0, segment_kept_ = 0;
+  uint64_t wrong_skipped_ = 0, wrong_kept_ = 0, all_wrong_ = 0;
+  uint64_t skipped_[2] = {};
+};
 
 }  // namespace rex::graphics::fh1_pass_ledger

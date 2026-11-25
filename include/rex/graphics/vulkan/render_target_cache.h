@@ -178,6 +178,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool Resolve(const memory::Memory& memory, VulkanSharedMemory& shared_memory,
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out);
+  // FH1 (0680, the pass ledger's FORZA_TEST_SKIP_PASS with `copies`): a resolve of a deleted
+  // pass without its copy: its clear still runs (with the ownership it gives), and the
+  // destination range is marked resolved, so the textures read from it load again as after a
+  // copy (with the old contents). Host render targets only.
+  bool Fh1ResolveWithoutCopy(const memory::Memory& memory, VulkanTextureCache& texture_cache);
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;

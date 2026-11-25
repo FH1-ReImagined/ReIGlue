@@ -74,6 +74,9 @@ enum Op : uint32_t {
   // with the layer << 4 for the model lists), [4] the class that ends, then the game's numbers
   // for that class's flush calls since the previous mark (render thread): [5] ns in the D3D
   // flush points, [6] their calls, [7] the draws submitted, [8] the command lists run.
+  // 0680: with the game's FORZA_TEST_SKIP_PASS (the deletion switch) a tenth word, [9] the pass
+  // id so far (the label the game expects the segment to end with), and a class mark whenever it
+  // changes.
   kOpPassClass = 0x30,
   // A segment of the frame ends (after a resolve, and before the swap): [2] sequence, [3] its
   // label (PassLabel), [4] the render thread's CPU time since the previous segment end (ns, 0
@@ -82,6 +85,7 @@ enum Op : uint32_t {
   kOpPassEnd = 0x31,
 };
 constexpr uint32_t kPassClassWords = 9, kPassEndWords = 11;
+constexpr uint32_t kPassClassWordsWithPass = 10;  // 0680
 // The draw classes of the pass ledger: who made the draws (FH1's D3D flush points).
 enum PassClass : uint32_t {
   kPassClassD3D = 0,         // DrawVertices, DrawIndexedVertices

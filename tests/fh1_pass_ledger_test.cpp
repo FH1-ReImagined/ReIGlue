@@ -238,6 +238,144 @@ void Csv() {
   CHECK(lines.find("0000A500") != std::string::npos);
 }
 
+// The deletion switch (0680): the kinds FORZA_TEST_SKIP_PASS names, and the recorder's decisions
+// on a frame with the FH1 track's labels.
+void Skip() {
+  const auto P = [](uint32_t pass, uint32_t occurrence, uint32_t after) {
+    return fh::PassLabel(fh::kPassKindPresentation, pass, occurrence, after);
+  };
+  const uint32_t mask0 = fh::PassLabel(fh::kPassKindShadowMask, 0, 0, 0);
+  const uint32_t mask_after = fh::PassLabel(fh::kPassKindShadowMask, 0, 1, 2);
+  const uint32_t cars = fh::PassLabel(fh::kPassKindCars, 3, 1, 0);
+  const uint32_t start = fh::PassLabel(fh::kPassKindStart, 0, 0, 1);
+  std::string bad;
+  pl::SkipSpec spec;
+  CHECK(spec.Parse("shadow", &bad) && !spec.copies() && !spec.empty());
+  CHECK(spec.Matches(P(6, 0, 0), false) && spec.Matches(P(6, 3, 0), true));
+  CHECK(!spec.Matches(P(6, 0, 1), false) && !spec.Matches(P(0, 0, 0), false));
+  CHECK(spec.Parse(" prepass , cube,copies", &bad) && spec.copies());
+  CHECK(spec.Matches(P(0, 0, 0), false) && spec.Matches(P(1, 5, 0), false));
+  CHECK(!spec.Matches(P(4, 0, 0), false) && !spec.Matches(P(6, 0, 0), false));
+  CHECK(spec.Parse("scene", &bad));
+  for (uint32_t after = 0; after <= 3; ++after)
+    CHECK(spec.Matches(P(4, 0, after), false) && spec.Matches(P(4, 0, after), true));
+  CHECK(!spec.Matches(P(4, 0, 4), false));
+  CHECK(spec.Parse("tiles", &bad));
+  CHECK(!spec.Matches(P(4, 0, 0), false) && spec.Matches(P(4, 0, 0), true) &&
+        spec.Matches(P(4, 0, 3), true) && !spec.Matches(P(4, 0, 4), true));
+  CHECK(spec.Parse("post", &bad));
+  CHECK(spec.Matches(P(4, 0, 4), false) && spec.Matches(P(4, 0, 30), false) &&
+        !spec.Matches(P(4, 0, 3), false));
+  CHECK(spec.Parse("mask,cars,start", &bad));
+  CHECK(spec.Matches(mask0, false) && spec.Matches(mask_after, false) && spec.Matches(cars, false) &&
+        spec.Matches(start, false) && !spec.Matches(P(4, 0, 0), false));
+  CHECK(spec.Parse("p4+5-6,c2,p7+1", &bad));
+  CHECK(spec.Matches(P(4, 0, 5), false) && spec.Matches(P(4, 1, 6), false) &&
+        !spec.Matches(P(4, 0, 7), false) && !spec.Matches(P(4, 0, 0), false));
+  CHECK(spec.Matches(fh::PassLabel(fh::kPassKindCars, 2, 0, 0), false) &&
+        !spec.Matches(fh::PassLabel(fh::kPassKindCars, 3, 0, 0), false));
+  CHECK(spec.Matches(P(7, 0, 1), false) && !spec.Matches(P(7, 0, 0), false));
+  // Labels only the command processor makes (the tail, the swap) are never a kind.
+  CHECK(!spec.Matches(fh::PassLabel(fh::kPassKindTail, 0, 0, 0), false));
+  for (const char* wrong : {"shadows", "p", "p4+", "p4+3-1", "p4-3", "p256", "q1", "p4+1-2x"}) {
+    bad.clear();
+    CHECK(!spec.Parse(std::string("cube,") + wrong, &bad) && bad == wrong && spec.empty());
+  }
+  CHECK(spec.Parse("copies", &bad) && spec.empty());  // nothing to skip: the ledger refuses it
+  CHECK(spec.Parse("none", &bad) && spec.empty() && spec.none());  // the baseline
+  CHECK(!spec.Matches(P(6, 0, 0), false));
+  CHECK(spec.Parse("shadow", &bad) && !spec.none());
+
+  // The recorder: a frame of the shadow maps (with the frame's start), the pre-pass, the scene in
+  // three tiles (the second and third read again) and its resolves, then post-processing.
+  struct Segment {
+    uint32_t pass_id, label;  // the game's pass id at the class mark, the label at the end
+    bool repeat;
+    uint32_t draws, resolves;
+  };
+  const std::vector<Segment> frame = {
+      {P(6, 0, 0), P(6, 0, 0), false, 156, 1}, {P(0, 0, 0), P(0, 0, 0), false, 554, 1},
+      {P(4, 0, 0), P(4, 0, 0), false, 900, 0}, {P(4, 0, 1), P(4, 0, 1), false, 0, 1},
+      {P(4, 0, 0), P(4, 0, 0), true, 800, 0},  {P(4, 0, 1), P(4, 0, 1), true, 0, 1},
+      {P(4, 0, 0), P(4, 0, 0), true, 700, 0},  {P(4, 0, 1), P(4, 0, 1), true, 0, 1},
+      {P(4, 0, 4), P(4, 0, 4), false, 40, 1},
+  };
+  const auto run = [&](const char* text, const std::vector<Segment>& segments, uint64_t* draws,
+                       uint64_t* resolves, uint64_t* wrong) {
+    pl::SkipSpec s;
+    CHECK(s.Parse(text, nullptr));
+    pl::SkipTracker t(s);
+    *draws = *resolves = 0;
+    for (const Segment& g : segments) {
+      t.ClassMark(g.pass_id, g.repeat);
+      for (uint32_t i = 0; i < g.draws; ++i)
+        *draws += t.Draw(false);
+      for (uint32_t i = 0; i < g.resolves; ++i)
+        *resolves += t.Draw(true);
+      t.SegmentEnd(g.label, g.repeat);
+    }
+    uint64_t ws = 0, wk = 0;
+    t.TakeWrong(&ws, &wk);
+    *wrong = ws + wk;
+    CHECK(t.skipped_draws() == *draws && t.skipped_copies() == *resolves);
+  };
+  uint64_t d, r, w;
+  run("shadow", frame, &d, &r, &w);
+  CHECK(d == 156 && r == 0 && w == 0);  // resolves stay without `copies`
+  run("shadow,copies", frame, &d, &r, &w);
+  CHECK(d == 156 && r == 1 && w == 0);
+  run("tiles,copies", frame, &d, &r, &w);
+  CHECK(d == 1500 && r == 2 && w == 0);
+  run("scene", frame, &d, &r, &w);
+  CHECK(d == 2400 && r == 0 && w == 0);
+  run("post,prepass", frame, &d, &r, &w);
+  CHECK(d == 594 && r == 0 && w == 0);
+  // A prediction that missed: the game said pre-pass, the segment ended as a second shadow map
+  // (its draws were skipped wrongly), and a segment predicted as nothing ended as the pre-pass
+  // (its draws kept wrongly).
+  std::vector<Segment> changed = frame;
+  changed[1].label = P(6, 1, 0);
+  changed[2].pass_id = 0;
+  changed[2].label = P(0, 0, 0);
+  run("prepass", changed, &d, &r, &w);
+  CHECK(d == 554 && w == 554 + 900);
+  // After a segment end nothing is skipped until the next class mark (and a draw there whose
+  // segment ends as a kind is counted).
+  {
+    pl::SkipSpec s;
+    CHECK(s.Parse("prepass", nullptr));
+    pl::SkipTracker t(s);
+    t.ClassMark(P(0, 0, 0), false);
+    CHECK(t.Draw(false));
+    t.SegmentEnd(P(0, 0, 0), false);
+    CHECK(!t.Draw(false) && !t.Draw(true));  // a resolve: not counted without `copies`
+    t.SegmentEnd(P(0, 0, 0), false);
+    uint64_t ws = 0, wk = 0;
+    t.TakeWrong(&ws, &wk);
+    CHECK(ws == 0 && wk == 1);
+  }
+  // The command processor's own ends (tail, swap) keep the pass id the game sent last.
+  {
+    pl::SkipSpec s;
+    CHECK(s.Parse("shadow", nullptr));
+    pl::SkipTracker t(s);
+    t.ClassMark(P(6, 0, 0), false);  // after the game's swap end: the next frame's first
+    t.SegmentEnd(fh::PassLabel(fh::kPassKindTail, 0, 0, 0), false, true);
+    t.SegmentEnd(fh::PassLabel(fh::kPassKindSwap, 0, 0, 0), false, true);
+    CHECK(t.Draw(false));
+    t.SegmentEnd(P(6, 0, 0), false);
+    uint64_t ws = 0, wk = 0;
+    t.TakeWrong(&ws, &wk);
+    CHECK(ws == 0 && wk == 0);
+  }
+  // The 0670 game sends no pass id: nothing is skipped, every draw of the kind counted wrong.
+  std::vector<Segment> old = frame;
+  for (Segment& g : old)
+    g.pass_id = 0;
+  run("prepass", old, &d, &r, &w);
+  CHECK(d == 0 && w == 554);
+}
+
 }  // namespace
 
 int main() {
@@ -250,6 +388,7 @@ int main() {
   Sequence();
   Labels();
   Csv();
+  Skip();
   std::printf("pass ledger: all checks passed\n");
   return 0;
 }

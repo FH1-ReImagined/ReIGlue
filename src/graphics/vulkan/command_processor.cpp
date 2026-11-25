@@ -8298,6 +8298,65 @@ void VulkanCommandProcessor::Fh1PassLedgerStarted() {
                               [](uint64_t key) { return Fh1PassLedgerKeyName(key); });
 }
 
+// FH1 (0680, FORZA_TEST_SKIP_PASS without `copies`): a skipped draw binds its render targets as
+// IssueDraw does up to render_target_cache_->Update, so the EDRAM ownership transfers into the
+// pass's surfaces (and out of them, at the next pass's binding) and its resolves stay; nothing
+// else of the draw is recorded (no shaders, pipeline, textures, constants or draw). The HUD
+// layer's switch (Fh1SelectNativeHud, with an upscaler or an independent scene size) is not
+// followed: skip `post` only without one.
+bool VulkanCommandProcessor::Fh1PassLedgerSkippedDraw() {
+  if (fh1_other_render_targets_) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXGPU_WARN(
+          "FORZA_TEST_SKIP_PASS: the HUD layer is split (an upscaler or an independent scene "
+          "size); skipped draws do not switch layers, so the HUD's passes after a skipped one "
+          "are measured on the scene's layer");
+    }
+  }
+  const RegisterFile& regs = *register_file_;
+  auto* vertex_shader = static_cast<VulkanShader*>(active_vertex_shader());
+  if (!vertex_shader)
+    return true;
+  pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  const bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
+  const bool is_rasterization_done =
+      draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
+  // As IssueDraw: a draw that rasterizes nothing binds nothing.
+  if (!is_rasterization_done || regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0)
+    return true;
+  VulkanShader* pixel_shader = nullptr;
+  if (regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth) {
+    pixel_shader = static_cast<VulkanShader*>(active_pixel_shader());
+    if (pixel_shader) {
+      pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+      if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs))
+        pixel_shader = nullptr;
+    }
+  }
+  const reg::RB_DEPTHCONTROL normalized_depth_control =
+      draw_util::GetNormalizedDepthControl(regs);
+  const uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                   : 0;
+  if (!BeginSubmission(true))
+    return false;
+  Fh1GpuZoneScope zone(deferred_command_buffer_, Fh1GpuProfile::kTransfer);
+  return render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                      normalized_color_mask, *vertex_shader);
+}
+
+// FH1 (0680, FORZA_TEST_SKIP_PASS with `copies`): a skipped resolve keeps its clear (the next
+// pass's depth test and ownership as with the copy) and marks its destination resolved (the
+// textures read from it load again), without the copy.
+bool VulkanCommandProcessor::Fh1PassLedgerSkippedCopy() {
+  if (!BeginSubmission(true))
+    return false;
+  Fh1GpuZoneScope gpu_zone(deferred_command_buffer_, Fh1GpuProfile::kResolve);
+  return render_target_cache_->Fh1ResolveWithoutCopy(*memory_, *texture_cache_);
+}
+
 bool VulkanCommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");

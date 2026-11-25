@@ -475,7 +475,11 @@ class CommandProcessor {
     CommandProcessor* cp_;
     std::chrono::steady_clock::time_point start_;
   };
-  void Fh1LedgerRecorderMark(uint32_t op, uint32_t value);
+  // A mark on the recorder (Fh1PassPacket packs it: value, end, read again, pass id).
+  void Fh1LedgerRecorderMark(uint64_t mark);
+  // FH1 (0680): FORZA_TEST_SKIP_PASS's work at each frame on the recorder: its wrong decisions
+  // added to the window's two counts, the warning every 10 s.
+  void Fh1LedgerSkipFrame(uint64_t* wrong_skipped, uint64_t* wrong_kept);
   void Fh1LedgerShutdown();
   // The backend's part (the Vulkan one has it): after an IssueDraw, an identity of what each
   // recorder stage chose (fh1_pass_ledger::Stage; false: not known), and a count that grows with
@@ -489,6 +493,12 @@ class CommandProcessor {
   // the segment's serial << 5 | its class slot), and the ledger's names for them.
   virtual void Fh1PassLedgerTag(uint32_t tag) { (void)tag; }
   virtual void Fh1PassLedgerStarted() {}
+  // FH1 (0680, FORZA_TEST_SKIP_PASS without `copies`): a draw the switch skips binds its render
+  // targets as IssueDraw would (the EDRAM ownership transfers stay) and draws nothing.
+  virtual bool Fh1PassLedgerSkippedDraw();
+  // FH1 (0680, with `copies`): a resolve the switch skips: its clear still runs and its
+  // destination is marked resolved, without the copy (the base: nothing).
+  virtual bool Fh1PassLedgerSkippedCopy();
 
  public:
   // FH1 (0670): a tag's label and class slot (label << 8 | slot), ~0 while not known yet; and a

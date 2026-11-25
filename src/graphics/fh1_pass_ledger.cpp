@@ -146,6 +146,9 @@ double MeasureNsPerTick() {
 constexpr uint32_t kLabelRing = 8192;
 const uint32_t kTailLabel = fh::PassLabel(fh::kPassKindTail, 0, 0, 0);
 const uint32_t kSwapLabel = fh::PassLabel(fh::kPassKindSwap, 0, 0, 0);
+// A pass id in the recorder's mark word: a label without its two top bits (the game's kinds are
+// below 0x40).
+constexpr uint32_t kPassIdMask = 0x3FFFFFFFu;
 
 // FNV-1a over 64-bit words (the recorder stages' identities).
 uint64_t Mix(uint64_t h, uint64_t v) {
@@ -206,6 +209,13 @@ struct CommandProcessor::Fh1PassLedger {
   std::vector<LabelEntry> labels = std::vector<LabelEntry>(kLabelRing);
   uint64_t previous_stages[pl::kStageCount] = {};
   bool previous_stages_valid = false;
+
+  // The deletion switch (0680, FORZA_TEST_SKIP_PASS): null unless set. Its text, and when the
+  // recorder last warned (with the counts then).
+  std::unique_ptr<pl::SkipTracker> skip;
+  std::string skip_text;
+  uint64_t skip_warned_ns = 0, skip_warned_draws = 0, skip_warned_copies = 0;
+  uint64_t skip_frames = 0;
 
   // The window (recorder).
   pl::Rows window_rows;
@@ -293,6 +303,29 @@ void CommandProcessor::Fh1PassPacket(const uint32_t* words, uint32_t count) {
     const uint32_t* regs = (record_split_ ? decode_register_file_.get() : register_file_)->values;
     if (ledger->delta)
       ledger->dec_previous.assign(regs, regs + RegisterFile::kRegisterCount);
+    // The deletion switch (0680): test only, read here once.
+    if (const char* skip = std::getenv("FORZA_TEST_SKIP_PASS"); skip && *skip) {
+      pl::SkipSpec spec;
+      std::string bad;
+      if (!spec.Parse(skip, &bad) || (spec.empty() && !spec.none())) {
+        REXGPU_ERROR(
+            "FORZA_TEST_SKIP_PASS={}: {}; nothing is skipped (docs/rendering.md \"Pass "
+            "deletion\")",
+            skip, bad.empty() ? std::string("no pass kind") : "not a pass kind: " + bad);
+      } else {
+        ledger->skip = std::make_unique<pl::SkipTracker>(spec);
+        ledger->skip_text = skip;
+        ledger->skip_warned_ns = SteadyNs();
+        REXGPU_WARN(
+            "FORZA_TEST_SKIP_PASS={}: TEST SWITCH ON, the recorder skips {} (the frame is wrong "
+            "by design; not for play)",
+            skip,
+            spec.empty() ? "nothing (the baseline: pass ids marked, nothing skipped)"
+            : spec.copies() ? "those passes' draws, their render target bindings and resolves' "
+                              "copies"
+                            : "those passes' draws");
+      }
+    }
     ledger->ns_per_tick = MeasureNsPerTick();
     const uint64_t cpu = ThreadCpuNs();
     ledger->dec_clock.Start(Ticks(), fh::kPassClassNone, true);
@@ -317,11 +350,13 @@ void CommandProcessor::Fh1PassPacket(const uint32_t* words, uint32_t count) {
   ++l.dec_frame->totals.marks;
   if (!fresh)
     ++l.dec_frame->totals.stale_marks;
-  uint32_t value;
+  uint32_t value, pass_id = 0;
   if (op == fh::kOpPassClass) {
     if (fresh)
       l.AddGame(words + 4);
     value = words[3];
+    if (count >= fh::kPassClassWordsWithPass)
+      pass_id = words[9] & kPassIdMask;  // 0680: the deletion switch's pass id
     l.dec_clock.Switch(now, pl::SlotOf(value), l.dec_ticks);
   } else {
     l.dec_clock.Mark(now, l.dec_ticks);
@@ -336,20 +371,30 @@ void CommandProcessor::Fh1PassPacket(const uint32_t* words, uint32_t count) {
     }
     l.FoldDecoder(value, ThreadCpuNs());
   }
-  RecordCall([this, op, value]() { Fh1LedgerRecorderMark(op, value); });
+  // One word for the recorder's call (the capture stays two words): [31:0] the value (the class,
+  // or the label that ends), [63] an end mark, [62] the mark read again, [61:32] the pass id.
+  const uint64_t mark = uint64_t(value) | uint64_t(op == fh::kOpPassEnd) << 63 |
+                        uint64_t(!fresh) << 62 | uint64_t(pass_id) << 32;
+  RecordCall([this, mark]() { Fh1LedgerRecorderMark(mark); });
 }
 
-void CommandProcessor::Fh1LedgerRecorderMark(uint32_t op, uint32_t value) {
+void CommandProcessor::Fh1LedgerRecorderMark(uint64_t mark) {
   Fh1PassLedger* ledger = fh1_ledger_rec_;
   if (!ledger)
     return;
   Fh1PassLedger& l = *ledger;
+  const uint32_t value = uint32_t(mark);
+  const bool end = (mark >> 63) & 1, repeat = (mark >> 62) & 1;
   if (l.split)
     l.rec_clock.Mark(Ticks(), l.rec_ticks);
-  if (op == fh::kOpPassClass) {
+  if (!end) {
     l.rec_slot = pl::SlotOf(value);
     l.rec_clock.SetSlot(l.rec_slot);  // accrued up to now above
+    if (l.skip)
+      l.skip->ClassMark(uint32_t(mark >> 32) & kPassIdMask, repeat);
   } else {
+    if (l.skip)
+      l.skip->SegmentEnd(value, repeat);
     l.FoldRecorder(value);
     ++l.serial;
     Fh1PassLedger::LabelEntry& e = l.labels[l.serial % kLabelRing];
@@ -393,10 +438,16 @@ void CommandProcessor::Fh1LedgerDecoderSwap() {
     Fh1PassLedger& r = *ledger;
     if (r.split)
       r.rec_clock.Mark(Ticks(), r.rec_ticks);
+    if (r.skip)
+      r.skip->SegmentEnd(kTailLabel, false, true);
     r.FoldRecorder(kTailLabel);
     if (!r.first_frame_done) {
       // The ledger started in this frame (the game turns its marks on mid-frame): dropped.
       r.first_frame_done = true;
+      if (r.skip) {
+        uint64_t dropped[2] = {};
+        r.skip->TakeWrong(&dropped[0], &dropped[1]);  // the dropped frame's (a partial one)
+      }
       r.rec_frame.Clear();
       r.rec_idle_ns = 0;
       r.rec_frame_cpu = ThreadCpuNs();
@@ -404,6 +455,8 @@ void CommandProcessor::Fh1LedgerDecoderSwap() {
     }
     pl::Totals totals = decoded->totals;
     totals.frames = 1;
+    if (r.skip)
+      Fh1LedgerSkipFrame(&totals.skip_wrong_skipped, &totals.skip_wrong_kept);
     totals.frame_draws = fh1_frame_cost::Current().draws;
     if (r.split) {
       const uint64_t cpu = ThreadCpuNs();
@@ -432,6 +485,21 @@ bool CommandProcessor::Fh1LedgerIssueDraw(xenos::PrimitiveType prim_type, uint32
   Fh1PassLedger& l = *fh1_ledger_rec_;
   const RegisterFile& regs = *register_file_;
   const bool copy = regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy;
+  if (l.skip && l.skip->Draw(copy)) [[unlikely]] {
+    // FORZA_TEST_SKIP_PASS (0680): nothing of the draw (or resolve) is recorded.
+    pl::Cell& c = l.rec_pending[l.rec_slot];
+    if (!copy && l.skip->spec().copies()) {
+      ++c.rec_skipped;
+      return true;
+    }
+    // A resolve (with `copies`): its clear without its copy. A draw without `copies`: its render
+    // targets bound as the draw would bind them.
+    const uint64_t t0 = Ticks();
+    const bool done = copy ? Fh1PassLedgerSkippedCopy() : Fh1PassLedgerSkippedDraw();
+    c.rec_skip_ns += l.Ns(Ticks() - t0);
+    ++(copy ? c.rec_skipped_copies : c.rec_skipped);
+    return done;
+  }
   const uint64_t work = Fh1PassLedgerWork();
   const uint64_t t0 = Ticks();
   const bool result = IssueDraw(prim_type, index_count, index_buffer_info, major_mode_explicit);
@@ -472,6 +540,28 @@ bool CommandProcessor::Fh1LedgerIssueDraw(xenos::PrimitiveType prim_type, uint32
     }
   }
   return result;
+}
+
+// FORZA_TEST_SKIP_PASS, at each frame on the recorder: the wrong decisions into the window, and
+// a warning every 10 s while the switch is on.
+void CommandProcessor::Fh1LedgerSkipFrame(uint64_t* wrong_skipped, uint64_t* wrong_kept) {
+  Fh1PassLedger& l = *fh1_ledger_rec_;
+  pl::SkipTracker& skip = *l.skip;
+  skip.TakeWrong(wrong_skipped, wrong_kept);
+  ++l.skip_frames;
+  const uint64_t now = SteadyNs();
+  if (now - l.skip_warned_ns < 10000000000ull)
+    return;
+  REXGPU_WARN(
+      "FORZA_TEST_SKIP_PASS={}: TEST SWITCH ON, {} draws and {} resolves skipped in the last "
+      "{:.1f} s ({} frames); {} draws or resolves in all whose pass id was not their segment's",
+      l.skip_text, skip.skipped_draws() - l.skip_warned_draws,
+      skip.skipped_copies() - l.skip_warned_copies, double(now - l.skip_warned_ns) * 1e-9,
+      l.skip_frames, skip.all_wrong());
+  l.skip_warned_ns = now;
+  l.skip_warned_draws = skip.skipped_draws();
+  l.skip_warned_copies = skip.skipped_copies();
+  l.skip_frames = 0;
 }
 
 void CommandProcessor::Fh1LedgerBatch(bool begin) {
@@ -523,6 +613,8 @@ void CommandProcessor::Fh1LedgerAfterSwap() {
     Fh1PassLedger& r = *ledger;
     if (r.split)
       r.rec_clock.Mark(Ticks(), r.rec_ticks);
+    if (r.skip)
+      r.skip->SegmentEnd(kSwapLabel, false, true);
     r.FoldRecorder(kSwapLabel);
     ++r.serial;
     Fh1PassLedger::LabelEntry& e = r.labels[r.serial % kLabelRing];
@@ -568,5 +660,19 @@ void CommandProcessor::Fh1LedgerShutdown() {
   fh1_ledger_dec_ = fh1_ledger_rec_ = nullptr;
   delete l;
 }
+
+// FH1 (0680): a backend without the render target part (D3D12) binds and clears nothing for a
+// skipped draw or resolve (said once).
+bool CommandProcessor::Fh1PassLedgerSkippedDraw() {
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    REXGPU_WARN(
+        "FORZA_TEST_SKIP_PASS: this GPU backend binds no render targets for skipped draws (the "
+        "EDRAM transfers into the skipped passes' surfaces go too)");
+  }
+  return true;
+}
+bool CommandProcessor::Fh1PassLedgerSkippedCopy() { return true; }
 
 }  // namespace rex::graphics
